@@ -57,9 +57,16 @@ export function buildComposerNavigationProbeExpression(): string {
         node?.getAttribute?.('aria-pressed') === 'true' ||
         node?.getAttribute?.('data-state') === 'on' ||
         node?.getAttribute?.('data-state') === 'active';
-      const prompt = document.querySelector('#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]');
+      // Home-page editors can lack both the id and the composer form.
+      const prompt = document.querySelector('#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]') ??
+        Array.from(document.querySelectorAll('.ProseMirror[contenteditable="true"], [contenteditable="true"][role="textbox"]'))
+          .find(node => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0) ?? null;
       const fallbackPrompt = document.querySelector('textarea[name="prompt-textarea"]');
-      const composer = (prompt ?? fallbackPrompt)?.closest('form, [data-testid="composer"]');
+      const composerLayouts = [];
+      for (let node = prompt?.parentElement; node; node = node.parentElement) {
+        if (node.hasAttribute?.('data-composer-layout')) composerLayouts.push(node);
+      }
+      const composer = (prompt ?? fallbackPrompt)?.closest('form, [data-testid="composer"]') ?? composerLayouts.at(-1) ?? null;
       const selectedControls = Array.from(
         document.querySelectorAll('[aria-checked="true"],[aria-selected="true"],[aria-pressed="true"],[data-state="on"],[data-state="active"]'),
       ).filter(visible).filter(selected);
@@ -79,7 +86,14 @@ export function buildComposerNavigationProbeExpression(): string {
     })()`;
 }
 
-export function assertComposerNavigationSnapshot(startUrl: string, snapshot: unknown): void {
+export function assertComposerNavigationSnapshot(
+  startUrl: string,
+  snapshot: unknown,
+  context: { stage?: string } = {},
+): void {
+  const stage = context.stage ?? "upload-attachment";
+  const activity =
+    stage === "upload-attachment" ? "attachment preparation" : "composer preparation";
   const value = snapshot as
     | { currentUrl?: string; workSelected?: boolean; modeUnverified?: boolean }
     | undefined;
@@ -98,9 +112,9 @@ export function assertComposerNavigationSnapshot(startUrl: string, snapshot: unk
     currentIdentity?.conversationId && /^WEB(?::|%3a)/i.test(currentIdentity.conversationId);
   if (value?.workSelected || workConversation || unexpectedNavigation) {
     throw new BrowserAutomationError(
-      "ChatGPT navigated to Work or another ChatGPT context during attachment preparation; upload/send was stopped before prompt submission.",
+      `ChatGPT navigated to Work or another ChatGPT context during ${activity}; upload/send was stopped before prompt submission.`,
       {
-        stage: "upload-attachment",
+        stage,
         code: "attachment-control-unexpected-navigation",
         startUrl,
         currentUrl,
@@ -114,7 +128,7 @@ export function assertComposerNavigationSnapshot(startUrl: string, snapshot: unk
     throw new BrowserAutomationError(
       "ChatGPT mode could not be verified; attachment upload/send was stopped.",
       {
-        stage: "upload-attachment",
+        stage,
         code: "attachment-control-mode-unverified",
         startUrl,
         currentUrl,

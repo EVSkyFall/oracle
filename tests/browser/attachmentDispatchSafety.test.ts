@@ -9,30 +9,48 @@ import {
 } from "../../src/browser/actions/attachments.js";
 import { __test__ as composer, submitPrompt } from "../../src/browser/actions/promptComposer.js";
 
-test.each([1, 2])("never repeats plus activation after key event %s fails", async (failure) => {
+function plusClickRuntime() {
+  let armed = 0;
   const runtime = {
-    evaluate: vi.fn().mockResolvedValue({
-      result: {
-        value: {
-          status: "focused",
-          focused: true,
-          startUrl: "https://chatgpt.com/",
-          currentUrl: "https://chatgpt.com/",
-        },
-      },
+    evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("const startUrl = navigation.currentUrl")) {
+        return { result: { value: { status: "ready", startUrl: "https://chatgpt.com/" } } };
+      }
+      if (expression.includes("__oracleTrustedClickGuards ??=")) {
+        armed += 1;
+        return {
+          result: {
+            value: { ready: true, contextMatches: true, currentUrl: "https://chatgpt.com/" },
+          },
+        };
+      }
+      if (expression.includes("const summary = { reached")) {
+        return { result: { value: { reached: true, blocked: null } } };
+      }
+      if (expression.includes("return { status: 'ready', x, y }")) {
+        return { result: { value: { status: "ready", x: 40, y: 30 } } };
+      }
+      return { result: { value: { currentUrl: "https://chatgpt.com/", workSelected: false } } };
     }),
   };
+  return { runtime, armedCount: () => armed };
+}
+
+test.each([1, 2, 3])("never repeats the plus click after mouse event %s fails", async (failure) => {
+  const { runtime, armedCount } = plusClickRuntime();
   let events = 0;
   const input = {
-    dispatchKeyEvent: vi.fn(async () => {
+    dispatchKeyEvent: vi.fn(),
+    dispatchMouseEvent: vi.fn(async () => {
       if (++events === failure) throw new Error("transport failed after possible dispatch");
     }),
   };
   await expect(activateComposerPlus(runtime as never, input as never)).rejects.toThrow(
     "transport failed",
   );
-  expect(runtime.evaluate).toHaveBeenCalledTimes(3);
-  expect(input.dispatchKeyEvent).toHaveBeenCalledTimes(failure);
+  expect(armedCount()).toBe(1);
+  expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(failure);
+  expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
 });
 
 test.each([

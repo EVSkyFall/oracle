@@ -1,6 +1,4 @@
-import { withoutBrowserCancellation } from "../cancellation.js";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import type { ChromeClient, BrowserAttachment, BrowserLogger } from "../types.js";
 import { INPUT_SELECTORS, SEND_BUTTON_SELECTORS, UPLOAD_STATUS_SELECTORS } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
@@ -12,13 +10,11 @@ import { buildAttachmentProgressExpression } from "./attachmentProgress.js";
 import { buildActiveComposerRootExpression } from "./composerRoot.js";
 import {
   assertComposerPlusStayedInPlace,
-  assertComposerNavigationSnapshot,
-  buildComposerNavigationValidationExpression,
-  buildComposerNavigationProbeExpression,
   withGuardedFileInput,
   dispatchGuardedFileInputEvents,
   clearGuardedFileInput,
 } from "./attachmentContext.js";
+import { openComposerPlusPanel } from "./composerTools.js";
 export {
   captureComposerNavigationUrl,
   assertComposerPlusStayedInPlace,
@@ -58,176 +54,38 @@ export function buildAttachmentNamePattern(
 }
 
 export interface ComposerPlusActivationResult {
-  method: "trusted-keyboard" | "synthetic" | "unavailable";
+  method: "trusted-click" | "synthetic" | "already-open" | "not-needed" | "unavailable";
   startUrl: string;
+  reason?: string;
 }
 
-type ComposerPlusProbe = {
-  status?: "focused" | "missing" | "work-selected" | "mode-unverified" | "context-changed";
-  navigation?: unknown;
-  startUrl?: string;
-  focused?: boolean;
-};
-
+/**
+ * Opens the composer "+" panel through the shared, guarded trusted-click path. Uploads pass
+ * `skipWhenFileInputPresent`: today's composer keeps its file inputs mounted, so the panel
+ * (whose type-ahead would capture the staged prompt) is opened only when they are not.
+ */
 export async function activateComposerPlus(
   runtime: ChromeClient["Runtime"],
   input?: ChromeClient["Input"],
   navigationUrl?: string,
+  options: { skipWhenFileInputPresent?: boolean; stage?: string } = {},
 ): Promise<ComposerPlusActivationResult> {
-  const guardId = randomUUID();
-  const probe = await Promise.resolve(
-    runtime.evaluate({
-      expression: `(() => {
-        const navigation = ${navigationUrl ? buildComposerNavigationValidationExpression(navigationUrl) : buildComposerNavigationProbeExpression()};
-        const startUrl = navigation.currentUrl;
-        if (navigation.contextMatches === false) return { status: 'context-changed', startUrl, navigation };
-        if (navigation.workSelected) {
-          return { status: 'work-selected', startUrl };
-        }
-        if (navigation.modeUnverified) return { status: 'mode-unverified', startUrl };
-        const selectors = ['#composer-plus-btn', 'button[data-testid="composer-plus-btn"]'];
-        for (const selector of selectors) {
-          const node = document.querySelector(selector);
-          if (!(node instanceof HTMLElement)) continue;
-          const rect = node.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) continue;
-          const nodes = window.__oracleAttachmentPlusNodes ??= Object.create(null);
-          nodes[${JSON.stringify(guardId)}] = node;
-          node.focus({ preventScroll: true });
-          return { status: 'focused', startUrl, focused: document.activeElement === node };
-        }
-        return { status: 'missing', startUrl };
-      })()`,
-      returnByValue: true,
-    }),
-  ).then((result) => result?.result?.value as ComposerPlusProbe | undefined);
-
-  const startUrl = navigationUrl ?? (typeof probe?.startUrl === "string" ? probe.startUrl : "");
-  if (probe?.status === "context-changed") {
-    assertComposerNavigationSnapshot(startUrl, probe.navigation);
-  }
-  if (probe?.status === "mode-unverified") {
-    throw new BrowserAutomationError(
-      "ChatGPT mode could not be verified; attachment preparation was stopped.",
-      {
-        stage: "upload-attachment",
-        code: "attachment-control-mode-unverified",
-        startUrl,
-      },
-    );
-  }
-  if (probe?.status === "work-selected") {
-    throw new BrowserAutomationError(
-      "Oracle refused to open the attachment menu because ChatGPT is in Work mode.",
-      {
-        stage: "upload-attachment",
-        code: "attachment-control-work-mode",
-        startUrl,
-      },
-    );
-  }
-  if (probe?.status !== "focused") {
-    return { method: "unavailable", startUrl };
-  }
-
-  const trusted = Boolean(input && typeof input.dispatchKeyEvent === "function");
-  let delivery: { sawKeyDown?: boolean; clicked?: boolean; blocked?: unknown } | undefined;
-  try {
-    const prepared = await runtime.evaluate({
-      expression: `(() => {
-        const button = window.__oracleAttachmentPlusNodes?.[${JSON.stringify(guardId)}];
-        const check = () => {
-          const navigation = ${buildComposerNavigationValidationExpression(startUrl)};
-          const rect = button?.getBoundingClientRect();
-          return { ...navigation, focused: button instanceof HTMLElement && button.isConnected &&
-            document.activeElement === button && document.querySelector('#composer-plus-btn, button[data-testid="composer-plus-btn"]') === button &&
-            !button.hasAttribute('disabled') && button.getAttribute('aria-disabled') !== 'true' &&
-            rect.width > 0 && rect.height > 0 };
-        };
-        const safeCheck = () => { try { return check(); } catch { return { currentUrl: location.href, contextMatches: false, focused: false }; } };
-        const guard = { sawKeyDown: false, clicked: false, blocked: null };
-        const cancel = (event, state) => { event.preventDefault(); event.stopImmediatePropagation(); guard.blocked = state; };
-        const onKey = event => {
-          if (event.key !== 'Enter' || !event.isTrusted) return;
-          if (event.type === 'keyup') { if (guard.blocked) cancel(event, guard.blocked); return; }
-          guard.sawKeyDown = true;
-          const state = safeCheck();
-          if (guard.blocked || !state.contextMatches || !state.focused) cancel(event, guard.blocked ?? state);
-        };
-        const onClick = event => {
-          if (!guard.sawKeyDown && ${trusted}) return;
-          const state = safeCheck();
-          if (guard.blocked || !state.contextMatches || !state.focused || !(event.target instanceof Node) || !button.contains(event.target)) cancel(event, guard.blocked ?? state);
-          else guard.clicked = true;
-        };
-        guard.cleanup = () => {
-          window.removeEventListener('keydown', onKey, true);
-          window.removeEventListener('keyup', onKey, true);
-          window.removeEventListener('click', onClick, true);
-        };
-        const guards = window.__oracleAttachmentPlusGuards ??= Object.create(null);
-        guards[${JSON.stringify(guardId)}] = guard;
-        const state = safeCheck();
-        if (!state.contextMatches || !state.focused) { guard.blocked = state; return state; }
-        window.addEventListener('keydown', onKey, true);
-        window.addEventListener('keyup', onKey, true);
-        window.addEventListener('click', onClick, true);
-        if (!${trusted}) button.click();
-        return state;
-      })()`,
-      returnByValue: true,
-    });
-    const state = prepared.result?.value as { focused?: boolean } | undefined;
-    assertComposerNavigationSnapshot(startUrl, state);
-    if (!state?.focused)
-      throw new BrowserAutomationError(
-        "Attachment menu focus changed before activation; upload was stopped.",
-        { stage: "upload-attachment", code: "attachment-plus-not-ready" },
-      );
-    if (trusted && input) {
-      const enter = {
-        key: "Enter",
-        code: "Enter",
-        windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-      } as const;
-      // A transport failure can follow a successful dispatch; never activate twice.
-      await input.dispatchKeyEvent({ type: "keyDown", ...enter, text: "\r", unmodifiedText: "\r" });
-      await input.dispatchKeyEvent({ type: "keyUp", ...enter });
-    }
-  } finally {
-    const observed = await withoutBrowserCancellation(() =>
-      runtime
-        .evaluate({
-          expression: `(() => {
-        const guards = window.__oracleAttachmentPlusGuards;
-        const guard = guards?.[${JSON.stringify(guardId)}];
-        const nodes = window.__oracleAttachmentPlusNodes;
-        if (nodes) delete nodes[${JSON.stringify(guardId)}];
-        if (!guard) return null;
-        const summary = { sawKeyDown: guard.sawKeyDown, clicked: guard.clicked, blocked: guard.blocked };
-        guard.cleanup(); delete guards[${JSON.stringify(guardId)}]; return summary;
-      })()`,
-          returnByValue: true,
-        })
-        .catch(() => undefined),
-    );
-    delivery = observed?.result?.value as typeof delivery;
-  }
-  if (delivery?.blocked) {
-    assertComposerNavigationSnapshot(startUrl, delivery.blocked);
-    throw new BrowserAutomationError(
-      "Attachment menu focus changed at activation; upload was stopped.",
-      { stage: "upload-attachment", code: "attachment-plus-not-ready" },
-    );
-  }
-  if (!delivery || (trusted ? !delivery.sawKeyDown : !delivery.clicked)) {
-    throw new BrowserAutomationError(
-      "Attachment menu activation could not be verified; do not retry automatically.",
-      { stage: "upload-attachment", code: "attachment-plus-ambiguous" },
-    );
-  }
-  return { method: trusted ? "trusted-keyboard" : "synthetic", startUrl };
+  const opened = await openComposerPlusPanel(runtime, input, {
+    navigationUrl,
+    stage: options.stage ?? "upload-attachment",
+    skipWhenFileInputPresent: options.skipWhenFileInputPresent,
+  });
+  const method =
+    opened.status === "opened"
+      ? opened.method === "none"
+        ? "synthetic"
+        : opened.method
+      : opened.status;
+  return {
+    method,
+    startUrl: opened.startUrl,
+    ...(opened.reason ? { reason: opened.reason } : {}),
+  };
 }
 
 export async function uploadAttachmentFile(
@@ -527,7 +385,9 @@ export async function uploadAttachmentFile(
 
   // Work suggestions sit close to the composer. Activate only the exact plus control and
   // verify that the page did not enter Work or another conversation before touching files.
-  const plusActivation = await activateComposerPlus(runtime, input, options?.navigationUrl);
+  const plusActivation = await activateComposerPlus(runtime, input, options?.navigationUrl, {
+    skipWhenFileInputPresent: true,
+  });
   const navigationUrl = options?.navigationUrl ?? plusActivation.startUrl;
   const assertNavigation = () => assertComposerPlusStayedInPlace(runtime, navigationUrl);
   await delay(350);

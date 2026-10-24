@@ -30,6 +30,7 @@ import { buildAttachmentProgressExpression } from "./attachmentProgress.js";
 import { buildActiveComposerRootExpression } from "./composerRoot.js";
 import { buildInstallCompletionAnnouncementExpression } from "./completionAnnouncement.js";
 import { activateWebSearch } from "./webSearch.js";
+import { COMPOSER_PLUS_SELECTORS, findComposerPlusButton } from "./composerTools.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -1043,12 +1044,11 @@ async function dismissOpenComposerPlusMenu(
 ): Promise<boolean> {
   const probe = await Runtime.evaluate({
     expression: `(() => {
-      const selectors = ['#composer-plus-btn', 'button[data-testid="composer-plus-btn"]'];
-      const button = selectors
-        .map(selector => document.querySelector(selector))
-        .find(node => node instanceof HTMLElement && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0);
+      const selectors = ${JSON.stringify(COMPOSER_PLUS_SELECTORS)};
+      const findPlus = ${findComposerPlusButton.toString()};
+      const button = findPlus(document, ${JSON.stringify(INPUT_SELECTORS)}, selectors);
       if (!(button instanceof HTMLElement)) return { status: 'absent' };
-      if (button.getAttribute('aria-expanded') !== 'true') return { status: 'closed' };
+      if (button.getAttribute('aria-expanded') !== 'true' && button.getAttribute('data-state') !== 'open') return { status: 'closed' };
       button.focus({ preventScroll: true });
       return { status: 'open', focused: document.activeElement === button };
     })()`,
@@ -1074,10 +1074,11 @@ async function dismissOpenComposerPlusMenu(
   while (Date.now() < deadline) {
     const state = await Runtime.evaluate({
       expression: `(() => {
-        const selectors = ['#composer-plus-btn', 'button[data-testid="composer-plus-btn"]'];
-        return !selectors.some(selector =>
-          document.querySelector(selector)?.getAttribute?.('aria-expanded') === 'true'
-        );
+        const selectors = ${JSON.stringify(COMPOSER_PLUS_SELECTORS)};
+        return !selectors.some(selector => {
+          const node = document.querySelector(selector);
+          return node?.getAttribute?.('aria-expanded') === 'true' || node?.getAttribute?.('data-state') === 'open';
+        });
       })()`,
       returnByValue: true,
     });

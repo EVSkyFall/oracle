@@ -2226,17 +2226,30 @@ describe("composer attachment menu safety", () => {
     });
   });
 
-  test("activates only the exact plus control with a trusted keyboard event", async () => {
-    const evaluate = vi.fn().mockResolvedValue({
-      result: {
-        value: {
-          status: "focused",
-          startUrl: "https://chatgpt.com/",
-          focused: true,
-          currentUrl: "https://chatgpt.com/",
-          sawKeyDown: true,
-        },
-      },
+  test("opens only the exact composer plus control with a guarded trusted click", async () => {
+    let opened = false;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("const startUrl = navigation.currentUrl")) {
+        return { result: { value: { status: "ready", startUrl: "https://chatgpt.com/" } } };
+      }
+      if (expression.includes("__oracleTrustedClickGuards ??=")) {
+        return {
+          result: {
+            value: { ready: true, contextMatches: true, currentUrl: "https://chatgpt.com/" },
+          },
+        };
+      }
+      if (expression.includes("const summary = { reached")) {
+        opened = true;
+        return { result: { value: { reached: true, blocked: null } } };
+      }
+      if (expression.includes("return { status: 'ready', x, y }")) {
+        return { result: { value: { status: "ready", x: 40, y: 30 } } };
+      }
+      if (expression.includes("return { plus: Boolean(plus), expanded")) {
+        return { result: { value: { plus: true, expanded: opened, rows: opened ? 4 : 0 } } };
+      }
+      return { result: { value: { currentUrl: "https://chatgpt.com/", workSelected: false } } };
     });
     const dispatchKeyEvent = vi.fn().mockResolvedValue(undefined);
     const dispatchMouseEvent = vi.fn().mockResolvedValue(undefined);
@@ -2247,27 +2260,26 @@ describe("composer attachment menu safety", () => {
     } as unknown as ChromeClient["Input"];
 
     await expect(attachments.activateComposerPlus(runtime, input)).resolves.toEqual({
-      method: "trusted-keyboard",
+      method: "trusted-click",
       startUrl: "https://chatgpt.com/",
     });
 
-    expect(dispatchKeyEvent).toHaveBeenCalledTimes(2);
-    expect(dispatchKeyEvent).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ type: "keyDown", key: "Enter", code: "Enter" }),
+    expect(dispatchMouseEvent.mock.calls.map(([event]) => event.type)).toEqual([
+      "mouseMoved",
+      "mousePressed",
+      "mouseReleased",
+    ]);
+    expect(dispatchMouseEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "mousePressed", x: 40, y: 30, button: "left" }),
     );
-    expect(dispatchKeyEvent).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ type: "keyUp", key: "Enter", code: "Enter" }),
-    );
-    expect(dispatchMouseEvent).not.toHaveBeenCalled();
+    expect(dispatchKeyEvent).not.toHaveBeenCalled();
 
     const expression = String(evaluate.mock.calls[0]?.[0]?.expression ?? "");
+    expect(expression).toContain("data-composer-navigation-target");
     expect(expression).toContain("#composer-plus-btn");
-    expect(expression).toContain('button[data-testid="composer-plus-btn"]');
+    expect(expression).toContain("composer-plus-btn");
     expect(expression).not.toContain('[data-testid*="plus"]');
     expect(expression).not.toContain('button[aria-label^="add" i]');
-    expect(expression).not.toContain("getBoundingClientRect().left");
   });
 
   test("fails closed before activation when Work is selected", async () => {

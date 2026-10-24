@@ -63,6 +63,7 @@ import {
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
+import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import {
   isGeneratedImageAssistantAnswer,
@@ -1621,6 +1622,9 @@ async function runBrowserModeInternal(
           }
           await delay(500);
         }
+        // An upload that had to open the "+" panel leaves it open; its type-ahead would
+        // capture the prompt staged next.
+        await raceWithDisconnect(closeComposerPlusPanel(Runtime, Input));
         // Scale timeout based on number of files: base 45s + 20s per additional file.
         const baseTimeout = config.inputTimeoutMs ?? 30_000;
         const perFileTimeout = 20_000;
