@@ -336,6 +336,10 @@ export async function waitForDeepResearchCompletion(
     (scopedToNewTurns && options?.targetBaselineCaptured !== true);
   let observedResearchEvidence = false;
   let loggedIncompleteResult = false;
+  // Today's Deep Research first posts a short acknowledgement (copy controls, no stop button) and
+  // researches afterwards, so a finished reply without research activity is not yet a fallback:
+  // what follows it decides.
+  let firstReply: { identity: string; textLength: number; text: string } | null = null;
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
@@ -355,6 +359,9 @@ export async function waitForDeepResearchCompletion(
           incompleteResult?: boolean;
           researchActivity?: boolean;
           accountBlocked?: boolean;
+          turnKey?: string;
+          turnCount?: number;
+          replyText?: string;
         }
       | undefined;
 
@@ -412,6 +419,21 @@ export async function waitForDeepResearchCompletion(
       val?.researchActivity ||
       val?.hasActiveScopedResearch,
     );
+    const turnIdentity = `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
+    // Scoped to this prompt's turns, a second assistant turn means something followed the first
+    // reply (a reattach can arrive after the report did).
+    if (!observedResearchEvidence && scopedToNewTurns && (val?.turnCount ?? 0) > 1) {
+      observedResearchEvidence = true;
+    }
+    if (firstReply && !observedResearchEvidence && val) {
+      const textLength = val.textLength ?? 0;
+      const grewIntoReport =
+        textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200;
+      if (turnIdentity !== firstReply.identity || val.stopVisible || grewIntoReport) {
+        observedResearchEvidence = true;
+        logger("[browser] Deep Research activity followed ChatGPT's first reply.");
+      }
+    }
     if (read?.completed && read.text) {
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
       return {
@@ -423,14 +445,20 @@ export async function waitForDeepResearchCompletion(
 
     // Completion detected
     if (val?.finished) {
-      if (!observedResearchEvidence) {
-        throw new BrowserAutomationError(
-          "ChatGPT returned a completed response without starting Deep Research. The Deep Research selection may have silently fallen back to a normal response.",
-          { stage: "deep-research-not-started", code: "deep-research-not-started" },
+      if (observedResearchEvidence) {
+        logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
+        return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      }
+      if (!firstReply) {
+        firstReply = {
+          identity: turnIdentity,
+          textLength: val.textLength ?? 0,
+          text: val.replyText ?? "",
+        };
+        logger(
+          "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
         );
       }
-      logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
     }
 
     const incompleteFrameResult = Boolean(
@@ -459,6 +487,17 @@ export async function waitForDeepResearchCompletion(
 
     lastTextLength = Math.max(val?.textLength ?? 0, read?.textLength ?? 0, lastTextLength);
     await delay(DEEP_RESEARCH_POLL_INTERVAL_MS);
+  }
+
+  if (firstReply && !observedResearchEvidence) {
+    const reply = firstReply.text.replace(/\s+/g, " ").trim();
+    const quoted = reply.length > 300 ? `${reply.slice(0, 300)}…` : reply;
+    throw new BrowserAutomationError(
+      "ChatGPT returned a completed response without starting Deep Research: nothing followed its reply " +
+        `within ${Math.round(timeoutMs / 60_000)} minutes. The Deep Research selection may have silently fallen back to a normal response.` +
+        (quoted ? ` ChatGPT said: "${quoted}"` : ""),
+      { stage: "deep-research-not-started", code: "deep-research-not-started", reply },
+    );
   }
 
   // Timeout — throw with metadata for potential reattach
@@ -1279,7 +1318,12 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
     const hasActiveScopedResearch = scopedToNewTurns && Boolean(lastTurn) &&
       hasScopedDeepResearchIframe &&
       (textLength < 40 || isToolStub || tailIsPlanningPanel || /chatgpt\\s+said:?$/i.test(text));
-    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked };
+    // Which assistant turn this is, so a later turn (the report after an acknowledgement) is seen.
+    const attrOf = (node, name) => (node && typeof node.getAttribute === 'function' ? node.getAttribute(name) : null);
+    const messageNode = attrOf(lastTurn, 'data-message-id') !== null ? lastTurn : lastTurn?.querySelector?.('[data-message-id]');
+    const turnKey = String(attrOf(messageNode, 'data-message-id') || attrOf(lastTurn, 'data-testid') || '');
+    const turnCount = (scopedToNewTurns ? scopedTurns : allAssistantTurns).length;
+    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, turnKey, turnCount, replyText: text.slice(0, 2000) };
   })()`;
 }
 

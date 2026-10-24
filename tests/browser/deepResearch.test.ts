@@ -880,15 +880,30 @@ describe("waitForDeepResearchCompletion", () => {
   });
 
   it("fails clearly when ChatGPT silently returns a normal response", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
+    mockRuntime.evaluate.mockResolvedValue({
       result: {
-        value: { finished: true, stopVisible: false, textLength: 100, hasIframe: false },
+        value: {
+          finished: true,
+          stopVisible: false,
+          textLength: 100,
+          hasIframe: false,
+          turnCount: 1,
+          turnKey: "m1",
+          replyText: "Node.js 24 is the Active LTS line.",
+        },
       },
     });
 
-    await expect(
-      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000),
-    ).rejects.toThrow(/without starting Deep Research/);
+    const error = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 30).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toMatchObject({
+      message: expect.stringMatching(/without starting Deep Research/),
+      details: { code: "deep-research-not-started", reply: "Node.js 24 is the Active LTS line." },
+    });
+    expect((error as Error).message).toContain(
+      'ChatGPT said: "Node.js 24 is the Active LTS line."',
+    );
   });
 
   it("does not treat an unscoped page iframe as evidence for a normal response", async () => {
@@ -897,14 +912,14 @@ describe("waitForDeepResearchCompletion", () => {
         value: { finished: false, stopVisible: true, textLength: 10, hasIframe: true },
       },
     });
-    mockRuntime.evaluate.mockResolvedValueOnce({
+    mockRuntime.evaluate.mockResolvedValue({
       result: {
         value: { finished: true, stopVisible: false, textLength: 100, hasIframe: true },
       },
     });
 
     await expect(
-      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000),
+      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 30),
     ).rejects.toThrow(/without starting Deep Research/);
   });
 
@@ -921,14 +936,103 @@ describe("waitForDeepResearchCompletion", () => {
         },
       },
     });
-    mockRuntime.evaluate.mockResolvedValueOnce({
+    mockRuntime.evaluate.mockResolvedValue({
       result: {
         value: { finished: true, stopVisible: false, textLength: 100, hasIframe: false },
       },
     });
 
     await expect(
-      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000),
+      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 30),
+    ).rejects.toThrow(/without starting Deep Research/);
+  });
+
+  // Today (2026-10) Deep Research first posts a short acknowledgement with copy controls and no
+  // stop button, then researches; the report follows.
+  const ack = {
+    finished: true,
+    stopVisible: false,
+    textLength: 120,
+    hasIframe: false,
+    turnCount: 1,
+    turnKey: "ack",
+    replyText: "Deep Research를 시작했어요. Node.js 공식 릴리스 일정을 기준으로 확인합니다.",
+  };
+  const queueReportExtraction = () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          text: "Research report content",
+          html: "<p>Research report content</p>",
+          turnId: "t2",
+          messageId: "m2",
+        },
+      },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: null } });
+  };
+
+  it("waits past an acknowledgement and returns the report that follows in a new turn", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ack } });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ack } });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          ...ack,
+          finished: false,
+          stopVisible: true,
+          turnCount: 2,
+          turnKey: "report",
+          textLength: 900,
+        },
+      },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: { value: { ...ack, turnCount: 2, turnKey: "report", textLength: 5000 } },
+    });
+    queueReportExtraction();
+
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
+    expect(result.text).toBe("Research report content");
+  });
+
+  it("counts the stop button coming back after the acknowledgement as research", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ack } });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: { value: { ...ack, finished: false, stopVisible: true } },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: { ...ack, textLength: 4000 } } });
+    queueReportExtraction();
+
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
+    expect(result.text).toBe("Research report content");
+  });
+
+  it("counts the acknowledgement turn growing into a report as research", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ack } });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: { ...ack, textLength: 4000 } } });
+    queueReportExtraction();
+
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
+    expect(result.text).toBe("Research report content");
+  });
+
+  it("a reattach that finds the acknowledgement and the report after the prompt returns the report", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: { value: { ...ack, turnCount: 2, turnKey: "report", textLength: 5000 } },
+    });
+    queueReportExtraction();
+
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000, 3);
+    expect(result.text).toBe("Research report content");
+  });
+
+  it("does not count small changes in the acknowledgement turn as research", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ack } });
+    mockRuntime.evaluate.mockResolvedValue({ result: { value: { ...ack, textLength: 135 } } });
+
+    await expect(
+      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 30),
     ).rejects.toThrow(/without starting Deep Research/);
   });
 
@@ -2282,6 +2386,42 @@ describe("waitForDeepResearchCompletion", () => {
     const afterStop = run(false);
     expect(afterStop.stopVisible).toBe(false);
     expect(afterStop.finished).toBe(true);
+  });
+
+  it("reports which assistant turn it read, so a report after an acknowledgement is noticed", () => {
+    const expression = buildDeepResearchCompletionPollExpressionForTest();
+    const reply = "Deep Research를 시작했어요. Node.js 공식 릴리스 일정을 기준으로 확인합니다.";
+    const message = {
+      getAttribute: (name: string) => (name === "data-message-id" ? "msg-ack" : null),
+    };
+    const turn = (text: string) => ({
+      textContent: text,
+      innerText: text,
+      dataset: {},
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "assistant" : null),
+      querySelector: (selector: string) => (selector === "[data-message-id]" ? message : {}),
+      querySelectorAll: () => [],
+    });
+    const result = new vm.Script(expression).runInNewContext({
+      document: {
+        body: { innerText: reply },
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => {
+          if (selector === "iframe") return [];
+          if (selector.includes("data-message-author-role") || selector.includes("data-turn")) {
+            return [turn("Earlier answer"), turn(reply)];
+          }
+          return [];
+        },
+      },
+    }) as { turnKey?: string; turnCount?: number; replyText?: string; finished?: boolean };
+
+    expect(result).toMatchObject({
+      turnKey: "msg-ack",
+      turnCount: 2,
+      replyText: reply,
+      finished: true,
+    });
   });
 
   it("throws on timeout with metadata", async () => {
