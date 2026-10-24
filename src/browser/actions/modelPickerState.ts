@@ -172,6 +172,7 @@ export async function openModelPicker(
       stage: STAGE,
       target: "The ChatGPT model picker",
     });
+    if (clicked.status === "unreached") continue;
     if (clicked.status !== "clicked") return false;
     if (await waitFor(() => isPickerMenuOpen(runtime), 3_000)) return true;
   }

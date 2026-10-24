@@ -307,7 +307,7 @@ export interface GuardedTrustedClickOptions {
 
 export type GuardedTrustedClickResult =
   | { status: "clicked"; method: "trusted-click" | "synthetic"; reached: boolean }
-  | { status: "missing" | "disabled" | "obscured"; detail?: string };
+  | { status: "missing" | "disabled" | "obscured" | "unreached"; detail?: string };
 
 type ClickMeasurement = {
   status?: "ready" | "settling" | "missing" | "disabled" | "obscured" | "context-changed";
@@ -412,18 +412,40 @@ export async function guardedTrustedClick(
             __visible(target) && __enabled(target) && Boolean(hit) && (hit === target || target.contains(hit)) };
         };
         const safeCheck = (event) => { try { return check(event); } catch { return { currentUrl: location.href, contextMatches: false, ready: false }; } };
-        const guard = { reached: false, blocked: null };
+        const guard = { reached: false, pressed: false, blocked: null, removed: false };
         const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
-        const cancel = (event, state) => { event.preventDefault(); event.stopImmediatePropagation(); guard.blocked = state; };
+        const swallow = (event) => { event.preventDefault(); event.stopImmediatePropagation(); };
+        const cancel = (event, state) => { swallow(event); guard.blocked = state; };
         const onEvent = event => {
           if (!event.isTrusted) return;
-          if (guard.blocked) { cancel(event, guard.blocked); return; }
           const inside = event.target instanceof Node && target.contains(event.target);
-          const state = safeCheck(event);
-          if (!inside || !state.contextMatches || !state.ready) { cancel(event, { ...state, inside }); return; }
-          guard.reached = true;
+          if (guard.blocked) {
+            cancel(event, guard.blocked);
+          } else if (guard.pressed) {
+            // The press reached the target; menus and cards act on it and may close before the
+            // release. A later event that no longer lands on the live target is swallowed, so it
+            // cannot activate whatever is underneath, without reporting the click as blocked.
+            if (!inside || !safeCheck(event).ready) swallow(event);
+          } else {
+            const state = safeCheck(event);
+            if (!inside || !state.contextMatches || !state.ready) cancel(event, { ...state, inside });
+            else {
+              guard.reached = true;
+              if (event.type === 'pointerdown' || event.type === 'mousedown') guard.pressed = true;
+            }
+          }
+          // The release ends the sequence; click (if any) is dispatched in the same task.
+          if (event.type === 'mouseup' || event.type === 'click') setTimeout(guard.cleanup, 0);
         };
-        guard.cleanup = () => types.forEach(type => window.removeEventListener(type, onEvent, true));
+        guard.cleanup = () => {
+          if (guard.removed) return;
+          guard.removed = true;
+          types.forEach(type => window.removeEventListener(type, onEvent, true));
+        };
+        // Page-side safety net: the guard never outlives the click, even if Oracle's own cleanup
+        // call cannot reach the page.
+        setTimeout(guard.cleanup, 30000);
+        setTimeout(() => { delete window.__oracleTrustedClickGuards?.[${JSON.stringify(guardId)}]; }, 120000);
         (window.__oracleTrustedClickGuards ??= Object.create(null))[${JSON.stringify(guardId)}] = guard;
         const state = safeCheck(null);
         if (!state.contextMatches || !state.ready) { guard.blocked = state; return state; }
@@ -487,10 +509,19 @@ export async function guardedTrustedClick(
       { stage: options.stage, code: "trusted-click-cancelled" },
     );
   }
+  if (!summary?.reached) {
+    // Nothing reached the target (or the outcome could not be read): the click did not happen.
+    return {
+      status: "unreached",
+      detail: summary
+        ? "the click did not reach the target"
+        : "the click outcome could not be read",
+    };
+  }
   return {
     status: "clicked",
     method: trusted ? "trusted-click" : "synthetic",
-    reached: Boolean(summary?.reached),
+    reached: true,
   };
 }
 
@@ -582,6 +613,11 @@ export async function openComposerPlusPanel(
       stage,
       target: "The ChatGPT composer + button",
     });
+    if (clicked.status === "unreached") {
+      // Nothing reached the button, so another click cannot toggle anything twice.
+      reason = `the click did not reach the composer + button (${clicked.detail ?? "unknown"})`;
+      continue;
+    }
     if (clicked.status !== "clicked") {
       reason = `composer + button ${clicked.status}${clicked.detail ? ` (${clicked.detail})` : ""}`;
       break;
@@ -595,7 +631,6 @@ export async function openComposerPlusPanel(
       }
     } while (Date.now() < deadline);
     // The click landed but nothing opened (no toggle happened), so one more click is safe.
-    if (!clicked.reached) reason = "the click did not reach the composer + button";
   }
   return { status: "unavailable", method: "none", startUrl, reason };
 }
