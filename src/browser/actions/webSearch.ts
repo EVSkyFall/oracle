@@ -8,6 +8,7 @@ import {
   type ComposerPanelRow,
   clickComposerPanelRow,
   closeComposerPlusPanel,
+  isWebSearchPill,
   openComposerPlusPanel,
 } from "./composerTools.js";
 
@@ -35,13 +36,8 @@ export function buildWebSearchVerificationExpression(prompt: string): string {
     const editor = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).find(visible);
     if (!editor) return { selected: false, promptMatches: false };
     // Current pills carry the system-hint type and link but no data-id; older ones had data-id="search".
-    const isSearchPill = node => {
-      const hint = node.getAttribute('data-system-hint-type');
-      return hint === 'search' ||
-        node.getAttribute('data-prompt-link-href') === 'chatgpt-system-hint://search' ||
-        (hint === null && node.getAttribute('data-id') === 'search');
-    };
-    const chip = Array.from(editor.querySelectorAll('[data-inline-selection-pill]')).find(isSearchPill);
+    const isSearchPill = ${isWebSearchPill.toString()};
+    const chip = Array.from(editor.querySelectorAll(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)})).find(isSearchPill);
     const copy = editor.cloneNode(true);
     copy.querySelectorAll(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)}).forEach(node => node.remove());
     const readText = node => {

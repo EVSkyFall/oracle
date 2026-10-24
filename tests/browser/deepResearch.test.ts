@@ -210,6 +210,17 @@ describe("Deep Research detection and row choice", () => {
     expect(evaluateMention(new FakeDocument([activeEditor]))).toBe(true);
   });
 
+  it.each<Record<string, string>>([
+    { "plugin-mention-name": "deep-research" },
+    { "app-mention-display-name": "Deep research" },
+    { "data-prompt-link-href": "app://connector_openai_deep_research" },
+  ])("recognises the Deep research mention by %o", (attributes) => {
+    const editor = new FakeElement("div", { contenteditable: "true", role: "textbox" }, [
+      new FakeElement("p", {}, [new FakeElement("span", attributes, [], "Deep research")]),
+    ]);
+    expect(evaluateMention(new FakeDocument([editor]))).toBe(true);
+  });
+
   it.each([
     [
       [

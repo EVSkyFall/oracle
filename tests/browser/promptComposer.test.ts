@@ -934,7 +934,7 @@ describe("promptComposer", () => {
             result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
           };
         }
-        if (expression.includes('app-mention-name=\\"deep-research\\"')) {
+        if (expression.includes("connector_openai_deep_research")) {
           return { result: { value: false } };
         }
         throw new Error(`unexpected expression: ${expression.slice(0, 80)}`);

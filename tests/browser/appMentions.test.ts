@@ -113,9 +113,25 @@ describe("editor mention detection", () => {
     const names = new Function("document", `return ${buildEditorMentionNamesExpression()}`)(
       new FakeDocument([editor]),
     ) as string[];
-    expect(names).toEqual(["CODEXish", "Deep research"]);
+    expect(names).toEqual(expect.arrayContaining(["CODEXish", "Deep research"]));
     expect(mentionNamesInclude(names, "codexish")).toBe(true);
     expect(mentionNamesInclude(names, "Code")).toBe(false);
+  });
+
+  test("finds a mention that has only a name attribute or only its label", () => {
+    const editor = new FakeElement("div", { contenteditable: "true", role: "textbox" }, [
+      new FakeElement("p", {}, [
+        new FakeElement("span", { "app-mention-name": "codexish" }, [], "CODEXish"),
+        new FakeElement("span", { "plugin-mention-path": "plugin://dev-1@curated" }, [
+          new FakeElement("span", { class: "Label" }, [], "Slack"),
+        ]),
+      ]),
+    ]);
+    const names = new Function("document", `return ${buildEditorMentionNamesExpression()}`)(
+      new FakeDocument([editor]),
+    ) as string[];
+    expect(mentionNamesInclude(names, "CODEXish")).toBe(true);
+    expect(mentionNamesInclude(names, "Slack")).toBe(true);
   });
 });
 

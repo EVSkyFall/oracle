@@ -19,10 +19,12 @@ import {
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { captureComposerNavigationUrl } from "./attachmentContext.js";
 import {
+  COMPOSER_TOKEN_SELECTOR,
   type ComposerPanelRow,
   clickComposerPanelRow,
   closeComposerPlusPanel,
   composerRowTitleEquals,
+  isDeepResearchMention,
   openComposerPlusPanel,
 } from "./composerTools.js";
 
@@ -34,19 +36,13 @@ const DEEP_RESEARCH_ROW_DESCRIPTIONS = ["Get a detailed report", "获取详细�
  * Deep Research is an app mention inside the editor. Only this element proves it is active:
  * suggestion chips and other composer buttons can carry the same "Deep research" text.
  */
-export const DEEP_RESEARCH_MENTION_SELECTOR = [
-  '[app-mention-name="deep-research"]',
-  '[app-mention-path="app://connector_openai_deep_research"]',
-  '[data-prompt-link-href="app://connector_openai_deep_research"]',
-  '[data-prompt-link-label="$deep-research"]',
-].join(", ");
-
 export function buildDeepResearchMentionExpression(): string {
   return `(() => {
     const visible = node => Boolean(node) && typeof node.getBoundingClientRect === 'function' &&
       node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
     const editors = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).filter(visible);
-    return editors.some(editor => Boolean(editor.querySelector(${JSON.stringify(DEEP_RESEARCH_MENTION_SELECTOR)})));
+    const isDeepResearch = ${isDeepResearchMention.toString()};
+    return editors.some(editor => Array.from(editor.querySelectorAll(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)})).some(isDeepResearch));
   })()`;
 }
 

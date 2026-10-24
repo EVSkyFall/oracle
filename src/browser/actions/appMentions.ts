@@ -4,26 +4,30 @@ import { delay } from "../utils.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { captureComposerNavigationUrl } from "./attachmentContext.js";
 import {
+  COMPOSER_MENTION_SELECTOR,
   COMPOSER_TOKEN_SELECTOR,
   closeComposerPlusPanel,
   composerRowTitleEquals,
   guardedTrustedClick,
   readComposerPanelRows,
   readComposerPromptText,
+  readMentionNames,
 } from "./composerTools.js";
 
 const APP_MENTION_STAGE = "app-mention";
-const MENTION_NAME_SELECTOR = "[app-mention-display-name], [plugin-mention-display-name]";
 
-/** Display names of the app/plugin mentions inside the visible editor. */
+/** Names the app/plugin mentions inside the visible editor go by (display name, name, label). */
 export function buildEditorMentionNamesExpression(): string {
   return `(() => {
     const visible = node => Boolean(node) && typeof node.getBoundingClientRect === 'function' &&
       node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
     const editor = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).find(visible);
     if (!editor) return null;
-    return Array.from(editor.querySelectorAll(${JSON.stringify(MENTION_NAME_SELECTOR)})).map(node =>
-      String(node.getAttribute('app-mention-display-name') ?? node.getAttribute('plugin-mention-display-name') ?? '').trim());
+    const names = ${readMentionNames.toString()};
+    const mentions = Array.from(editor.querySelectorAll(${JSON.stringify(COMPOSER_MENTION_SELECTOR)}));
+    // Nested mention markup (a label span inside the chip) is read through its outermost chip.
+    const outer = mentions.filter(node => !mentions.some(other => other !== node && other.contains(node)));
+    return Array.from(new Set(outer.flatMap(names)));
   })()`;
 }
 

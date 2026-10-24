@@ -23,17 +23,88 @@ export const COMPOSER_PLUS_SELECTORS = [
   'button[data-testid="composer-plus-btn"]',
 ];
 
-/**
- * Inline editor tokens that are not prompt text: tool pills (Web search) and app or plugin
- * mentions (Deep research, connected apps). Staged-prompt comparisons drop them.
- */
-export const COMPOSER_TOKEN_SELECTOR = [
+/** App and plugin mentions (Deep research, connected apps), by any attribute ChatGPT has used. */
+export const COMPOSER_MENTION_SELECTOR = ["app", "plugin"]
+  .flatMap((kind) => ["name", "display-name", "path"].map((field) => `[${kind}-mention-${field}]`))
+  .join(", ");
+
+/** Tool pills and prompt links (Web search). */
+export const COMPOSER_PILL_SELECTOR = [
   "[data-inline-selection-pill]",
   "[data-inline-selection-pill-cursor-target]",
-  "[app-mention-name]",
-  "[plugin-mention-name]",
+  "[data-system-hint-type]",
   "[data-prompt-link-href]",
+  "[data-prompt-link-label]",
 ].join(", ");
+
+/**
+ * Inline editor tokens that are not prompt text: tool pills and app or plugin mentions.
+ * Staged-prompt comparisons drop them.
+ */
+export const COMPOSER_TOKEN_SELECTOR = `${COMPOSER_MENTION_SELECTOR}, ${COMPOSER_PILL_SELECTOR}`;
+
+/**
+ * Page function: the names a mention may go by, display names first, then names, then the
+ * visible label without its "@"/"$" sigil.
+ */
+export function readMentionNames(node: Element): string[] {
+  const attributes = [
+    "app-mention-display-name",
+    "plugin-mention-display-name",
+    "app-mention-name",
+    "plugin-mention-name",
+  ];
+  const label = String(node.textContent ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[@$]\s*/, "");
+  return [...attributes.map((name) => String(node.getAttribute(name) ?? "").trim()), label].filter(
+    (value) => value.length > 0,
+  );
+}
+
+/** Page function: whether an editor token is the Web search pill (current or legacy markup). */
+export function isWebSearchPill(node: Element): boolean {
+  const hint = node.getAttribute("data-system-hint-type");
+  return (
+    hint === "search" ||
+    node.getAttribute("data-prompt-link-href") === "chatgpt-system-hint://search" ||
+    (hint === null && node.getAttribute("data-id") === "search")
+  );
+}
+
+/** Page function: whether an editor token is the Deep research mention. */
+export function isDeepResearchMention(node: Element): boolean {
+  const ids = ["app", "plugin"]
+    .flatMap((kind) => [`${kind}-mention-name`, `${kind}-mention-path`])
+    .concat(["data-prompt-link-href", "data-prompt-link-label"])
+    .map((name) =>
+      String(node.getAttribute(name) ?? "")
+        .trim()
+        .toLowerCase(),
+    );
+  if (
+    ids.some(
+      (value) =>
+        value === "deep-research" ||
+        value === "$deep-research" ||
+        value === "app://connector_openai_deep_research",
+    )
+  ) {
+    return true;
+  }
+  const names = ["app-mention-display-name", "plugin-mention-display-name"]
+    .map((name) => node.getAttribute(name))
+    .concat(String(node.textContent ?? ""))
+    .map((value) =>
+      String(value ?? "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/^[@$]\s*/, "")
+        .toLowerCase(),
+    );
+  return names.some((value) => value === "deep research" || value === "深度研究");
+}
 
 /**
  * Reads the editor's prompt text without inline tokens: hard breaks and block boundaries become

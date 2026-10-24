@@ -127,6 +127,23 @@ describe("Web Search inline selection", () => {
     });
   });
 
+  test("accepts a search pill without the inline-selection marker and strips a display-name-only mention", () => {
+    const pill = new Element(
+      "span",
+      { "data-prompt-link-href": "chatgpt-system-hint://search" },
+      [],
+      "Web search",
+    );
+    const mention = new Element("span", { "app-mention-display-name": "CODEXish" }, [], "CODEXish");
+    const editor = new Element("div", { contenteditable: "true", role: "textbox" }, [
+      new Element("p", {}, [mention, pill], "Check the build"),
+    ]);
+    expect(evaluateVerification(editor, "Check the build")).toEqual({
+      selected: true,
+      promptMatches: true,
+    });
+  });
+
   test("finds the Web search row by title in the + panel", () => {
     const row = (title: string, text = title) => ({
       index: 0,

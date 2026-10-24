@@ -7,7 +7,10 @@ import {
   composerRowTitleEquals,
   findComposerPlusButton,
   guardedTrustedClick,
+  isDeepResearchMention,
+  isWebSearchPill,
   readComposerRowLabels,
+  readMentionNames,
 } from "../../src/browser/actions/composerTools.js";
 import { INPUT_SELECTORS } from "../../src/browser/constants.js";
 import { FakeDocument, FakeElement } from "./domFixture.js";
@@ -126,7 +129,7 @@ describe("composer panel row titles", () => {
 class TextNodeElement extends FakeElement {
   constructor(
     tag: string,
-    attrs: Record<string, string> = {},
+    readonly attrs: Record<string, string> = {},
     readonly nodes: Array<TextNodeElement | string> = [],
   ) {
     super(
@@ -149,11 +152,7 @@ class TextNodeElement extends FakeElement {
   cloneNode(): TextNodeElement {
     return new TextNodeElement(
       this.tagName,
-      Object.fromEntries(
-        ["app-mention-name", "data-prompt-link-href", "class"]
-          .map((name) => [name, this.getAttribute(name)])
-          .filter((entry): entry is [string, string] => entry[1] !== null),
-      ),
+      { ...this.attrs },
       this.nodes.map((node) => (typeof node === "string" ? node : node.cloneNode())),
     );
   }
@@ -179,6 +178,62 @@ describe("staged prompt text", () => {
       text: " First line\nSecond line",
       tokens: 1,
     });
+  });
+
+  test.each<Record<string, string>>([
+    { "app-mention-display-name": "CODEXish" },
+    { "app-mention-path": "app://asdk_app_example" },
+    { "plugin-mention-display-name": "CODEXish" },
+    { "plugin-mention-path": "plugin://dev-example@openai-curated-remote" },
+    { "data-prompt-link-label": "$codexish" },
+    { "data-system-hint-type": "search" },
+  ])("treats a token carrying only %o as a token, not prompt text", (attributes) => {
+    const token = new TextNodeElement("span", attributes, ["CODEXish"]);
+    const editor = new TextNodeElement("div", {}, [
+      new TextNodeElement("p", {}, [token, " Prompt"]),
+    ]);
+    expect(readComposerPromptText(editor as unknown as Element, COMPOSER_TOKEN_SELECTOR)).toEqual({
+      text: " Prompt",
+      tokens: 1,
+    });
+  });
+});
+
+describe("shared token matchers", () => {
+  const span = (attributes: Record<string, string>, text = "") =>
+    new FakeElement("span", attributes, [], text) as unknown as Element;
+
+  test("mention names fall back from display names to names to the visible label", () => {
+    expect(
+      readMentionNames(span({ "plugin-mention-display-name": "CODEXish" }, "CODEXish")),
+    ).toEqual(["CODEXish", "CODEXish"]);
+    expect(readMentionNames(span({ "app-mention-name": "codexish" }, "@CODEXish"))).toEqual([
+      "codexish",
+      "CODEXish",
+    ]);
+    expect(readMentionNames(span({ "app-mention-path": "app://x" }, "$Slack"))).toEqual(["Slack"]);
+  });
+
+  test("Web search and Deep research tokens are recognised by any of their markers", () => {
+    expect(isWebSearchPill(span({ "data-system-hint-type": "search" }))).toBe(true);
+    expect(isWebSearchPill(span({ "data-prompt-link-href": "chatgpt-system-hint://search" }))).toBe(
+      true,
+    );
+    expect(isWebSearchPill(span({ "data-id": "search" }))).toBe(true);
+    expect(isWebSearchPill(span({ "data-system-hint-type": "image", "data-id": "search" }))).toBe(
+      false,
+    );
+    const deepResearch: Array<Record<string, string>> = [
+      { "app-mention-name": "deep-research" },
+      { "plugin-mention-path": "app://connector_openai_deep_research" },
+      { "data-prompt-link-label": "$deep-research" },
+      { "app-mention-display-name": "Deep research" },
+    ];
+    for (const attributes of deepResearch) {
+      expect(isDeepResearchMention(span(attributes))).toBe(true);
+    }
+    expect(isDeepResearchMention(span({}, "Deep research"))).toBe(true);
+    expect(isDeepResearchMention(span({ "app-mention-name": "codexish" }, "CODEXish"))).toBe(false);
   });
 });
 
