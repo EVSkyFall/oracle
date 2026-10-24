@@ -104,6 +104,10 @@ Browser mode recognizes the Chat/Work layout as well as the older conversation m
 
 Project navigation dismisses controls only inside visible dialogs. Sidebar conversation titles are never treated as dismiss buttons; if a project has no usable composer, Oracle retries at the configured ChatGPT homepage.
 
+The composer "+" control on current layouts has no id or test id; it is the composer navigation target `data-composer-navigation-target="add-context"` (labelled "Add files and more"). Oracle takes the matching control nearest the editor, ignores sidebar/header controls, and falls back to the older `#composer-plus-btn` / `data-testid="composer-plus-btn"` buttons. It opens the panel with one trusted CDP mouse click at the control's centre after checking that `elementFromPoint` hits the control and that its position is stable; capture-phase guards cancel the click at delivery if the control moved, something covers it, or the page left the ChatGPT conversation or entered Work mode. Panel rows are `button[data-list-navigation-item]` (title = first line, description below). Uploads that already have a file input skip the panel.
+
+Composer tokens (the Web search pill, app and plugin mentions such as Deep research or a connected app) are not prompt text: staged-prompt comparisons drop them, and fallback text writes go after them, so a mention or pill survives the paste checks.
+
 Multiline prompts are pasted into contenteditable composers in small chunks and checked for complete content before Send. If a paste is truncated or converted into a file, Oracle stops with `prompt-paste-incomplete`. Remote attachments wait for the file input to mount and require a visible attachment or acceptance receipt; a missing chip fails without automatically repeating an upload that might still be processing.
 
 ### CLI Options
@@ -136,6 +140,9 @@ Multiline prompts are pasted into contenteditable composers in small chunks and 
 - In the direct-slider picker without an Advanced → Effort submenu, Oracle adjusts the five-tier slider with arrow keys and verifies its associated tier announcement and numeric value together. A rightmost thumb without a confirmed `Pro` label never satisfies a Pro request; unknown ranges or inconsistent feedback fail verification.
 - `--browser-research search`: explicitly select Web Search for a normal ChatGPT answer. The pilot supports English ChatGPT with local Chrome, attach-running, or direct remote Chrome; `--remote-host` is not supported yet.
 - `--browser-research deep`: activate ChatGPT Deep Research before submitting the prompt. Use this for broad public-web research and final cited reports, not as a replacement for GPT-5.x Pro Heavy code review or pure reasoning.
+- `--browser-app <name>` (repeatable; config `browser.apps`; MCP `browserApps`): mention a ChatGPT app such as `CODEXish` in every submitted prompt. See [App mentions](#app-mentions). `--browser-app-chip <file>` (config `browser.appChipFiles`; MCP `browserAppChips`) supplies chip HTML copied from ChatGPT for that path.
+- `--browser-allow-app <name>` (repeatable; off by default; config `browser.allowApps`; MCP `browserAllowApps`): approve that app's tool-permission prompts while Oracle waits for the answer. See [App permission auto-approval](#app-permission-auto-approval).
+- `--browser-select-only`: select and verify the model and thinking time, print the evidence, restore the previous selection and stop without sending. See [Select-only check](#select-only-check).
 - `--browser-follow-up <prompt>`: submit another prompt in the same ChatGPT conversation after the initial answer. Repeat the flag for multi-turn reviews such as “challenge your recommendation”, “compare against this constraint”, then “give the final decision”. Deep Research has its own report lifecycle, so browser follow-ups are rejected when `--browser-research deep` is enabled.
 - `--followup <session-id>`: reopen the exact saved ChatGPT conversation from a completed browser session. Oracle inherits the parent browser profile, configuration, and model, then verifies the thread and prior turns before submitting.
 - `--browser-archive <auto|always|never>`: archive completed ChatGPT conversations after local artifacts are saved. The default `auto` archives only successful one-shot chats and skips project, Deep Research, multi-turn, failed, and incomplete sessions.
@@ -199,7 +206,7 @@ For the direct five-tier effort slider, Oracle verifies the leading effort label
 
 ### Web Search
 
-Use `oracle --engine browser --browser-research search -p "Find the current Node.js LTS releases and cite official sources"` to explicitly select ChatGPT's Web Search tool. Oracle verifies the selected search hint and the complete staged prompt before sending. Missing or changed controls stop the run before submission. Answers and citations use the normal browser transcript and output paths; search activation is UI evidence, not independent attestation of a provider's internal tool execution. The API `--search on/off` setting retains its existing meaning.
+Use `oracle --engine browser --browser-research search -p "Find the current Node.js LTS releases and cite official sources"` to explicitly select ChatGPT's Web Search tool. Oracle opens the composer "+" panel, chooses the `Web search` row by its title, and verifies the search pill in the editor before sending: today's pill carries `data-system-hint-type="search"` and `data-prompt-link-href="chatgpt-system-hint://search"` and no `data-id`; the older `data-id` pill is still accepted. The staged-prompt check ignores the pill and other composer tokens. A missing panel (`web-search-menu-unavailable`), a missing row (`web-search-option-missing`) or an unverified pill stops the run before submission. Answers and citations use the normal browser transcript and output paths; search activation is UI evidence, not independent attestation of a provider's internal tool execution. The API `--search on/off` setting retains its existing meaning.
 
 ### Deep Research mode
 
@@ -212,7 +219,7 @@ oracle --engine browser \
   -p "Research the current browser support for WebGPU in enterprise-managed Chrome and cite sources."
 ```
 
-Oracle activates ChatGPT Deep Research through the composer tools menu, recognizing the English `Deep research` / `Get a detailed report` labels and the Chinese `深度研究` / `获取详细报告` variants. It waits for the research plan to auto-confirm, logs high-level progress, then captures the final report from the Deep Research report surface instead of trusting the assistant tool-call wrapper.
+Oracle activates ChatGPT Deep Research through the composer "+" panel row (its `deep_research` impression id, or the `Deep research` / `深度研究` title, with the older `Get a detailed report` / `获取详细报告` descriptions as fallbacks). Activation counts only when the editor holds the Deep Research app mention (`app-mention-name="deep-research"` or `app://connector_openai_deep_research`); any other pill or button state is not evidence, so a Web search pill or a stale control can no longer pass as "already active". The mention must still be present after the prompt is staged (`deep-research-mention-lost` otherwise), and the run keeps detecting a submission that silently fell back to a normal chat. It waits for the research plan to auto-confirm, logs high-level progress, then captures the final report from the Deep Research report surface instead of trusting the assistant tool-call wrapper.
 
 When the research frame exposes a plan, Oracle logs its visible title and steps and saves its latest planning/researching phase and Edit/Update action under `browser.runtime.researchPlan` in the session metadata. It begins monitoring as soon as the frame reports researching, without waiting out a fixed plan countdown. This optional observation does not change terminal session status or retry a submitted prompt.
 
@@ -227,6 +234,47 @@ Completed browser sessions also save durable artifacts under `~/.oracle/sessions
 For a new browser run, add `--write-artifacts` with `--write-output <path>` to copy captured files beside the written answer. This is opt-in; plain `--write-output` still writes only the answer. Canonical session files stay intact, binary copies are checked against their recorded size and SHA-256, and existing files are preserved using numbered names such as `report-2.csv`. Copy failures are logged and saved in session warnings while the answer remains successful. Files that could not be captured or transferred from a remote host cannot be exported; the existing manual-copy guidance still applies.
 
 When ChatGPT generates downloadable files in the assistant response (for example a ZIP, wheel, source distribution, CSV, or PDF), Oracle saves those files beside the transcript before any archive attempt. The downloader is intentionally narrow: it only follows ChatGPT-owned file/download URLs from the assistant response and uses `sandbox:/mnt/data/...` links as source metadata and filename hints, not as arbitrary fetch targets. External links in the response are left in the transcript but are not downloaded. In bridge mode, a patched Windows host advertises artifact-transfer capability through `/health`; the Linux client then pulls each saved file over the authenticated bridge endpoint, stores it under the Linux session `artifacts/` directory, and verifies safe filename, byte size, SHA-256, and ZIP structure where applicable. If either side is older or transfer validation fails, the text response still completes and Oracle prints a manual-copy fallback instead of leaking host paths or signed download URLs.
+
+### App mentions
+
+`--browser-app <name>` mentions a connected ChatGPT app (for example `--browser-app CODEXish`) in every prompt Oracle submits, initial and follow-up. Before the prompt text is staged, Oracle types `@` and the name into the editor with trusted key events, waits for the picker row whose title equals the name (case-insensitive), chooses it with a guarded trusted click (or Enter when it is the highlighted row), and then requires an `[app-mention-display-name]` or `[plugin-mention-display-name]` equal to the name inside the editor. The typed query is removed if the picker does not turn it into a mention.
+
+`--browser-app-chip <file>` takes the chip HTML exactly as copied from the ChatGPT composer (a `<span app-mention-…>` or `<span plugin-mention-…>` element). The app name is read from the chip's display-name attribute; Oracle pastes the chip as `text/html` through a `paste` event first and falls back to the `@` picker for that app if the pasted chip cannot be verified. Use it when the picker does not list the app or lists it under another title.
+
+If no mention can be verified the run stops with `app-mention-unverified` before anything is sent, and a mention that disappears while the prompt is staged stops it with `app-mention-lost`. The progress lines (`[browser] App mention CODEXish: attached (@ picker)`) are printed without `--verbose`. Configure defaults with `browser.apps` (names) and `browser.appChipFiles` (chip files) in `~/.oracle/config.json`; MCP `consult` accepts `browserApps` and `browserAppChips`. App mentions are a local browser feature: `--remote-host` refuses them because an older host would drop them silently.
+
+### App permission auto-approval
+
+ChatGPT can ask before an app runs a tool ("Allow CODEXish to …?", "ChatGPT가 CODEXish을(를) 사용하도록 허용할까요?"). With `--browser-allow-app <name>` (repeatable, off by default) Oracle approves those prompts for the listed apps while it waits for an answer: during the initial response, follow-ups, Deep Research, and reattach/harvest waits that keep watching a live tab. A web page the model reads could try to steer it into calling local tools, and ChatGPT's prompt is the last check, so it is lifted only for the apps you name.
+
+- Only a visible card in the conversation or a dialog whose own text names an allowed app (whole-word match) is considered; the user's own messages and answer prose are ignored.
+- Only allow-type buttons are clicked, in this order: `Always allow` / `항상 허용`, then `Allow once` / `1회 허용` / `한 번만 허용`, then `Allow` / `허용` (labels compared case-insensitively after trimming). Deny and cancel are never clicked.
+- A card that names no listed app is left for you and logged once: `[browser] App approval for "<card text>" left for the user …`.
+- Oracle scrolls the button into view, checks with `elementFromPoint` that the button owns its centre, clicks it with a trusted click, and re-checks on the next poll (clicking again after a few seconds if the card is still there).
+- Every approval is logged (`[browser] App approval: CODEXish approved ("Always allow") at <time>: <tool text>`) and recorded in the session metadata under `browser.runtime.appApprovals` (`app`, `button`, `toolText`, `approvedAt`). Approvals do not count as response progress and do not change any timeout.
+
+Configure a default list with `browser.allowApps` in the user config (project config cannot enable it); MCP `consult` accepts `browserAllowApps`. As observed on 2026-10-25, the ChatGPT web client ran CODEXish's read-only and shell tools without any prompt; the prompts seen so far came from the desktop app, so the web card's markup is handled from its texts and covered by fixtures rather than a recorded live card.
+
+### Select-only check
+
+`--browser-select-only` checks that a model and thinking time can be selected without spending a message. Oracle does navigation, login, the model and thinking-time selection and their verification exactly as a real run would, prints the evidence, then puts back the model and effort that were selected before and closes its tab. It never touches the composer text and never sends. No prompt is needed:
+
+```bash
+oracle --engine browser --browser-manual-login --browser-no-focus \
+  --model gpt-6-pro --browser-select-only
+```
+
+```
+[browser] Select-only: before: model "GPT-6", tier "Medium", slider 1 (0-4).
+[browser] Thinking time: Pro
+[browser] Select-only: selected: model "GPT-6", tier "Pro", slider 4 (0-4); model evidence "GPT-6"; effort evidence "Pro"; verified.
+[browser] Select-only: restored: model "GPT-6", tier "Medium", slider 1 (0-4).
+Select-only check: verified and restored; nothing was sent.
+```
+
+This is how GPT-6 Pro (`--model gpt-6-pro` and/or `--browser-thinking-time pro`) is checked at zero Pro inputs. ChatGPT remembers the last effort for the account, which is why the previous selection is always restored, also when the selection fails or the run is cancelled. The picker is read by role: the checked `menuitemradio` (model), the effort `slider` (`aria-valuenow` within `aria-valuemin`–`aria-valuemax`), the tier name at the top of the menu, and the live announcement such as `Medium, 2 of 5.`. Restoring opens the picker with a guarded trusted click, chooses the model radio (on today's layout the radios sit under the effort panel until its `Select model` header brings the model list forward), and steps the slider with trusted arrow keys until it shows the old value; reversed keys in right-to-left layouts and sliders that only take vertical keys are detected.
+
+Exit codes: `0` the requested selection was verified and the previous one restored; `1` the requested selection could not be verified (the reason is printed); `2` the selection was verified but the previous model/effort could not be confirmed as restored, so check the picker before the next run. Select-only works with local Chrome, manual login, attach-running and `--remote-chrome`; `--remote-host` refuses it because a host that does not know the flag would send a normal prompt, and resumed conversations (`--followup`) are refused because ChatGPT keeps their model.
 
 ### Conversation archiving
 
