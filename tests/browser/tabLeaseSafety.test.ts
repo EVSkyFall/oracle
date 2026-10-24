@@ -45,9 +45,9 @@ test.each(["empty", "malformed"] as const)(
       if (kind === "malformed")
         expect(await fs.readFile(path.join(lock, "owner.json"), "utf8")).toBe("{broken");
     } finally {
-      await fs.rm(lock, { recursive: true, force: true });
+      await fs.rm(lock, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       await (await pending).release();
-      await fs.rm(profile, { recursive: true, force: true });
+      await fs.rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   },
 );
@@ -74,9 +74,9 @@ test("does not steal a live owner after two false native PID probes", async () =
     );
   } finally {
     spy.mockRestore();
-    await fs.rm(lock, { recursive: true, force: true });
+    await fs.rm(lock, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     await (await pending).release();
-    await fs.rm(profile, { recursive: true, force: true });
+    await fs.rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -112,7 +112,7 @@ test.each([true, false])(
       ).toContain("foreign");
     } finally {
       await lease.release();
-      await fs.rm(profile, { recursive: true, force: true });
+      await fs.rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   },
 );
@@ -140,7 +140,7 @@ test.each([0, -1, 1.5])(
       );
       expect(await fs.readFile(registry, "utf8")).toBe(original);
     } finally {
-      await fs.rm(profile, { recursive: true, force: true });
+      await fs.rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   },
 );

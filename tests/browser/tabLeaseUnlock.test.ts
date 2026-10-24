@@ -60,7 +60,7 @@ test("retries ENOTEMPTY while removing the registry lock", async () => {
     expect(existsSync(path.join(dir, LOCK_DIRNAME))).toBe(false);
   } finally {
     await restoreFsMocks();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 30_000);
 
@@ -84,7 +84,7 @@ test("a lock directory that outlives the unlock retries fails neither the releas
     expect(existsSync(path.join(dir, LOCK_DIRNAME))).toBe(false);
   } finally {
     await restoreFsMocks();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 60_000);
 
@@ -108,7 +108,7 @@ test("reclaims an empty ownerless lock after a few seconds but leaves a fresh on
     const lease2 = await blocked;
     await lease2.release();
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 30_000);
 
@@ -147,7 +147,7 @@ test("probes stale lease identities before taking the registry lock", async () =
     expect(await hasOtherActiveBrowserTabLeases(dir, lease.id, deps)).toBe(false);
     await lease.release();
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 30_000);
 

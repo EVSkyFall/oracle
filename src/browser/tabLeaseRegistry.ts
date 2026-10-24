@@ -2,6 +2,7 @@ import path from "node:path";
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  link,
   lstat,
   mkdir,
   readdir,
@@ -48,6 +49,17 @@ class RegistryLockTimeoutError extends Error {
 }
 
 const TRANSIENT_FS_CODES = new Set(["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"]);
+// Hard links are missing on some filesystems (FAT, some network shares).
+const HARD_LINK_UNSUPPORTED_CODES = new Set([
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "ENOSYS",
+  "EXDEV",
+  "EINVAL",
+  "EPERM",
+  "EISDIR",
+  "EMLINK",
+]);
 
 function isTransientLockError(error: unknown): boolean {
   if (error instanceof RegistryLockTimeoutError) return true;
@@ -116,10 +128,8 @@ interface RegistryLockIdentity {
 }
 
 type RegistryOwnerReadFile = (filePath: string, encoding: "utf8") => Promise<string>;
-type RegistryLockRemove = (
-  lockDir: string,
-  options: { recursive: true; force: true },
-) => Promise<void>;
+type RegistryFileRemove = (file: string) => Promise<void>;
+type RegistryDirectoryRemove = (directory: string) => Promise<void>;
 
 export function normalizeMaxConcurrentTabs(value: unknown): number {
   if (value === undefined || value === null) {
@@ -349,8 +359,10 @@ function scheduleBackgroundLeaseRelease(
   logger?: BrowserLogger,
 ): void {
   void (async () => {
+    // Retries while the registry lock is only busy; a slot left behind would keep a long-lived
+    // controller (MCP) holding it. It stops on success or a non-transient failure.
     let wait = 1_000;
-    for (let attempt = 0; attempt < 150; attempt += 1) {
+    for (;;) {
       await backgroundDelay(wait);
       try {
         await releaseBrowserTabLease(profileDir, leaseId);
@@ -498,10 +510,16 @@ async function withRegistryLock<T>(
         await rm(temporaryOwner, { force: true }).catch(() => undefined);
         continue;
       }
-      await renameRegistryFileWithRetry(
-        temporaryOwner,
-        path.join(lockDir, REGISTRY_LOCK_OWNER_FILENAME),
-      );
+      if (
+        !(await publishRegistryLockOwner(
+          temporaryOwner,
+          path.join(lockDir, REGISTRY_LOCK_OWNER_FILENAME),
+        ))
+      ) {
+        // Another controller published first (it reclaimed and re-created this directory
+        // while we stalled); this lock is theirs.
+        continue;
+      }
     } catch (error) {
       await rm(temporaryOwner, { force: true }).catch(() => undefined);
       await removeRegistryLockIfOwned(lockDir, lockId).catch(() => undefined);
@@ -547,8 +565,10 @@ function scheduleBackgroundLockRemoval(
   ownedIdentity: RegistryLockIdentity | null,
 ): void {
   void (async () => {
+    // Keeps trying while the failure is transient: a lock left behind would make every later
+    // run wait for it. It stops once the directory is gone, is someone else's, or fails hard.
     let wait = 250;
-    for (let attempt = 0; attempt < 150; attempt += 1) {
+    for (;;) {
       await backgroundDelay(wait);
       try {
         const identity = await readRegistryLockIdentity(lockDir);
@@ -557,9 +577,7 @@ function scheduleBackgroundLockRemoval(
         const owner = await readRegistryLockOwner(lockDir);
         if (owner && owner.id !== lockId) return;
         if (!owner && !ownedIdentity) return;
-        if (owner) await rm(lockDir, { recursive: true, force: true });
-        else if (await isRegistryOwnerFileMissing(lockDir)) await rmdir(lockDir);
-        else await rm(lockDir, { recursive: true, force: true });
+        await removeOwnedRegistryLockDirectory(lockDir, lockId, { ownedIdentity, attempts: 1 });
         return;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -709,7 +727,8 @@ async function removeRegistryLockIfOwned(
   options: {
     requireOwned?: boolean;
     readFileImpl?: RegistryOwnerReadFile;
-    removeImpl?: RegistryLockRemove;
+    unlinkImpl?: RegistryFileRemove;
+    rmdirImpl?: RegistryDirectoryRemove;
     /** Directory identity seen right after this owner's mkdir. */
     ownedIdentity?: RegistryLockIdentity | null;
   } = {},
@@ -732,7 +751,7 @@ async function removeRegistryLockIfOwned(
     }
     return false;
   }
-  await removeRegistryLockDirectoryWithRetry(lockDir, options.removeImpl, options.ownedIdentity);
+  await removeOwnedRegistryLockDirectory(lockDir, lockId, options);
   return true;
 }
 
@@ -749,31 +768,45 @@ async function readRegistryLockOwnerWithRetry(
   }
 }
 
-async function removeRegistryLockDirectoryWithRetry(
+/**
+ * Removes a lock that belongs to `lockId`: its owner record, re-read each time and deleted only
+ * while it still names that owner, then the directory with a non-recursive rmdir. Another
+ * controller's owner record or any file this lock did not create is never deleted; a directory
+ * that is not empty yet (Windows keeps a deleted file "delete pending" while another handle has
+ * it open) is retried.
+ */
+async function removeOwnedRegistryLockDirectory(
   lockDir: string,
-  removeImpl: RegistryLockRemove = rm,
-  ownedIdentity?: RegistryLockIdentity | null,
+  lockId: string,
+  options: {
+    readFileImpl?: RegistryOwnerReadFile;
+    unlinkImpl?: RegistryFileRemove;
+    rmdirImpl?: RegistryDirectoryRemove;
+    ownedIdentity?: RegistryLockIdentity | null;
+    attempts?: number;
+  } = {},
 ): Promise<void> {
-  let ownerRecordGone = false;
+  const unlinkImpl = options.unlinkImpl ?? ((file: string) => rm(file, { force: true }));
+  const rmdirImpl = options.rmdirImpl ?? rmdir;
+  const attempts = Math.max(1, options.attempts ?? REGISTRY_LOCK_REMOVE_ATTEMPTS);
   for (let attempt = 0; ; attempt += 1) {
     try {
-      // With our owner record already deleted only an empty directory is left, and a
-      // non-recursive rmdir cannot sweep away a lock another controller has just published.
-      if (ownerRecordGone) await rmdir(lockDir);
-      else await removeImpl(lockDir, { recursive: true, force: true });
+      const owner = await readRegistryLockOwner(lockDir, options.readFileImpl);
+      if (owner && owner.id !== lockId) return;
+      if (owner) await unlinkImpl(path.join(lockDir, REGISTRY_LOCK_OWNER_FILENAME));
+      await rmdirImpl(lockDir);
       return;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (ownerRecordGone && code === "ENOENT") return;
+      if (code === "ENOENT") return;
       const transient = typeof code === "string" && TRANSIENT_FS_CODES.has(code);
-      if (!transient || attempt + 1 >= REGISTRY_LOCK_REMOVE_ATTEMPTS) throw error;
+      if (!transient || attempt + 1 >= attempts) throw error;
       await delay(Math.min(REGISTRY_LOCK_REMOVE_MAX_DELAY_MS, 50 * 2 ** attempt));
-      if (ownedIdentity) {
-        // Once our emptied directory is gone or replaced, nothing of ours is left to remove.
+      if (options.ownedIdentity) {
+        // Once our directory is gone or replaced, nothing of ours is left to remove.
         const current = await readRegistryLockIdentity(lockDir);
-        if (!current || !sameRegistryLockDirectory(current, ownedIdentity)) return;
+        if (!current || !sameRegistryLockDirectory(current, options.ownedIdentity)) return;
       }
-      ownerRecordGone = await isRegistryOwnerFileMissing(lockDir);
     }
   }
 }
@@ -781,7 +814,11 @@ async function removeRegistryLockDirectoryWithRetry(
 export async function removeRegistryLockIfOwnedForTest(
   lockDir: string,
   lockId: string,
-  options: { readFileImpl?: RegistryOwnerReadFile; removeImpl?: RegistryLockRemove } = {},
+  options: {
+    readFileImpl?: RegistryOwnerReadFile;
+    unlinkImpl?: RegistryFileRemove;
+    rmdirImpl?: RegistryDirectoryRemove;
+  } = {},
 ): Promise<boolean> {
   return removeRegistryLockIfOwned(lockDir, lockId, { ...options, requireOwned: true });
 }
@@ -824,13 +861,39 @@ async function recoverOwnerlessRegistryLock(
     ) {
       return;
     }
-    if (staleMs < LEGACY_OWNERLESS_LOCK_STALE_MS) {
-      // Reclaimed early only because it is empty: rmdir fails if anything appeared since.
-      await rmdir(lockDir).catch(() => undefined);
-      return;
+    if (staleMs >= LEGACY_OWNERLESS_LOCK_STALE_MS) {
+      // A crash before the owner was published leaves only a temporary owner file. Remove
+      // just those, never files this registry did not create.
+      const entries = await readdir(lockDir).catch(() => [] as string[]);
+      for (const entry of entries) {
+        if (entry.endsWith(".tmp")) await rm(path.join(lockDir, entry), { force: true });
+      }
     }
-    await rm(lockDir, { recursive: true, force: true });
+    // rmdir fails (and the lock is left alone) if anything else is in it or appeared since.
+    await rmdir(lockDir).catch(() => undefined);
   });
+}
+
+/**
+ * Publishes the owner record without ever replacing one: a hard link fails with EEXIST when
+ * another controller already published into this directory. Returns false in that case.
+ * Filesystems without hard links fall back to the rename after the missing-owner check.
+ */
+async function publishRegistryLockOwner(temporary: string, owner: string): Promise<boolean> {
+  try {
+    await link(temporary, owner);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      return false;
+    }
+    if (typeof code !== "string" || !HARD_LINK_UNSUPPORTED_CODES.has(code)) throw error;
+    await renameRegistryFileWithRetry(temporary, owner);
+    return true;
+  }
+  await rm(temporary, { force: true }).catch(() => undefined);
+  return true;
 }
 
 async function withRegistryRecoveryLock<T>(

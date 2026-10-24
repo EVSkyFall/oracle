@@ -1,7 +1,17 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  rmdir,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import {
   acquireBrowserTabLease,
   canonicalProfileIdentityForTest,
@@ -66,7 +76,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       // Drain the queued writer before removing its registry, even after a failed assertion.
       const remaining = await pendingLease?.catch(() => undefined);
       await remaining?.release();
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -110,7 +120,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       await fresh.release();
       await expect(stale.release()).rejects.toThrow(/already lost/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -126,7 +136,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         }),
       ).rejects.toThrow(/Unable to read Oracle tab lease registry/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -146,7 +156,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         }),
       ).rejects.toThrow(/invalid lease record/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -178,7 +188,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       await first.release();
       await second.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -204,7 +214,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       });
       await lease.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -229,7 +239,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       });
       await lease.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -247,7 +257,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       });
       await lease.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -262,7 +272,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         expect(differentlyCased).toBe(canonical);
         expect(extended).toBe(canonical);
       } finally {
-        await rm(dir, { recursive: true, force: true });
+        await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     },
   );
@@ -284,7 +294,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         expect.stringContaining("Released ChatGPT browser slot"),
       );
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -304,7 +314,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         }),
       ).rejects.toThrow(/Unable to verify ownership while releasing/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -322,7 +332,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         }),
       );
       let readAttempts = 0;
-      let removeAttempts = 0;
+      let rmdirAttempts = 0;
 
       await expect(
         removeRegistryLockIfOwnedForTest(lockDir, "retry-owner", {
@@ -333,19 +343,20 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
             }
             return readFile(filePath, encoding);
           },
-          removeImpl: async (target, options) => {
-            removeAttempts += 1;
-            if (removeAttempts < 3) {
+          rmdirImpl: async (target) => {
+            rmdirAttempts += 1;
+            if (rmdirAttempts < 3) {
               throw Object.assign(new Error("temporarily locked"), { code: "EBUSY" });
             }
-            await rm(target, options);
+            await rmdir(target);
           },
         }),
       ).resolves.toBe(true);
-      expect(readAttempts).toBe(3);
-      expect(removeAttempts).toBe(3);
+      expect(readAttempts).toBeGreaterThanOrEqual(3);
+      expect(rmdirAttempts).toBe(3);
+      await expect(stat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -362,22 +373,24 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
           createdAt: new Date().toISOString(),
         }),
       );
-      let removeAttempts = 0;
+      let rmdirAttempts = 0;
 
       await expect(
         removeRegistryLockIfOwnedForTest(lockDir, "exhausted-owner", {
-          removeImpl: async () => {
-            removeAttempts += 1;
+          rmdirImpl: async () => {
+            rmdirAttempts += 1;
             throw Object.assign(new Error("still locked"), { code: "EACCES" });
           },
         }),
       ).rejects.toThrow(/still locked/i);
-      expect(removeAttempts).toBe(REGISTRY_LOCK_REMOVE_ATTEMPTS);
-      await expect(readFile(path.join(lockDir, "owner.json"), "utf8")).resolves.toContain(
-        "exhausted-owner",
-      );
+      expect(rmdirAttempts).toBe(REGISTRY_LOCK_REMOVE_ATTEMPTS);
+      // Our own owner record is gone, so other controllers can reclaim the empty directory.
+      await expect(readFile(path.join(lockDir, "owner.json"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(stat(lockDir)).resolves.toBeTruthy();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -418,7 +431,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
 
       await first.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -455,7 +468,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       ) as { leases: unknown[] };
       expect(registry.leases).toEqual([]);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -535,7 +548,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       ).rejects.toThrow(/already lost/i);
       expect(lostOwnerCleanup).not.toHaveBeenCalled();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -557,7 +570,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       );
       await expect(lease.release()).rejects.toThrow(/already lost/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -594,7 +607,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       await replacement.release();
       await expect(original.release()).rejects.toThrow(/already lost/i);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -635,7 +648,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       ).rejects.toThrow(/Timed out waiting for ChatGPT browser slot/i);
       await original.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -667,7 +680,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       );
       await lease.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -721,7 +734,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
         (await readdir(dir)).filter((name) => name.startsWith("oracle-tab-leases.lock")),
       ).toEqual([]);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -763,7 +776,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
       expect(acquired).toBe(true);
       await next.release();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 });

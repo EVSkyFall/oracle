@@ -27,7 +27,7 @@ test("an interrupted owner write never publishes partial ownership and permits r
     await lease.release();
   } finally {
     vi.mocked(writeFile).mockImplementation(actual.writeFile);
-    await rm(profile, { recursive: true, force: true });
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -42,6 +42,6 @@ test("recovers an aged ownerless lock after a crash during its temporary owner w
     await lease.release();
     expect(await readdir(profile)).toEqual(["oracle-tab-leases.json"]);
   } finally {
-    await rm(profile, { recursive: true, force: true });
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }, 20_000);
