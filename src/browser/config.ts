@@ -72,6 +72,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   resumeConversationUrl: null,
   captureProviderNative: false,
   apps: [],
+  allowApps: [],
 };
 
 export function resolveBrowserConfig(
@@ -164,6 +165,7 @@ export function resolveBrowserConfig(
     captureProviderNative:
       config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative,
     apps: normalizeBrowserApps(config?.apps),
+    allowApps: normalizeBrowserAllowApps(config?.allowApps),
     manualLogin,
     manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
     manualLoginCookieSync:
@@ -197,6 +199,19 @@ export function normalizeBrowserApps(value: unknown): BrowserAppMention[] {
     apps.push(chipHtml ? { name, chipHtml } : { name });
   }
   return apps;
+}
+
+/** App names for auto-approval: trimmed, non-empty, de-duplicated case-insensitively. */
+export function normalizeBrowserAllowApps(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const names: string[] = [];
+  for (const entry of value) {
+    const name = typeof entry === "string" ? entry.trim() : "";
+    if (name && !names.some((existing) => existing.toLowerCase() === name.toLowerCase())) {
+      names.push(name);
+    }
+  }
+  return names;
 }
 
 function normalizeResearchMode(value: unknown): "off" | "search" | "deep" {

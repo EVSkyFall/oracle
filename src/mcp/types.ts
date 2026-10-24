@@ -35,6 +35,7 @@ export const consultInputSchema = z
     browserFollowUps: z.array(z.string()).optional(),
     browserApps: z.array(z.string()).optional(),
     browserAppChips: z.array(z.string()).optional(),
+    browserAllowApps: z.array(z.string()).optional(),
     browserKeepBrowser: z.boolean().optional(),
     generateImage: z.string().optional(),
     outputPath: z.string().optional(),

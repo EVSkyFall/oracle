@@ -6,6 +6,7 @@ import type { WriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import type {
+  BrowserAppApprovalRecord,
   BrowserAppMention,
   BrowserArchiveMode,
   BrowserArchiveResult,
@@ -97,6 +98,8 @@ export interface BrowserSessionConfig {
   captureProviderNative?: boolean;
   /** Apps mentioned in every submitted prompt (--browser-app / --browser-app-chip). */
   apps?: Array<BrowserAppMention | string>;
+  /** Apps whose tool-permission prompts are approved automatically (--browser-allow-app). */
+  allowApps?: string[];
 }
 
 export interface BrowserRecoveryTarget {
@@ -128,6 +131,8 @@ export interface BrowserRuntimeMetadata {
   researchPlan?: BrowserResearchPlanMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
+  /** Tool-permission prompts approved through --browser-allow-app (app, button, tool text, time). */
+  appApprovals?: BrowserAppApprovalRecord[];
 }
 
 export type BrowserHarvestState = "running" | "completed" | "stalled" | "detached";

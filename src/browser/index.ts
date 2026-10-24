@@ -17,6 +17,7 @@ import { redactBrowserConfigForDebugLog } from "./configLogging.js";
 import { copyChromeProfile } from "./profileCopy.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
 import type {
+  BrowserAppApprovalRecord,
   BrowserRunOptions,
   BrowserRunResult,
   BrowserLogger,
@@ -64,6 +65,7 @@ import {
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
+import { withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import {
   isGeneratedImageAssistantAnswer,
@@ -904,6 +906,8 @@ async function runBrowserModeInternal(
   let researchPlan: BrowserResearchPlanMetadata | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  const appApprovals: BrowserAppApprovalRecord[] = [];
+  const appApprovalMonitors = new Set<() => Promise<void>>();
   const buildRuntimeDiagnostics = () => ({
     chromePid: chrome.pid,
     chromePort: chrome.port,
@@ -935,6 +939,7 @@ async function runBrowserModeInternal(
       userDataDir,
       controllerPid: process.pid,
       researchPlan,
+      ...(appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {}),
     };
     try {
       await runtimeHintCb?.(hint, modelSelectionEvidence);
@@ -1256,6 +1261,21 @@ async function runBrowserModeInternal(
       cancellation.race(Promise.race([promise, disconnectPromise]));
     const { Network, Page, Runtime, Input, DOM, Target } = client;
     const loginClient = client;
+    const watchAppApprovals = <T>(operation: () => Promise<T>): Promise<T> =>
+      withAppApprovalMonitor(
+        Runtime,
+        Input,
+        {
+          allowApps: config.allowApps,
+          logger,
+          registry: appApprovalMonitors,
+          onApproval: async (record) => {
+            appApprovals.push(record);
+            await emitRuntimeHint();
+          },
+        },
+        operation,
+      );
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -1769,32 +1789,37 @@ async function runBrowserModeInternal(
       await releaseProfileLockIfHeld();
     }
     const imageArtifactMinTurnIndex = baselineTurns;
+    const researchClient = client;
     if (deepResearch) {
       await raceWithDisconnect(
-        waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
-          Page,
-          client,
-          ignoredTargetKeys: deepResearchTargetKeys,
-          targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-          minTurnIndex: baselineTurns,
-          onPlan: async (plan) => {
-            researchPlan = plan;
-            await emitRuntimeHint();
-          },
-        }),
-      );
-      const researchResult = await raceWithDisconnect(
-        waitForDeepResearchCompletion(
-          Runtime,
-          logger,
-          config.timeoutMs,
-          baselineTurns,
-          Page,
-          client,
-          {
+        watchAppApprovals(() =>
+          waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
+            Page,
+            client: researchClient,
             ignoredTargetKeys: deepResearchTargetKeys,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-          },
+            minTurnIndex: baselineTurns,
+            onPlan: async (plan) => {
+              researchPlan = plan;
+              await emitRuntimeHint();
+            },
+          }),
+        ),
+      );
+      const researchResult = await raceWithDisconnect(
+        watchAppApprovals(() =>
+          waitForDeepResearchCompletion(
+            Runtime,
+            logger,
+            config.timeoutMs,
+            baselineTurns,
+            Page,
+            researchClient,
+            {
+              ignoredTargetKeys: deepResearchTargetKeys,
+              targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+            },
+          ),
         ),
       );
       await updateConversationHint("post-deep-research", 15_000).catch(() => false);
@@ -1870,6 +1895,7 @@ async function runBrowserModeInternal(
         ownedRecoveryTarget,
         controllerPid: process.pid,
         researchPlan,
+        ...(appApprovals.length > 0 ? { appApprovals } : {}),
       };
     }
     const expectedConversationId = () =>
@@ -1880,7 +1906,7 @@ async function runBrowserModeInternal(
         intervalMs: options.heartbeatIntervalMs,
       });
       try {
-        return await operation();
+        return await watchAppApprovals(operation);
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -2317,6 +2343,7 @@ async function runBrowserModeInternal(
       submittedPromptHash,
       ownedRecoveryTarget,
       controllerPid: process.pid,
+      ...(appApprovals.length > 0 ? { appApprovals } : {}),
     };
   } catch (error) {
     if (options.signal?.aborted || error instanceof BrowserRunCancelledError) {
@@ -2442,6 +2469,7 @@ async function runBrowserModeInternal(
   } finally {
     await withoutBrowserCancellation(async () => {
       stopThinkingMonitor?.();
+      await Promise.all(Array.from(appApprovalMonitors, (stop) => stop()));
       await conversationUrlMonitor?.stop();
       try {
         if (!connectionClosedUnexpectedly) {
@@ -2854,6 +2882,8 @@ async function runRemoteBrowserMode(
   let attachedExistingTab = false;
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  const appApprovals: BrowserAppApprovalRecord[] = [];
+  const appApprovalMonitors = new Set<() => Promise<void>>();
   const runtimeHintCb = options.runtimeHintCb;
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
@@ -2872,6 +2902,7 @@ async function runRemoteBrowserMode(
           ownedRecoveryTarget,
           controllerPid: process.pid,
           researchPlan,
+          ...(appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {}),
         },
         modelSelectionEvidence,
       );
@@ -2995,6 +3026,21 @@ async function runRemoteBrowserMode(
     };
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    const watchAppApprovals = <T>(operation: () => Promise<T>): Promise<T> =>
+      withAppApprovalMonitor(
+        Runtime,
+        Input,
+        {
+          allowApps: config.allowApps,
+          logger,
+          registry: appApprovalMonitors,
+          onApproval: async (record) => {
+            appApprovals.push(record);
+            await emitRuntimeHint();
+          },
+        },
+        operation,
+      );
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -3265,29 +3311,34 @@ async function runRemoteBrowserMode(
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     const imageArtifactMinTurnIndex = baselineTurns;
+    const researchClient = client;
     if (deepResearch) {
-      await waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
-        Page,
-        client,
-        ignoredTargetKeys: deepResearchTargetKeys,
-        targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-        minTurnIndex: baselineTurns,
-        onPlan: async (plan) => {
-          researchPlan = plan;
-          await emitRuntimeHint();
-        },
-      });
-      const researchResult = await waitForDeepResearchCompletion(
-        Runtime,
-        logger,
-        config.timeoutMs,
-        baselineTurns,
-        Page,
-        client,
-        {
+      await watchAppApprovals(() =>
+        waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
+          Page,
+          client: researchClient,
           ignoredTargetKeys: deepResearchTargetKeys,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-        },
+          minTurnIndex: baselineTurns,
+          onPlan: async (plan) => {
+            researchPlan = plan;
+            await emitRuntimeHint();
+          },
+        }),
+      );
+      const researchResult = await watchAppApprovals(() =>
+        waitForDeepResearchCompletion(
+          Runtime,
+          logger,
+          config.timeoutMs,
+          baselineTurns,
+          Page,
+          researchClient,
+          {
+            ignoredTargetKeys: deepResearchTargetKeys,
+            targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+          },
+        ),
       );
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
       const durationMs = Date.now() - startedAt;
@@ -3360,6 +3411,7 @@ async function runRemoteBrowserMode(
         ownedRecoveryTarget,
         controllerPid: process.pid,
         researchPlan,
+        ...(appApprovals.length > 0 ? { appApprovals } : {}),
       };
     }
     const expectedConversationId = () =>
@@ -3370,7 +3422,7 @@ async function runRemoteBrowserMode(
         intervalMs: options.heartbeatIntervalMs,
       });
       try {
-        return await operation();
+        return await watchAppApprovals(operation);
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -3763,6 +3815,7 @@ async function runRemoteBrowserMode(
       modelSelection: modelSelectionEvidence,
       thinkingSelection: thinkingSelectionEvidence,
       controllerPid: process.pid,
+      ...(appApprovals.length > 0 ? { appApprovals } : {}),
     };
   } catch (error) {
     if (options.signal?.aborted || error instanceof BrowserRunCancelledError) {
@@ -3816,6 +3869,7 @@ async function runRemoteBrowserMode(
   } finally {
     await withoutBrowserCancellation(async () => {
       stopThinkingMonitor?.();
+      await Promise.all(Array.from(appApprovalMonitors, (stop) => stop()));
       await conversationUrlMonitor?.stop();
       removeDialogHandler?.();
       const keepRemoteBrowser = Boolean(config.keepBrowser);

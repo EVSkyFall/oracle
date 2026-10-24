@@ -437,6 +437,7 @@ async function executeAssembledBrowserSession({
       submittedPromptHash: browserResult.submittedPromptHash,
       researchPlan: browserResult.researchPlan,
       controllerPid: browserResult.controllerPid ?? process.pid,
+      ...(browserResult.appApprovals?.length ? { appApprovals: browserResult.appApprovals } : {}),
     },
     archive: browserResult.archive,
     modelSelection,

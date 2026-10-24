@@ -66,9 +66,9 @@ export function createRemoteBrowserExecutor({ host, token, runOptions }: RemoteE
         "Web Search is a local browser pilot; --remote-host does not negotiate this capability yet. Use local Chrome or --browser-attach-running.",
       );
     }
-    if ((options.config?.apps?.length ?? 0) > 0) {
+    if ((options.config?.apps?.length ?? 0) > 0 || (options.config?.allowApps?.length ?? 0) > 0) {
       throw new Error(
-        "App mentions (--browser-app) are a local browser feature; --remote-host does not negotiate this capability yet, and an older host would drop them silently. Use local Chrome or --browser-attach-running.",
+        "App mentions and app auto-approval (--browser-app, --browser-allow-app) are a local browser feature; --remote-host does not negotiate this capability yet, and an older host would drop them silently. Use local Chrome or --browser-attach-running.",
       );
     }
     const callerSignal = options.signal;

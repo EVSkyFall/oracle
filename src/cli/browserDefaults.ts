@@ -49,6 +49,7 @@ export interface BrowserDefaultsOptions {
   browserManualLoginCookieSync?: boolean;
   browserApp?: string[];
   browserAppChip?: string[];
+  browserAllowApp?: string[];
 }
 
 const stringList = (value: unknown): string[] | undefined =>
@@ -231,5 +232,9 @@ export function applyBrowserDefaultsFromConfig(
   const configuredAppChips = stringList(browser.appChipFiles);
   if (isUnset("browserAppChip") && configuredAppChips) {
     options.browserAppChip = configuredAppChips;
+  }
+  const configuredAllowApps = stringList(browser.allowApps);
+  if (isUnset("browserAllowApp") && configuredAllowApps) {
+    options.browserAllowApp = configuredAllowApps;
   }
 }

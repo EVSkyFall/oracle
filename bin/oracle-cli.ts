@@ -167,6 +167,7 @@ interface CliOptions extends OptionValues {
   browserFollowUp?: string[];
   browserApp?: string[];
   browserAppChip?: string[];
+  browserAllowApp?: string[];
   browserAllowCookieErrors?: boolean;
   browserAttachments?: string;
   browserInlineFiles?: boolean;
@@ -884,6 +885,14 @@ program
     new Option(
       "--browser-app-chip <file>",
       "Mention an app by pasting chip HTML copied from ChatGPT (file contents); repeatable. Used before the @ picker for that app, which stays the fallback.",
+    )
+      .argParser(collectTextValues)
+      .default([]),
+  )
+  .addOption(
+    new Option(
+      "--browser-allow-app <name>",
+      "Approve this app's ChatGPT tool-permission prompts automatically while Oracle waits for a response (Always allow > Allow once > Allow); repeatable, off by default. Prompts that name no listed app are left for you.",
     )
       .argParser(collectTextValues)
       .default([]),
@@ -2291,6 +2300,13 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     throw new Error(
       "--browser-app/--browser-app-chip require a ChatGPT run with --engine browser.",
     );
+  }
+  if (
+    getSource("browserAllowApp") === "cli" &&
+    (options.browserAllowApp?.length ?? 0) > 0 &&
+    (engine !== "browser" || activeModel.startsWith("gemini"))
+  ) {
+    throw new Error("--browser-allow-app requires a ChatGPT run with --engine browser.");
   }
 
   const sessionMode: SessionMode = engine === "browser" ? "browser" : "api";

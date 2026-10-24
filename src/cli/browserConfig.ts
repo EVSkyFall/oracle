@@ -7,7 +7,11 @@ import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "../browser/constants.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import { parseDuration } from "../duration.js";
-import { resolveBrowserApprovalWait, resolveBrowserNoFocus } from "../browser/config.js";
+import {
+  normalizeBrowserAllowApps,
+  resolveBrowserApprovalWait,
+  resolveBrowserNoFocus,
+} from "../browser/config.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type {
   BrowserArchiveMode,
@@ -111,6 +115,7 @@ export interface BrowserFlagOptions {
   browserDebugPort?: number;
   browserApp?: string[];
   browserAppChip?: string[];
+  browserAllowApp?: string[];
   model: ModelName;
   verbose?: boolean;
 }
@@ -269,6 +274,7 @@ export async function buildBrowserConfig(
     : shouldUseOverride
       ? desiredModelOverride
       : mapModelToBrowserLabel(options.model);
+  const allowApps = normalizeBrowserAllowApps(options.browserAllowApp);
 
   return {
     chromeProfile: options.copyProfile
@@ -373,6 +379,7 @@ export async function buildBrowserConfig(
     archiveConversations: options.browserArchive,
     captureProviderNative: options.browserCaptureProviderNative,
     apps: await resolveBrowserAppMentions(options.browserApp, options.browserAppChip),
+    allowApps: allowApps.length > 0 ? allowApps : undefined,
   };
 }
 

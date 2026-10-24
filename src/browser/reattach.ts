@@ -22,6 +22,7 @@ import {
   listRemoteChromeTargets,
 } from "./chromeLifecycle.js";
 import {
+  normalizeBrowserAllowApps,
   resolveBrowserApprovalWait,
   resolveBrowserConfig,
   resolveBrowserNoFocus,
@@ -46,6 +47,7 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+import { withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
@@ -252,14 +254,28 @@ async function resumeBrowserSessionInternal(
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+    const approvalMonitor = {
+      allowApps: normalizeBrowserAllowApps(config?.allowApps),
+      logger,
+    };
     if (config?.researchMode === "deep") {
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
       const researchResult = await withTimeout(
         cancellation.call(() =>
-          waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
-            requireScopedTargetOwner: true,
-          }),
+          withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
+            waitForDeepResearch(
+              Runtime,
+              logger,
+              timeoutMs,
+              minTurnIndex ?? undefined,
+              Page,
+              client,
+              {
+                requireScopedTargetOwner: true,
+              },
+            ),
+          ),
         ),
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
@@ -275,7 +291,9 @@ async function resumeBrowserSessionInternal(
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const answer = await withTimeout(
       cancellation.call(() =>
-        waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+        withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
+          waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+        ),
       ),
       timeoutMs + 5_000,
       "Reattach response timed out",
@@ -521,13 +539,16 @@ async function resumeBrowserSessionViaNewChrome(
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+    const approvalMonitor = { allowApps: resolved.allowApps, logger };
     if (resolved.researchMode === "deep") {
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
       const researchResult = await cancellation.call(() =>
-        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
-          requireScopedTargetOwner: true,
-        }),
+        withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
+          waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
+            requireScopedTargetOwner: true,
+          }),
+        ),
       );
       return {
         answerText: researchResult.text,
@@ -536,7 +557,9 @@ async function resumeBrowserSessionViaNewChrome(
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const answer = await cancellation.call(() =>
-      waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+      withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
+        waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+      ),
     );
     const recovered = await cancellation.call(() =>
       recoverPromptEcho(Runtime, answer, promptEcho, logger, minTurnIndex, timeoutMs),

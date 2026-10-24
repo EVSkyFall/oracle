@@ -90,6 +90,11 @@ export interface BrowserConfigDefaults {
   apps?: string[];
   /** Chip HTML files copied from ChatGPT, one per app (--browser-app-chip). User config only. */
   appChipFiles?: string[];
+  /**
+   * Apps whose tool-permission prompts are approved automatically (--browser-allow-app).
+   * User config only: a project config must never lift this check.
+   */
+  allowApps?: string[];
 }
 
 export interface AzureConfig {

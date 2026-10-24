@@ -31,6 +31,16 @@ export type BrowserLogger = ((message: string) => void) & {
   sessionLog?: (message: string) => void;
 };
 
+/** One tool-permission prompt Oracle approved because its app was in allowApps. */
+export interface BrowserAppApprovalRecord {
+  app: string;
+  /** Label of the clicked button, e.g. "Always allow". */
+  button: string;
+  /** The card's text without its buttons: what ChatGPT asked to run. */
+  toolText: string;
+  approvedAt: string;
+}
+
 /** A ChatGPT app/connector to mention in each prompt (for example CODEXish). */
 export interface BrowserAppMention {
   /** Display name as ChatGPT shows it; matched case-insensitively. */
@@ -157,6 +167,11 @@ export interface BrowserAutomationConfig {
    * a mention that cannot be verified stops the send.
    */
   apps?: Array<BrowserAppMention | string>;
+  /**
+   * Apps whose tool-permission prompts Oracle approves while it waits for a response
+   * (Always allow > Allow once > Allow). Off unless listed; other prompts are left alone.
+   */
+  allowApps?: string[];
 }
 
 export interface BrowserRunOptions {
@@ -260,6 +275,8 @@ export interface BrowserRunResult {
   submittedPromptHash?: string | null;
   researchPlan?: BrowserResearchPlanMetadata;
   controllerPid?: number;
+  /** Tool-permission prompts approved through allowApps during this run. */
+  appApprovals?: BrowserAppApprovalRecord[];
 }
 
 export type ResolvedBrowserConfig = Required<

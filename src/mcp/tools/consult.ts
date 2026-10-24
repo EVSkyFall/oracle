@@ -27,7 +27,11 @@ export async function readSessionLogTail(
 import { performSessionRun } from "../../cli/sessionRunner.js";
 import { runDryRunSummary } from "../../cli/dryRun.js";
 import { CHATGPT_URL } from "../../browser/constants.js";
-import { normalizeBrowserApps, resolveBrowserNoFocus } from "../../browser/config.js";
+import {
+  normalizeBrowserAllowApps,
+  normalizeBrowserApps,
+  resolveBrowserNoFocus,
+} from "../../browser/config.js";
 import { resolveBrowserAppMentions } from "../../cli/browserApps.js";
 import { CONSULT_PRESETS, browserThinkingTimeRawSchema, consultInputSchema } from "../types.js";
 import { applyConsultPreset } from "../consultPresets.js";
@@ -135,6 +139,12 @@ const consultInputShape = {
     .optional()
     .describe(
       "Browser-only (ChatGPT): paths of files holding mention chip HTML copied from ChatGPT; pasted before trying the @ picker.",
+    ),
+  browserAllowApps: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Browser-only (ChatGPT): apps whose tool-permission prompts Oracle approves automatically while it waits (Always allow > Allow once > Allow). Off unless listed; prompts naming other apps are left alone.",
     ),
   browserKeepBrowser: z
     .boolean()
@@ -352,6 +362,7 @@ export function buildConsultBrowserConfig({
   browserArchive,
   browserKeepBrowser,
   apps,
+  browserAllowApps,
 }: {
   userConfig: UserConfig;
   env: Record<string, string | undefined>;
@@ -365,13 +376,16 @@ export function buildConsultBrowserConfig({
   browserKeepBrowser?: boolean;
   /** Resolved app mentions; defaults to the configured app names. */
   apps?: BrowserAppMention[];
+  browserAllowApps?: string[];
 }): BrowserSessionConfig {
   // Config-only keys are resolved here, not copied into the session config.
   const {
     apps: configuredApps,
     appChipFiles: _appChipFiles,
+    allowApps: configuredAllowApps,
     ...configuredBrowser
   } = userConfig.browser ?? {};
+  const allowApps = normalizeBrowserAllowApps(browserAllowApps ?? configuredAllowApps);
   const envProfileDir = (env.ORACLE_BROWSER_PROFILE_DIR ?? "").trim();
   const hasProfileDir = envProfileDir.length > 0;
   const preferredLabel = (browserModelLabel ?? inputModel)?.trim();
@@ -417,6 +431,7 @@ export function buildConsultBrowserConfig({
     desiredModel: desiredModelLabel || mapModelToBrowserLabel(runModel),
     modelIsImplicitDefault: !inputModel && !userConfig.model && !browserModelLabel,
     ...(resolvedApps.length > 0 ? { apps: resolvedApps } : {}),
+    ...(allowApps.length > 0 ? { allowApps } : {}),
   };
 }
 
@@ -579,6 +594,7 @@ export async function runConsultTool(
     browserFollowUps,
     browserApps,
     browserAppChips,
+    browserAllowApps,
     browserKeepBrowser,
     generateImage,
     outputPath,
@@ -645,6 +661,7 @@ export async function runConsultTool(
       browserArchive,
       browserKeepBrowser,
       apps,
+      browserAllowApps,
     });
   }
 
