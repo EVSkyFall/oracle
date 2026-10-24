@@ -1674,6 +1674,7 @@ async function runBrowserModeInternal(
         attachmentNavigationUrl,
         onPromptSubmitted: markPromptSubmitted,
         webSearch: config.researchMode === "search",
+        deepResearch,
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -3200,6 +3201,7 @@ async function runRemoteBrowserMode(
         attachmentNavigationUrl,
         onPromptSubmitted: markPromptSubmitted,
         webSearch: config.researchMode === "search",
+        deepResearch,
       };
       const deepResearchTargetBaseline =
         deepResearch && client

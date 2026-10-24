@@ -1,7 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   COMPOSER_PLUS_SELECTORS,
+  COMPOSER_TOKEN_SELECTOR,
   buildComposerPanelStateExpression,
+  readComposerPromptText,
   composerRowTitleEquals,
   findComposerPlusButton,
   guardedTrustedClick,
@@ -118,6 +120,65 @@ describe("composer panel row titles", () => {
         ["Deep research"],
       ),
     ).toBe(true);
+  });
+});
+
+class TextNodeElement extends FakeElement {
+  constructor(
+    tag: string,
+    attrs: Record<string, string> = {},
+    readonly nodes: Array<TextNodeElement | string> = [],
+  ) {
+    super(
+      tag,
+      attrs,
+      nodes.filter((node): node is TextNodeElement => typeof node !== "string"),
+    );
+  }
+  nodeType = 1;
+  get nodeName() {
+    return this.tagName;
+  }
+  get childNodes(): Array<
+    TextNodeElement | { nodeType: number; nodeName: string; nodeValue: string }
+  > {
+    return this.nodes.map((node) =>
+      typeof node === "string" ? { nodeType: 3, nodeName: "#text", nodeValue: node } : node,
+    );
+  }
+  cloneNode(): TextNodeElement {
+    return new TextNodeElement(
+      this.tagName,
+      Object.fromEntries(
+        ["app-mention-name", "data-prompt-link-href", "class"]
+          .map((name) => [name, this.getAttribute(name)])
+          .filter((entry): entry is [string, string] => entry[1] !== null),
+      ),
+      this.nodes.map((node) => (typeof node === "string" ? node : node.cloneNode())),
+    );
+  }
+  override remove() {
+    const parent = this.parentElement as TextNodeElement | null;
+    super.remove();
+    if (parent) parent.nodes.splice(parent.nodes.indexOf(this), 1);
+  }
+}
+
+describe("staged prompt text", () => {
+  test("drops mentions and keeps paragraph breaks", () => {
+    const mention = new TextNodeElement(
+      "span",
+      { "app-mention-name": "codexish", "data-prompt-link-href": "app://asdk_app_example" },
+      ["CODEXish"],
+    );
+    const editor = new TextNodeElement("div", {}, [
+      new TextNodeElement("p", {}, [mention, " First line"]),
+      new TextNodeElement("p", {}, ["Second line"]),
+    ]);
+    expect(readComposerPromptText(editor as unknown as Element, COMPOSER_TOKEN_SELECTOR)).toEqual({
+      text: " First line\nSecond line",
+      tokens: 1,
+    });
   });
 });
 

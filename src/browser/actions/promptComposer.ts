@@ -30,7 +30,13 @@ import { buildAttachmentProgressExpression } from "./attachmentProgress.js";
 import { buildActiveComposerRootExpression } from "./composerRoot.js";
 import { buildInstallCompletionAnnouncementExpression } from "./completionAnnouncement.js";
 import { activateWebSearch } from "./webSearch.js";
-import { COMPOSER_PLUS_SELECTORS, findComposerPlusButton } from "./composerTools.js";
+import {
+  COMPOSER_PLUS_SELECTORS,
+  COMPOSER_TOKEN_SELECTOR,
+  findComposerPlusButton,
+  readComposerPromptText,
+} from "./composerTools.js";
+import { hasDeepResearchMention } from "./deepResearch.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -70,6 +76,8 @@ export async function submitPrompt(
     attachmentTimeoutMs?: number | null;
     onPromptSubmitted?: () => Promise<void> | void;
     webSearch?: boolean;
+    /** Deep Research was activated before staging; its editor mention must still be there. */
+    deepResearch?: boolean;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -181,20 +189,13 @@ export async function submitPrompt(
           i = end;
         }
         // innerText adds layout spacing between paragraphs. Read actual hard breaks and block
-        // boundaries instead, ignoring only ProseMirror's decorative trailing break.
-        const readText = node => {
-          if (node.nodeType === 3) return node.nodeValue || '';
-          if (node.nodeName === 'BR') return node.classList.contains('ProseMirror-trailingBreak') ? '' : '\\n';
-          const children = Array.from(node.childNodes || []);
-          return children.map((child, index) => {
-            const previous = children[index - 1];
-            const block = value => /^(P|DIV|PRE|LI)$/.test(value?.nodeName || '');
-            return (index > 0 && (block(child) || block(previous)) ? '\\n' : '') + readText(child);
-          }).join('');
-        };
+        // boundaries instead, without mentions/pills staged before the text (a mention leaves
+        // its separating space ahead of the prompt).
+        const staged = (${readComposerPromptText.toString()})(editor, ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)});
         const normalize = value => value.replace(/\\r\\n?/g, '\\n');
-        const landed = normalize(readText(editor));
-        const expected = normalize(text);
+        const comparable = value => staged.tokens > 0 ? value.replace(/^\\s+/, '') : value;
+        const landed = comparable(normalize(staged.text));
+        const expected = comparable(normalize(text));
         const convertedToFile = chips() > chipsBefore;
         return { used: true, length: landed.length, expected: expected.length, complete: landed === expected, convertedToFile };
       })()`,
@@ -239,9 +240,13 @@ export async function submitPrompt(
       const editor = document.querySelector(${primarySelectorLiteral});
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
+      const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
+      const readPrompt = ${readComposerPromptText.toString()};
       const readValue = (node) => {
         if (!node) return '';
         if (node instanceof HTMLTextAreaElement) return node.value ?? '';
+        // A staged mention or tool pill is not prompt text.
+        if (node.querySelector?.(tokenSelector)) return readPrompt(node, tokenSelector).text;
         return node.innerText ?? '';
       };
       const isVisible = (node) => {
@@ -254,7 +259,7 @@ export async function submitPrompt(
         .filter((node) => Boolean(node));
       const active = candidates.find((node) => isVisible(node)) || candidates[0] || null;
       return {
-        editorText: editor?.innerText ?? '',
+        editorText: readValue(editor),
         fallbackValue: fallback?.value ?? '',
         activeValue: active ? readValue(active) : '',
       };
@@ -279,7 +284,17 @@ export async function submitPrompt(
           fallback.dispatchEvent(new Event('change', { bubbles: true }));
         }
         const editor = document.querySelector(${primarySelectorLiteral});
-        if (editor) {
+        if (editor && editor.querySelector(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)})) {
+          // Replacing textContent would drop the staged mentions; insert after them instead.
+          editor.focus();
+          const selection = document.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(editor);
+          range.collapse(false);
+          selection?.removeAllRanges();
+          selection?.addRange(range);
+          document.execCommand('insertText', false, ${encodedPrompt});
+        } else if (editor) {
           editor.textContent = ${encodedPrompt};
           // Nudge ProseMirror to register the textContent write so its state/send-button updates
           editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
@@ -293,9 +308,13 @@ export async function submitPrompt(
       const editor = document.querySelector(${primarySelectorLiteral});
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
+      const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
+      const readPrompt = ${readComposerPromptText.toString()};
       const readValue = (node) => {
         if (!node) return '';
         if (node instanceof HTMLTextAreaElement) return node.value ?? '';
+        // A staged mention or tool pill is not prompt text.
+        if (node.querySelector?.(tokenSelector)) return readPrompt(node, tokenSelector).text;
         return node.innerText ?? '';
       };
       const isVisible = (node) => {
@@ -308,7 +327,7 @@ export async function submitPrompt(
         .filter((node) => Boolean(node));
       const active = candidates.find((node) => isVisible(node)) || candidates[0] || null;
       return {
-        editorText: editor?.innerText ?? '',
+        editorText: readValue(editor),
         fallbackValue: fallback?.value ?? '',
         activeValue: active ? readValue(active) : '',
       };
@@ -340,6 +359,13 @@ export async function submitPrompt(
   }
 
   if (deps.webSearch) await activateWebSearch(runtime, input, prompt, logger);
+  if (deps.deepResearch && !(await hasDeepResearchMention(runtime))) {
+    // Without the mention ChatGPT answers normally instead of starting Deep Research.
+    throw new BrowserAutomationError(
+      "The Deep research mention left the composer while the prompt was staged; nothing was sent.",
+      { stage: "submit-prompt", code: "deep-research-mention-lost" },
+    );
+  }
   await warnIfChatListRateLimited(runtime, logger);
 
   // Install before the click: a short answer can complete while commit verification runs.

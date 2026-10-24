@@ -35,6 +35,39 @@ export const COMPOSER_TOKEN_SELECTOR = [
   "[data-prompt-link-href]",
 ].join(", ");
 
+/**
+ * Reads the editor's prompt text without inline tokens: hard breaks and block boundaries become
+ * newlines and ProseMirror's decorative trailing break is ignored. Injected into the page with
+ * Function.prototype.toString.
+ */
+export function readComposerPromptText(
+  editor: Element,
+  tokenSelector: string,
+): { text: string; tokens: number } {
+  if (typeof HTMLTextAreaElement !== "undefined" && editor instanceof HTMLTextAreaElement) {
+    return { text: editor.value ?? "", tokens: 0 };
+  }
+  const copy = editor.cloneNode(true) as Element;
+  const tokens = Array.from(copy.querySelectorAll(tokenSelector));
+  for (const token of tokens) token.remove();
+  const isBlock = (node: Node | undefined) => /^(P|DIV|PRE|LI)$/.test(node?.nodeName || "");
+  const readText = (node: Node): string => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeName === "BR") {
+      return (node as Element).classList?.contains("ProseMirror-trailingBreak") ? "" : "\n";
+    }
+    const children = Array.from(node.childNodes || []);
+    return children
+      .map(
+        (child, index) =>
+          (index > 0 && (isBlock(child) || isBlock(children[index - 1])) ? "\n" : "") +
+          readText(child),
+      )
+      .join("");
+  };
+  return { text: readText(copy), tokens: tokens.length };
+}
+
 /** Rows of the "+" panel and of the "@" mention picker share this list item. */
 export const COMPOSER_PANEL_ROW_SELECTOR = "button[data-list-navigation-item]";
 const LEGACY_PANEL_ROOT_SELECTOR =

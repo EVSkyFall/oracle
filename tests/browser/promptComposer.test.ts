@@ -919,6 +919,48 @@ describe("promptComposer", () => {
     );
   });
 
+  test("refuses to send when the Deep research mention left the composer", async () => {
+    const onPromptSubmitted = vi.fn();
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("document.readyState")) {
+          return { result: { value: { ready: true, composer: true, fileInput: false } } };
+        }
+        if (expression.includes("focused: true")) {
+          return { result: { value: { focused: true } } };
+        }
+        if (expression.includes("editorText")) {
+          return {
+            result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
+          };
+        }
+        if (expression.includes('app-mention-name=\\"deep-research\\"')) {
+          return { result: { value: false } };
+        }
+        throw new Error(`unexpected expression: ${expression.slice(0, 80)}`);
+      }),
+    };
+    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn(), dispatchMouseEvent: vi.fn() };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await expect(
+      submitPrompt(
+        {
+          runtime: runtime as never,
+          input: input as never,
+          baselineTurns: 0,
+          onPromptSubmitted,
+          deepResearch: true,
+        },
+        "hello",
+        logger as never,
+      ),
+    ).rejects.toMatchObject({ details: { code: "deep-research-mention-lost" } });
+    expect(onPromptSubmitted).not.toHaveBeenCalled();
+    expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+    expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
+  });
+
   test("does not send Enter while a trusted click commits after the old fallback deadline", async () => {
     vi.useFakeTimers();
     try {

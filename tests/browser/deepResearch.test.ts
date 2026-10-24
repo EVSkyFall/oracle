@@ -10,9 +10,20 @@ vi.mock("../../src/browser/utils.js", async (importOriginal) => {
   };
 });
 
+const composerMocks = vi.hoisted(() => ({
+  openComposerPlusPanel: vi.fn(),
+  clickComposerPanelRow: vi.fn(),
+  closeComposerPlusPanel: vi.fn(),
+}));
+vi.mock("../../src/browser/actions/composerTools.js", async (importOriginal) => ({
+  ...((await importOriginal()) as Record<string, unknown>),
+  ...composerMocks,
+}));
+
 import {
   activateDeepResearch,
-  buildActivateDeepResearchExpressionForTest,
+  buildDeepResearchMentionExpression,
+  findDeepResearchPanelRow,
   buildDeepResearchCompletionPollExpressionForTest,
   buildDeepResearchFrameStatusExpressionForTest,
   buildDeepResearchStatusExpressionForTest,
@@ -71,222 +82,184 @@ function createFrameOwnerClient(
 }
 
 describe("activateDeepResearch", () => {
-  let mockRuntime: ReturnType<typeof createMockRuntime>;
-  let mockInput: Record<string, unknown>;
+  const editorUrl = "https://chatgpt.com/";
+  const panelRow = (title: string, impression: string | null = null, text = title) => ({
+    index: 0,
+    title,
+    leaf: title,
+    aria: "",
+    text,
+    impression,
+    current: false,
+  });
+  let mentionAfterClick: boolean;
+  let mockRuntime: { evaluate: ReturnType<typeof vi.fn> };
   let mockLogger: BrowserLogger;
 
   beforeEach(() => {
-    mockRuntime = createMockRuntime();
-    mockInput = {};
+    mentionAfterClick = true;
+    let clicked = false;
+    composerMocks.openComposerPlusPanel.mockReset().mockResolvedValue({
+      status: "opened",
+      method: "trusted-click",
+      startUrl: editorUrl,
+    });
+    composerMocks.clickComposerPanelRow.mockReset().mockImplementation(async (_r, _i, options) => {
+      const rows = [
+        panelRow("GitHub", "connector_github"),
+        panelRow("Deep research", "connector_openai_deep_research"),
+      ];
+      const index = options.pick(rows);
+      clicked = index === 1;
+      return clicked ? { status: "clicked", row: rows[index], rows } : { status: "missing", rows };
+    });
+    composerMocks.closeComposerPlusPanel.mockReset().mockResolvedValue(true);
+    mockRuntime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "location.href") return { result: { value: editorUrl } };
+        if (expression.includes("app-mention-name")) {
+          return { result: { value: clicked && mentionAfterClick } };
+        }
+        throw new Error(`unexpected expression: ${expression.slice(0, 60)}`);
+      }),
+    };
     mockLogger = createMockLogger();
   });
 
-  it("activates Deep Research when all steps succeed", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: { value: { status: "activated" } },
-    });
+  it("selects the + panel row and verifies the editor mention", async () => {
     await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
+      activateDeepResearch(mockRuntime as never, {} as never, mockLogger),
     ).resolves.toBeUndefined();
+    expect(composerMocks.openComposerPlusPanel).toHaveBeenCalledWith(
+      mockRuntime,
+      {},
+      expect.objectContaining({ navigationUrl: editorUrl, stage: "deep-research-activate" }),
+    );
+    expect(composerMocks.clickComposerPanelRow).toHaveBeenCalledOnce();
+    expect(composerMocks.closeComposerPlusPanel).toHaveBeenCalled();
     expect(mockLogger).toHaveBeenCalledWith("Deep Research mode activated");
   });
 
-  it("returns early when already active", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: { value: { status: "already-active" } },
-    });
+  it("returns early only when the mention is already in the editor", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: true } });
     await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
+      activateDeepResearch(mockRuntime as never, {} as never, mockLogger),
     ).resolves.toBeUndefined();
-    expect(mockLogger).toHaveBeenCalledWith("Deep Research mode already active");
+    expect(composerMocks.openComposerPlusPanel).not.toHaveBeenCalled();
+    expect(mockLogger).toHaveBeenCalledWith(
+      "Deep Research mode already active (Deep research mention in the composer)",
+    );
   });
 
-  it("throws when plus button is missing", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: { value: { status: "plus-button-missing" } },
+  it("throws when the composer + menu cannot be opened", async () => {
+    composerMocks.openComposerPlusPanel.mockResolvedValueOnce({
+      status: "unavailable",
+      method: "none",
+      startUrl: editorUrl,
+      reason: "composer + button not found",
     });
     await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
-    ).rejects.toThrow(/composer plus button/);
+      activateDeepResearch(mockRuntime as never, {} as never, mockLogger),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/composer plus button.*not found/),
+      details: { code: "plus-button-missing" },
+    });
   });
 
-  it("throws with available options when Deep Research item missing", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: {
-        value: {
-          status: "dropdown-item-missing",
-          available: ["Create image", "Web search"],
-        },
-      },
+  it("throws with the available rows when Deep research is missing", async () => {
+    composerMocks.clickComposerPanelRow.mockResolvedValueOnce({
+      status: "missing",
+      rows: [panelRow("Create image"), panelRow("Web search")],
     });
     await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
-    ).rejects.toThrow(/not found.*Create image/);
+      activateDeepResearch(mockRuntime as never, {} as never, mockLogger),
+    ).rejects.toThrow(/not found.*Create image, Web search/);
+    expect(composerMocks.closeComposerPlusPanel).toHaveBeenCalled();
   });
 
-  it("throws when pill does not confirm", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: { value: { status: "pill-not-confirmed" } },
-    });
+  it("fails before submit when the mention never appears", async () => {
+    mentionAfterClick = false;
     await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
-    ).rejects.toThrow(/pill did not appear/);
-  });
-
-  it("falls back to a trusted point click when the menu row ignores synthetic clicks", async () => {
-    const dispatchMouseEvent = vi.fn(async () => undefined);
-    mockInput = { dispatchMouseEvent };
-    mockRuntime.evaluate
-      .mockResolvedValueOnce({
-        result: { value: { status: "pill-not-confirmed", clickPoint: { x: 12, y: 34 } } },
-      })
-      .mockResolvedValueOnce({ result: { value: true } });
-
-    await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
-    ).resolves.toBeUndefined();
-    expect(dispatchMouseEvent).toHaveBeenCalledTimes(3);
-    expect(dispatchMouseEvent).toHaveBeenCalledWith({
-      type: "mousePressed",
-      x: 12,
-      y: 34,
-      button: "left",
-      clickCount: 1,
-    });
-    expect(mockLogger).toHaveBeenCalledWith("Deep Research mode activated");
-  });
-
-  it("throws on unexpected result", async () => {
-    mockRuntime.evaluate.mockResolvedValueOnce({
-      result: { value: { status: "unknown-status" } },
-    });
-    await expect(
-      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
-    ).rejects.toThrow(/Unexpected result/);
+      activateDeepResearch(mockRuntime as never, {} as never, mockLogger),
+    ).rejects.toMatchObject({ details: { code: "pill-not-confirmed" } });
+    expect(composerMocks.closeComposerPlusPanel).toHaveBeenCalled();
   });
 });
 
-describe("Deep Research activation expression", () => {
-  it("uses the composer tools menu without mutating the queued prompt", () => {
-    const expression = buildActivateDeepResearchExpressionForTest();
+describe("Deep Research detection and row choice", () => {
+  const evaluateMention = (document: FakeDocument) =>
+    new Function("document", `return ${buildDeepResearchMentionExpression()}`)(document);
 
-    expect(expression).not.toContain("/Deepresearch");
-    expect(expression).toContain("findDeepResearchItem");
-    expect(expression).toContain("findPopoverSearchInput");
-    expect(expression).toContain("composer-plus-btn");
-    expect(expression).toContain('role="menuitemradio"');
-    expect(expression).toContain(".__menu-item");
-    expect(expression).toContain("popover");
-    expect(expression).toContain("detailed report");
-    expect(expression).toContain("descriptionLabels");
-    expect(expression).toContain("深度研究");
-    expect(expression).toContain("获取详细报告");
-    expect(expression).toContain("添加文件");
-    expect(expression).toContain('[class*="composer-pill"]');
-    expect(expression).toContain("deep research");
-    expect(expression).toContain("already-active");
+  it("is active only with the Deep research mention inside the editor", () => {
+    const chip = new FakeElement("button", { class: "composer-pill" }, [], "Deep research");
+    const idleEditor = new FakeElement("div", { contenteditable: "true", role: "textbox" });
+    expect(evaluateMention(new FakeDocument([chip, idleEditor]))).toBe(false);
+    const mention = new FakeElement(
+      "span",
+      {
+        "app-mention-name": "deep-research",
+        "app-mention-path": "app://connector_openai_deep_research",
+        "data-prompt-link-label": "$deep-research",
+      },
+      [],
+      "Deep research",
+    );
+    const activeEditor = new FakeElement("div", { contenteditable: "true", role: "textbox" }, [
+      new FakeElement("p", {}, [mention]),
+    ]);
+    expect(evaluateMention(new FakeDocument([activeEditor]))).toBe(true);
   });
 
   it.each([
-    ["深度研究 获取详细报告", "深度研究", "添加文件等"],
-    ["DeepResearch", "Deep research", "Add files and more"],
-    ["Deep Research Get a detailed report", "Deep research", "Add files and more"],
-  ])("activates %s without clicking the GitHub connector", async (row, pill, plusLabel) => {
-    const expression = buildActivateDeepResearchExpressionForTest();
-    let menuOpen = false;
-    let activated = false;
-
-    class FakeEventTarget {
-      dispatchEvent(event: { type?: string }) {
-        if (event.type === "click") this.onClick();
-        return true;
-      }
-
-      onClick() {}
-    }
-
-    class FakeElement extends FakeEventTarget {
-      className = "__menu-item";
-      clickCount = 0;
-
-      constructor(
-        readonly textContent: string,
-        private readonly ariaLabel = "",
-        private readonly inPopover = false,
-        private readonly clickAction?: () => void,
-      ) {
-        super();
-      }
-
-      getAttribute(name: string) {
-        return name === "aria-label" ? this.ariaLabel : null;
-      }
-
-      getBoundingClientRect() {
-        return { left: 10, top: 20, width: 200, height: 40 };
-      }
-
-      closest(selector: string) {
-        if (selector.includes("popover")) return this.inPopover ? popover : null;
-        return this;
-      }
-
-      querySelector() {
-        return null;
-      }
-
-      querySelectorAll() {
-        return [];
-      }
-
-      scrollIntoView() {}
-
-      override onClick() {
-        this.clickCount += 1;
-        this.clickAction?.();
-      }
-    }
-
-    const popover = {};
-    const plusButton = new FakeElement("", plusLabel, false, () => {
-      menuOpen = true;
-    });
-    const githubRow = new FakeElement("GitHub 搜索和引用代码", "", true);
-    const deepResearchRow = new FakeElement(row, "", true, () => {
-      activated = true;
-    });
-    const deepResearchPill = new FakeElement(pill);
-    const menuRows = [githubRow, deepResearchRow];
-    const document = {
-      querySelector: () => null,
-      querySelectorAll: (selector: string) => {
-        if (selector.includes("composer-pill")) return activated ? [deepResearchPill] : [];
-        if (selector === '[data-testid="composer"], form, [class*="composer"]') return [];
-        if (selector === 'input, textarea, [contenteditable="true"]') return [];
-        if (selector === "button") return [plusButton];
-        if (selector.includes('[role="menuitemradio"]')) return menuOpen ? menuRows : [];
-        return [];
-      },
-    };
-    class FakeMouseEvent {
-      constructor(readonly type: string) {}
-    }
-
-    const result = (await new vm.Script(expression).runInNewContext({
-      document,
-      Element: FakeElement,
-      EventTarget: FakeEventTarget,
-      MouseEvent: FakeMouseEvent,
-      window: { getComputedStyle: () => ({ visibility: "visible", display: "block" }) },
-      setTimeout: (callback: () => void) => {
-        callback();
-        return 0;
-      },
-    })) as { status?: string };
-
-    expect(result.status).toBe("activated");
-    expect(deepResearchRow.clickCount).toBeGreaterThan(0);
-    expect(githubRow.clickCount).toBe(0);
+    [
+      [
+        ["GitHub", "connector_github"],
+        ["Deep research", "connector_openai_deep_research"],
+      ],
+      1,
+    ],
+    [
+      [
+        ["Create image", null],
+        ["Deep research", null],
+      ],
+      1,
+    ],
+    [
+      [
+        ["GitHub 搜索和引用代码", null],
+        ["深度研究", null],
+      ],
+      1,
+    ],
+    [
+      [
+        ["GitHub", null],
+        ["DeepResearchGet a detailed report", null],
+      ],
+      1,
+    ],
+    [
+      [
+        ["GitHub", "connector_github"],
+        ["Web search", null],
+      ],
+      -1,
+    ],
+  ] as const)("chooses the Deep research row from %j", (rows, expected) => {
+    expect(
+      findDeepResearchPanelRow(
+        rows.map(([title, impression], index) => ({
+          index,
+          title,
+          leaf: title,
+          aria: "",
+          text: title,
+          impression,
+          current: false,
+        })),
+      ),
+    ).toBe(expected);
   });
 });
 

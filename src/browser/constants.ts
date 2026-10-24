@@ -110,9 +110,7 @@ export const ACTION_BAR_COPY_BUTTON_SELECTOR = [
   '[data-talvt-turn-state] button:is([aria-label="Copy"], [aria-label="コピーする"], [aria-label="复制"]):not(pre button, code button, [data-user-message-bubble] button, [data-message-author-role="user"] button, [data-content-search-unit-key$=":user"] button, [data-chatgpt-search-unit-key$=":user"] button)',
 ].join(", ");
 // Action buttons that only appear once a turn has finished rendering.
-export const DEEP_RESEARCH_PLUS_BUTTON = '[data-testid="composer-plus-btn"]';
 export const DEEP_RESEARCH_DROPDOWN_ITEM_TEXT = "Deep research";
-export const DEEP_RESEARCH_PILL_LABEL = "Deep research";
 export const DEEP_RESEARCH_POLL_INTERVAL_MS = 5_000;
 export const DEEP_RESEARCH_AUTO_CONFIRM_WAIT_MS = 70_000;
 export const DEEP_RESEARCH_DEFAULT_TIMEOUT_MS = 2_400_000;

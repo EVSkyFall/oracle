@@ -9,6 +9,7 @@ import {
   buildComposerNavigationValidationExpression,
 } from "./attachmentContext.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { COMPOSER_TOKEN_SELECTOR, readComposerPromptText } from "./composerTools.js";
 
 /** Bind editing commands and fallback writes to the original renderer and editor. */
 export async function stageAttachmentPrompt(
@@ -37,7 +38,11 @@ export async function stageAttachmentPrompt(
         const visible = node => { const r = node?.getBoundingClientRect(); return r && r.width > 0 && r.height > 0; };
         const resolveEditor = () => selectors.map(s => document.querySelector(s)).find(visible);
         const editor = resolveEditor();
-        const read = () => editor instanceof HTMLTextAreaElement ? editor.value : editor?.innerText ?? '';
+        const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
+        const readPrompt = ${readComposerPromptText.toString()};
+        // Mentions and tool pills staged before the prompt are not prompt text.
+        const hasTokens = () => !(editor instanceof HTMLTextAreaElement) && Boolean(editor?.querySelector?.(tokenSelector));
+        const read = () => editor instanceof HTMLTextAreaElement ? editor.value : hasTokens() ? readPrompt(editor, tokenSelector).text : editor?.innerText ?? '';
         const write = value => { if (editor instanceof HTMLTextAreaElement) editor.value = value; else if (editor) editor.textContent = value; };
         const guard = { blocked: null, beforeValue: '', sawInput: false };
         const validate = (requireFocus = true) => {
@@ -78,6 +83,14 @@ export async function stageAttachmentPrompt(
           if (!validate() || read().trim()) return;
           const before = new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: text, inputType: 'insertFromPaste' });
           if (!editor.dispatchEvent(before) || !validate()) return;
+          if (hasTokens()) {
+            // Overwriting textContent would drop the staged mentions; insert after them.
+            const selection = document.getSelection();
+            const range = document.createRange(); range.selectNodeContents(editor); range.collapse(false);
+            selection?.removeAllRanges(); selection?.addRange(range);
+            try { document.execCommand('insertText', false, text); } catch {}
+            return;
+          }
           write(text);
           editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertFromPaste' }));
         };

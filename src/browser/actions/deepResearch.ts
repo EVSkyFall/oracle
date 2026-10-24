@@ -1,125 +1,132 @@
 import type { ChromeClient, BrowserLogger, BrowserResearchPlanMetadata } from "../types.js";
 import {
-  DEEP_RESEARCH_PLUS_BUTTON,
   DEEP_RESEARCH_DROPDOWN_ITEM_TEXT,
-  DEEP_RESEARCH_PILL_LABEL,
   DEEP_RESEARCH_POLL_INTERVAL_MS,
   DEEP_RESEARCH_AUTO_CONFIRM_WAIT_MS,
   DEEP_RESEARCH_DEFAULT_TIMEOUT_MS,
   FINISHED_ACTIONS_SELECTOR,
+  INPUT_SELECTORS,
   STOP_BUTTON_SELECTOR,
 } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
-import { buildClickDispatcher } from "./domEvents.js";
 import {
   captureAssistantMarkdown,
   readAssistantSnapshot,
   throwIfAssistantUiError,
 } from "./assistantResponse.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import { captureComposerNavigationUrl } from "./attachmentContext.js";
+import {
+  type ComposerPanelRow,
+  clickComposerPanelRow,
+  closeComposerPlusPanel,
+  composerRowTitleEquals,
+  openComposerPlusPanel,
+} from "./composerTools.js";
 
-type ActivateOutcome =
-  | { status: "activated" }
-  | { status: "already-active" }
-  | { status: "plus-button-missing" }
-  | { status: "dropdown-item-missing"; available?: string[] }
-  | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } };
+const DEEP_RESEARCH_STAGE = "deep-research-activate";
+const DEEP_RESEARCH_ROW_TITLES = [DEEP_RESEARCH_DROPDOWN_ITEM_TEXT, "深度研究"];
+const DEEP_RESEARCH_ROW_DESCRIPTIONS = ["Get a detailed report", "获取详细报告"];
 
 /**
- * Activates Deep Research mode through ChatGPT's composer tools menu and
- * verifies the selected tool pill before prompt submission.
+ * Deep Research is an app mention inside the editor. Only this element proves it is active:
+ * suggestion chips and other composer buttons can carry the same "Deep research" text.
+ */
+export const DEEP_RESEARCH_MENTION_SELECTOR = [
+  '[app-mention-name="deep-research"]',
+  '[app-mention-path="app://connector_openai_deep_research"]',
+  '[data-prompt-link-href="app://connector_openai_deep_research"]',
+  '[data-prompt-link-label="$deep-research"]',
+].join(", ");
+
+export function buildDeepResearchMentionExpression(): string {
+  return `(() => {
+    const visible = node => Boolean(node) && typeof node.getBoundingClientRect === 'function' &&
+      node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
+    const editors = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).filter(visible);
+    return editors.some(editor => Boolean(editor.querySelector(${JSON.stringify(DEEP_RESEARCH_MENTION_SELECTOR)})));
+  })()`;
+}
+
+export async function hasDeepResearchMention(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
+  const { result } = await Runtime.evaluate({
+    expression: buildDeepResearchMentionExpression(),
+    returnByValue: true,
+  });
+  return result?.value === true;
+}
+
+/** The "+" panel row for Deep Research: its app id, its title, or the legacy combined label. */
+export function findDeepResearchPanelRow(rows: readonly ComposerPanelRow[]): number {
+  const byApp = rows.findIndex((row) => /deep[_-]?research/i.test(row.impression ?? ""));
+  if (byApp >= 0) return byApp;
+  const byTitle = rows.findIndex((row) => composerRowTitleEquals(row, DEEP_RESEARCH_ROW_TITLES));
+  if (byTitle >= 0) return byTitle;
+  const compact = (value: string) => value.replace(/\s+/g, "").toLowerCase();
+  return rows.findIndex(
+    (row) =>
+      DEEP_RESEARCH_ROW_TITLES.some((title) => compact(row.text).startsWith(compact(title))) &&
+      DEEP_RESEARCH_ROW_DESCRIPTIONS.some((label) => compact(row.text).includes(compact(label))),
+  );
+}
+
+/**
+ * Activates Deep Research through the composer "+" panel and verifies its mention in the
+ * editor before prompt submission.
  */
 export async function activateDeepResearch(
   Runtime: ChromeClient["Runtime"],
   Input: ChromeClient["Input"],
   logger: BrowserLogger,
 ): Promise<void> {
-  const expression = buildActivateDeepResearchExpression();
-  const outcome = await Runtime.evaluate({
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
+  if (await hasDeepResearchMention(Runtime)) {
+    logger("Deep Research mode already active (Deep research mention in the composer)");
+    return;
+  }
+  const navigationUrl = await captureComposerNavigationUrl(Runtime);
+  const opened = await openComposerPlusPanel(Runtime, Input, {
+    navigationUrl,
+    stage: DEEP_RESEARCH_STAGE,
   });
-  const result = outcome.result?.value as ActivateOutcome | undefined;
-
-  switch (result?.status) {
-    case "activated":
-      logger("Deep Research mode activated");
-      return;
-    case "already-active":
-      logger("Deep Research mode already active");
-      return;
-    case "plus-button-missing":
-      throw new BrowserAutomationError(
-        "Could not find the composer plus button to activate Deep Research.",
-        { stage: "deep-research-activate", code: "plus-button-missing" },
-      );
-    case "dropdown-item-missing": {
-      const hint = result.available?.length
-        ? ` Available options: ${result.available.join(", ")}`
-        : "";
+  if (opened.status === "unavailable" || opened.status === "not-needed") {
+    throw new BrowserAutomationError(
+      `Could not open the composer plus button menu to activate Deep Research (${opened.reason ?? "not available"}).`,
+      { stage: DEEP_RESEARCH_STAGE, code: "plus-button-missing" },
+    );
+  }
+  try {
+    const choice = await clickComposerPanelRow(Runtime, Input, {
+      pick: findDeepResearchPanelRow,
+      navigationUrl,
+      stage: DEEP_RESEARCH_STAGE,
+      target: "The Deep research row",
+    });
+    if (choice.status !== "clicked") {
+      const available = choice.rows.map((row) => row.title || row.text).filter(Boolean);
+      const hint = available.length ? ` Available options: ${available.join(", ")}` : "";
       throw new BrowserAutomationError(
         `"Deep research" option not found in composer dropdown.${hint} ` +
           "This feature may require a ChatGPT Plus or Pro subscription.",
-        { stage: "deep-research-activate", code: "dropdown-item-missing" },
+        { stage: DEEP_RESEARCH_STAGE, code: "dropdown-item-missing", available },
       );
     }
-    case "pill-not-confirmed": {
-      const point = result.clickPoint;
-      if (typeof point?.x === "number" && typeof point.y === "number") {
-        await clickTrustedPoint(Runtime, Input, point.x, point.y);
-        if (await waitForDeepResearchPill(Runtime)) {
-          logger("Deep Research mode activated");
-          return;
-        }
+    // About five seconds of 200 ms polls for the mention to render.
+    for (let poll = 0; poll < 25; poll += 1) {
+      if (await hasDeepResearchMention(Runtime)) {
+        logger("Deep Research mode activated");
+        return;
       }
-      throw new BrowserAutomationError(
-        "Deep Research pill did not appear after selection. The UI may have changed.",
-        { stage: "deep-research-activate", code: "pill-not-confirmed" },
-      );
+      await delay(200);
     }
-    default:
-      throw new BrowserAutomationError("Unexpected result from Deep Research activation.", {
-        stage: "deep-research-activate",
-      });
+  } finally {
+    await closeComposerPlusPanel(Runtime, Input).catch(() => false);
   }
-}
-
-async function clickTrustedPoint(
-  Runtime: ChromeClient["Runtime"],
-  Input: ChromeClient["Input"],
-  x: number,
-  y: number,
-): Promise<void> {
-  if (Input && typeof Input.dispatchMouseEvent === "function") {
-    await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
-    await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
-    await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-    return;
-  }
-  await Runtime.evaluate({
-    expression: `(() => {
-      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
-      if (!(el instanceof HTMLElement)) return false;
-      el.click();
-      return true;
-    })()`,
-    returnByValue: true,
-  });
-}
-
-async function waitForDeepResearchPill(
-  Runtime: ChromeClient["Runtime"],
-  timeoutMs = 5000,
-): Promise<boolean> {
-  const { result } = await Runtime.evaluate({
-    expression: buildWaitForDeepResearchPillExpression(timeoutMs),
-    awaitPromise: true,
-    returnByValue: true,
-  });
-  return Boolean(result?.value);
+  throw new BrowserAutomationError(
+    "Deep Research mention did not appear in the composer after selection. The UI may have changed.",
+    { stage: DEEP_RESEARCH_STAGE, code: "pill-not-confirmed" },
+  );
 }
 
 /**
@@ -1286,258 +1293,4 @@ export function buildDeepResearchStatusExpressionForTest(): string {
 
 export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = -1): string {
   return buildDeepResearchCompletionPollExpression(minTurnIndex);
-}
-
-function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPill"): string {
-  const pillLabels = JSON.stringify([DEEP_RESEARCH_PILL_LABEL, "深度研究"]);
-  return `const ${functionName} = () => {
-      const labels = ${pillLabels}.map(label => label.toLowerCase());
-      const selectors = [
-        '.__composer-pill-composite',
-        '.__composer-pill',
-        '[class*="composer-pill"]',
-      ].join(',');
-      const candidates = Array.from(document.querySelectorAll(selectors));
-      const composerRoots = Array.from(document.querySelectorAll('[data-testid="composer"], form, [class*="composer"]'));
-      for (const root of composerRoots) {
-        candidates.push(...Array.from(root.querySelectorAll('button, [role="button"], [class*="pill"], [class*="composer-pill"]')));
-      }
-      const seen = new Set();
-      for (const pill of candidates) {
-        if (!(pill instanceof Element) || seen.has(pill)) continue;
-        seen.add(pill);
-        const rect = pill.getBoundingClientRect?.();
-        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
-        const text = (pill.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-        const aria = (
-          pill.getAttribute('aria-label') ||
-          pill.querySelector('button')?.getAttribute('aria-label') ||
-          ''
-        ).toLowerCase();
-        if (labels.some(label => text.includes(label) || aria.includes(label))) {
-          return pill;
-        }
-      }
-      return null;
-    };`;
-}
-
-function buildWaitForDeepResearchPillExpression(timeoutMs: number): string {
-  return `(async () => {
-    ${buildFindDeepResearchPillExpression()}
-    const deadline = Date.now() + ${JSON.stringify(Math.max(timeoutMs, 0))};
-    while (Date.now() < deadline) {
-      if (findDeepResearchPill()) return true;
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    return Boolean(findDeepResearchPill());
-  })()`;
-}
-
-function buildActivateDeepResearchExpression(): string {
-  const plusBtnSelector = JSON.stringify(DEEP_RESEARCH_PLUS_BUTTON);
-  const targetText = JSON.stringify(DEEP_RESEARCH_DROPDOWN_ITEM_TEXT);
-  const targetLabels = JSON.stringify([DEEP_RESEARCH_DROPDOWN_ITEM_TEXT, "深度研究"]);
-  const descriptionLabels = JSON.stringify(["Get a detailed report", "获取详细报告"]);
-  const addFilesLabels = JSON.stringify(["add files", "添加文件"]);
-  const dropdownReadyLabels = JSON.stringify([
-    "add photos",
-    "create image",
-    "web search",
-    "deep research",
-    "get a detailed report",
-    "深度研究",
-    "获取详细报告",
-  ]);
-
-  return `(async () => {
-    ${buildClickDispatcher()}
-    ${buildFindDeepResearchPillExpression()}
-
-    const waitForPill = () => new Promise((resolve) => {
-      let elapsed = 0;
-      const tick = () => {
-        if (findDeepResearchPill()) {
-          resolve(true); return;
-        }
-        elapsed += 200;
-        if (elapsed > 5000) { resolve(false); return; }
-        setTimeout(tick, 200);
-      };
-      setTimeout(tick, 200);
-    });
-
-    const menuItemSelector = [
-      '[data-radix-collection-item]',
-      '[role="option"]',
-      '[cmdk-item]',
-      'button',
-      '[role="menuitem"]',
-      '[role="menuitemradio"]',
-      '.__menu-item',
-      '[class*="__menu-item"]',
-      '[class*="menu-item"]',
-    ].join(',');
-    const dropdownItemSelector = [
-      '[data-radix-collection-item]',
-      '[role="menuitem"]',
-      '[role="menuitemradio"]',
-      '[role="option"]',
-      '[cmdk-item]',
-      'button',
-      '.__menu-item',
-      '[class*="__menu-item"]',
-      '[class*="menu-item"]',
-    ].join(',');
-    const popoverSelector = [
-      '.popover',
-      '[class*="popover"]',
-      '[data-radix-popper-content-wrapper]',
-      '[data-floating-ui-portal]',
-    ].join(',');
-    const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compactText = (value) => normalizeText(value).replace(/\\s+/g, '');
-    const targetLabels = ${targetLabels}.map(normalizeText);
-    const descriptionLabels = ${descriptionLabels}.map(normalizeText);
-    const addFilesLabels = ${addFilesLabels}.map(normalizeText);
-    const dropdownReadyLabels = ${dropdownReadyLabels}.map(normalizeText);
-    const getText = (item) => normalizeText(item.textContent || item.getAttribute?.('aria-label') || '');
-    const isInPopover = (item) => Boolean(item.closest?.(popoverSelector));
-    const isVisible = (item) => {
-      const rect = item.getBoundingClientRect?.();
-      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-      const style = window.getComputedStyle?.(item);
-      return !style || (style.visibility !== 'hidden' && style.display !== 'none');
-    };
-    const findPopoverSearchInput = () => Array.from(
-      document.querySelectorAll('input, textarea, [contenteditable="true"]')
-    ).find(item => {
-      const type = (item.getAttribute?.('type') || '').toLowerCase();
-      const testId = (item.getAttribute?.('data-testid') || '').toLowerCase();
-      return isInPopover(item) &&
-        isVisible(item) &&
-        type !== 'file' &&
-        testId !== 'upload-photos-input';
-    }) || null;
-    const setSearchText = (input, text) => {
-      input.focus?.();
-      if ('value' in input) input.value = text;
-      else input.textContent = text;
-      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    };
-    const isDeepResearchText = (text) => {
-      const compact = compactText(text);
-      const exactLabel = targetLabels.some(label => compact === compactText(label) || text.startsWith(label + ' '));
-      const exactDescription = descriptionLabels.some(
-        label => text === label || text.startsWith(label + ' ')
-      );
-      const combinedLabel = targetLabels.some(label => compact.startsWith(compactText(label))) &&
-        descriptionLabels.some(label => compact.includes(compactText(label)));
-      return exactLabel || exactDescription || combinedLabel;
-    };
-    const getClickableItem = (item) => item.closest?.(
-      '[data-radix-collection-item], [role="option"], [cmdk-item], button, [role="menuitem"], [role="menuitemradio"], .__menu-item, [class*="__menu-item"], [class*="menu-item"]'
-    ) || item;
-    const findDeepResearchItem = (options = {}) => {
-      const matches = Array.from(document.querySelectorAll(menuItemSelector))
-        .filter(item => {
-          const text = getText(item);
-          return text &&
-            text.length <= 180 &&
-            isVisible(item) &&
-            (!options.requirePopover || isInPopover(item)) &&
-            isDeepResearchText(text);
-        })
-        .map(item => {
-          const text = getText(item);
-          const clickable = getClickableItem(item);
-          const exact = targetLabels.includes(text) ? 0 : 1;
-          const menuRow = /(^|\\s)__menu-item(\\s|$)/.test(clickable.className || '') ? 0 : 1;
-          return { item: clickable, score: exact + menuRow, textLength: text.length };
-        })
-        .sort((a, b) => a.score - b.score || a.textLength - b.textLength);
-      return matches[0]?.item || null;
-    };
-    const collectAvailableItems = (options = {}) => {
-      const seen = new Set();
-      return Array.from(document.querySelectorAll(dropdownItemSelector))
-        .filter(item => !options.requirePopover || isInPopover(item))
-        .filter(item => isVisible(item))
-        .map(item => (item.textContent || '').replace(/\\s+/g, ' ').trim())
-        .filter(text => text && text.length <= 180)
-        .filter(text => {
-          const key = text.toLowerCase();
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-    };
-
-    // Step 0: Check if already active
-    if (findDeepResearchPill()) {
-      return { status: 'already-active' };
-    }
-
-    // Step 1: Open the composer tools menu. Avoid slash commands because they
-    // mutate the main composer and can be submitted as normal prompt text.
-    const plusBtn = document.querySelector(${plusBtnSelector}) ||
-      Array.from(document.querySelectorAll('button')).find(
-        b => addFilesLabels.some(label =>
-          normalizeText(b.getAttribute('aria-label') || '').includes(label)
-        )
-      );
-    if (!plusBtn) return { status: 'plus-button-missing' };
-    dispatchClickSequence(plusBtn);
-
-    // Step 2: Wait for dropdown
-    const waitForDropdown = () => new Promise((resolve) => {
-      let elapsed = 0;
-      const tick = () => {
-        const items = collectAvailableItems({ requirePopover: true });
-        if (findDeepResearchItem({ requirePopover: true }) || items.some(text => {
-          const normalized = normalizeText(text);
-          return dropdownReadyLabels.some(label => normalized.includes(label));
-        })) { resolve(items); return; }
-        elapsed += 150;
-        if (elapsed > 3000) { resolve(items.length ? items : null); return; }
-        setTimeout(tick, 150);
-      };
-      setTimeout(tick, 150);
-    });
-    const items = await waitForDropdown();
-    if (!items) return { status: 'dropdown-item-missing', available: [] };
-
-    // Step 3: Find "Deep research" item. Some ChatGPT variants only reveal it
-    // after typing in the tools menu search field.
-    let match = findDeepResearchItem({ requirePopover: true });
-    let available = Array.isArray(items) ? items : collectAvailableItems({ requirePopover: true });
-    if (!match) {
-      const searchInput = findPopoverSearchInput();
-      if (searchInput) {
-        setSearchText(searchInput, ${targetText});
-        await new Promise(resolve => setTimeout(resolve, 600));
-        match = findDeepResearchItem({ requirePopover: true });
-        available = collectAvailableItems({ requirePopover: true });
-      }
-    }
-    if (!match) return { status: 'dropdown-item-missing', available };
-
-    // Step 4: Click it
-    match.scrollIntoView?.({ block: 'center', inline: 'center' });
-    await new Promise(resolve => setTimeout(resolve, 100));
-    const rect = match.getBoundingClientRect();
-    const clickPoint = rect && rect.width > 0 && rect.height > 0
-      ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
-      : undefined;
-    dispatchClickSequence(match);
-
-    // Step 5: Verify pill appeared
-    const pillConfirmed = await waitForPill();
-    return pillConfirmed ? { status: 'activated' } : { status: 'pill-not-confirmed', clickPoint };
-  })()`;
-}
-
-export function buildActivateDeepResearchExpressionForTest(): string {
-  return buildActivateDeepResearchExpression();
 }
