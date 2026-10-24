@@ -30,6 +30,8 @@ import {
 
 const DEEP_RESEARCH_STAGE = "deep-research-activate";
 const DEEP_RESEARCH_ROW_TITLES = [DEEP_RESEARCH_DROPDOWN_ITEM_TEXT, "深度研究"];
+/** Titles of the iframe that hosts the research (today an MCP app frame), lower-case. */
+const DEEP_RESEARCH_FRAME_TITLES = DEEP_RESEARCH_ROW_TITLES.map((title) => title.toLowerCase());
 const DEEP_RESEARCH_ROW_DESCRIPTIONS = ["Get a detailed report", "获取详细报告"];
 
 /**
@@ -340,6 +342,7 @@ export async function waitForDeepResearchCompletion(
   // researches afterwards, so a finished reply without research activity is not yet a fallback:
   // what follows it decides.
   let firstReply: { identity: string; textLength: number; text: string } | null = null;
+  let sawResearchFrame = false;
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
@@ -362,6 +365,7 @@ export async function waitForDeepResearchCompletion(
           turnKey?: string;
           turnCount?: number;
           replyText?: string;
+          deepResearchFrameInScope?: boolean;
         }
       | undefined;
 
@@ -413,11 +417,17 @@ export async function waitForDeepResearchCompletion(
     // Target keys captured before submission are ignored, so a target result is
     // tied to this run. Main-page iframes are not: old reports can remain in the
     // conversation and must never authorize a new normal-response fallback.
+    // The report surface (a frame) decides completion once it is seen: the reply next to it is
+    // only the acknowledgement.
+    const frameSeen = Boolean(
+      rawTargetResult || (scopedToNewTurns && rawInPageResult) || val?.deepResearchFrameInScope,
+    );
+    if (frameSeen && !sawResearchFrame) {
+      logger("[browser] Deep Research report frame found; waiting for the research to complete.");
+    }
+    sawResearchFrame ||= frameSeen;
     observedResearchEvidence ||= Boolean(
-      rawTargetResult ||
-      (scopedToNewTurns && rawInPageResult) ||
-      val?.researchActivity ||
-      val?.hasActiveScopedResearch,
+      frameSeen || val?.researchActivity || val?.hasActiveScopedResearch,
     );
     const turnIdentity = `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
     // Scoped to this prompt's turns, a second assistant turn means something followed the first
@@ -425,11 +435,13 @@ export async function waitForDeepResearchCompletion(
     if (!observedResearchEvidence && scopedToNewTurns && (val?.turnCount ?? 0) > 1) {
       observedResearchEvidence = true;
     }
+    const textLength = val?.textLength ?? 0;
+    const movedPastFirstReply =
+      !firstReply ||
+      turnIdentity !== firstReply.identity ||
+      (textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200);
     if (firstReply && !observedResearchEvidence && val) {
-      const textLength = val.textLength ?? 0;
-      const grewIntoReport =
-        textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200;
-      if (turnIdentity !== firstReply.identity || val.stopVisible || grewIntoReport) {
+      if (movedPastFirstReply || val.stopVisible) {
         observedResearchEvidence = true;
         logger("[browser] Deep Research activity followed ChatGPT's first reply.");
       }
@@ -445,19 +457,20 @@ export async function waitForDeepResearchCompletion(
 
     // Completion detected
     if (val?.finished) {
-      if (observedResearchEvidence) {
+      const extractable =
+        observedResearchEvidence &&
+        (!sawResearchFrame || (firstReply !== null && movedPastFirstReply));
+      if (extractable) {
         logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
         return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
       }
       if (!firstReply) {
-        firstReply = {
-          identity: turnIdentity,
-          textLength: val.textLength ?? 0,
-          text: val.replyText ?? "",
-        };
-        logger(
-          "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
-        );
+        firstReply = { identity: turnIdentity, textLength, text: val.replyText ?? "" };
+        if (!observedResearchEvidence) {
+          logger(
+            "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
+          );
+        }
       }
     }
 
@@ -804,8 +817,17 @@ async function readDeepResearchTargetResult(
     let completed: DeepResearchFrameStatus | null = null;
     let latestProgress: DeepResearchFrameStatus | null = null;
     const targetKeys: string[] = [];
+    const appFrameHosts =
+      sessions.size > 0
+        ? await readDeepResearchAppFrameHosts(rawClient, pageSessionId)
+        : new Set<string>();
     for (const [sessionId, target] of sessions) {
-      const sessionResult = await readDeepResearchTargetSession(rawClient, sessionId, target.url);
+      const sessionResult = await readDeepResearchTargetSession(
+        rawClient,
+        sessionId,
+        target.url,
+        appFrameHosts,
+      );
       if (!sessionResult.confirmed) {
         continue;
       }
@@ -868,6 +890,44 @@ async function readDeepResearchTargetResult(
   }
 }
 
+/**
+ * Hosts of the page's iframes titled "Deep research". Today the research runs in an MCP app frame
+ * whose URL is the generic app runtime (`mcp-app-<hash>.web-sandbox.oaiusercontent.com/?app=skybridge`);
+ * only the iframe element's title names it, and the host is specific to the app.
+ */
+async function readDeepResearchAppFrameHosts(
+  rawClient: {
+    send: (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+    ) => Promise<unknown>;
+  },
+  pageSessionId?: string,
+): Promise<Set<string>> {
+  const response = (await rawClient
+    .send(
+      "Runtime.evaluate",
+      {
+        expression: `(() => {
+          const titles = ${JSON.stringify(DEEP_RESEARCH_FRAME_TITLES)};
+          return Array.from(document.querySelectorAll('iframe')).flatMap((frame) => {
+            const title = String(frame.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            if (!titles.includes(title)) return [];
+            try { return [new URL(frame.getAttribute('src') || '', location.href).host]; } catch { return []; }
+          });
+        })()`,
+        returnByValue: true,
+      },
+      pageSessionId,
+    )
+    .catch(() => null)) as { result?: { value?: unknown } } | null;
+  const value = response?.result?.value;
+  return new Set(
+    Array.isArray(value) ? value.filter((host) => typeof host === "string" && host) : [],
+  );
+}
+
 export async function captureDeepResearchTargetKeys(client: ChromeClient): Promise<string[]> {
   const scan = await readDeepResearchTargetResult(client);
   if (!scan) {
@@ -906,9 +966,14 @@ async function readDeepResearchTargetOwnerTurnIndex(
         "Runtime.callFunctionOn",
         {
           objectId,
+          // Today's report frame sits beside the turn units, not inside one: then it belongs to
+          // the last turn before it.
           functionDeclaration: `function() {
             const turns = ${buildConversationTurnListExpression()};
-            const index = turns.findIndex((turn) => turn === this || turn.contains?.(this));
+            let index = turns.findIndex((turn) => turn === this || turn.contains?.(this));
+            for (let i = turns.length - 1; index < 0 && i >= 0; i -= 1) {
+              if ((turns[i].compareDocumentPosition?.(this) ?? 0) & 4) index = i;
+            }
             return index >= 0 ? index : null;
           }`,
           returnByValue: true,
@@ -937,6 +1002,7 @@ async function readDeepResearchTargetSession(
   },
   sessionId: string,
   targetUrl: string,
+  appFrameHosts: ReadonlySet<string> = new Set(),
 ): Promise<DeepResearchTargetSessionResult> {
   await rawClient.send("Runtime.enable", {}, sessionId).catch(() => undefined);
   await rawClient.send("Page.enable", {}, sessionId).catch(() => undefined);
@@ -945,7 +1011,10 @@ async function readDeepResearchTargetSession(
     .send("Page.getFrameTree", {}, sessionId)
     .catch(() => null)) as { frameTree?: DeepResearchFrameTree } | null;
   const ownerFrameId = frameTree?.frameTree?.frame?.id;
-  if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
+  if (
+    !isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree) &&
+    !appFrameHosts.has(hostOf(targetUrl))
+  ) {
     return { confirmed: false, read: null };
   }
   const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
@@ -1024,6 +1093,14 @@ function isConfirmedDeepResearchTarget(
   tree: DeepResearchFrameTree | undefined,
 ): boolean {
   return isDeepResearchFrameDescriptor(targetUrl) || Boolean(findDeepResearchFrameId(tree));
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
 }
 
 function isDeepResearchFrameDescriptor(url: string, name = ""): boolean {
@@ -1318,12 +1395,25 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
     const hasActiveScopedResearch = scopedToNewTurns && Boolean(lastTurn) &&
       hasScopedDeepResearchIframe &&
       (textLength < 40 || isToolStub || tailIsPlanningPanel || /chatgpt\\s+said:?$/i.test(text));
+    // Today's Deep Research runs in an MCP app iframe titled "Deep research" next to the
+    // acknowledgement, outside the assistant unit; it counts when it sits after this prompt.
+    const deepResearchTitles = ${JSON.stringify(DEEP_RESEARCH_FRAME_TITLES)};
+    const scopeStart = scopedToNewTurns ? conversationTurns[MIN_TURN_INDEX] || null : null;
+    const deepResearchFrameInScope = Boolean(scopeStart) && Array.from(document.querySelectorAll('iframe')).some(f => {
+      const rect = f.getBoundingClientRect();
+      if (!(rect.width > 0 && rect.height > 0)) return false;
+      const title = String(f.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const descriptor = String(f.getAttribute('src') || '') + ' ' + String(f.getAttribute('name') || '');
+      if (!deepResearchTitles.includes(title) && !/connector_openai_deep_research|deep-research/i.test(descriptor)) return false;
+      return scopeStart === f || Boolean(scopeStart.contains?.(f)) ||
+        Boolean((scopeStart.compareDocumentPosition?.(f) ?? 0) & 4);
+    });
     // Which assistant turn this is, so a later turn (the report after an acknowledgement) is seen.
     const attrOf = (node, name) => (node && typeof node.getAttribute === 'function' ? node.getAttribute(name) : null);
     const messageNode = attrOf(lastTurn, 'data-message-id') !== null ? lastTurn : lastTurn?.querySelector?.('[data-message-id]');
     const turnKey = String(attrOf(messageNode, 'data-message-id') || attrOf(lastTurn, 'data-testid') || '');
     const turnCount = (scopedToNewTurns ? scopedTurns : allAssistantTurns).length;
-    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, turnKey, turnCount, replyText: text.slice(0, 2000) };
+    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, turnKey, turnCount, replyText: text.slice(0, 2000), deepResearchFrameInScope };
   })()`;
 }
 

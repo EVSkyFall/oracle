@@ -1227,6 +1227,213 @@ describe("waitForDeepResearchCompletion", () => {
     );
   });
 
+  // Today (2026-10) the research runs in an MCP app frame whose URL is the generic app runtime;
+  // only the page's iframe title ("Deep research") names it.
+  const skybridgeClient = (pageFrameHosts: string[]) => {
+    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    return {
+      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+        listeners.set(event, listener);
+      }),
+      removeListener: vi.fn(),
+      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "app-session",
+            targetInfo: {
+              type: "iframe",
+              targetId: "app-frame",
+              url: "https://mcp-app-79f7.web-sandbox.oaiusercontent.com/?app=skybridge&locale=en-US",
+            },
+          });
+          return {};
+        }
+        if (method === "Runtime.evaluate" && sessionId === undefined) {
+          return { result: { value: pageFrameHosts } };
+        }
+        if (method === "Page.getFrameTree" && sessionId === "app-session") {
+          return {
+            frameTree: {
+              frame: {
+                id: "app-frame",
+                name: "",
+                url: "https://mcp-app-79f7.web-sandbox.oaiusercontent.com/?app=skybridge",
+              },
+              childFrames: [
+                {
+                  frame: {
+                    id: "inner",
+                    name: "root",
+                    url: "https://mcp-app-79f7.web-sandbox.oaiusercontent.com/?app=skybridge",
+                  },
+                },
+              ],
+            },
+          };
+        }
+        if (method === "Runtime.evaluate" && sessionId === "app-session") {
+          return {
+            result: {
+              value: {
+                completed: true,
+                inProgress: false,
+                textLength: 120,
+                text: "Node.js v24 Krypton is the Active LTS line; end-of-life 2028-04-30.",
+              },
+            },
+          };
+        }
+        return {};
+      }),
+    };
+  };
+
+  it("reads the report from the MCP app frame the page titles Deep research", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: { value: { finished: false, stopVisible: false, textLength: 0, hasIframe: true } },
+    });
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      1_000,
+      undefined,
+      undefined,
+      skybridgeClient(["mcp-app-79f7.web-sandbox.oaiusercontent.com"]) as never,
+    );
+    expect(result.text).toBe("Node.js v24 Krypton is the Active LTS line; end-of-life 2028-04-30.");
+  });
+
+  it("does not read an MCP app frame the page does not title Deep research", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: { value: { finished: false, stopVisible: false, textLength: 0, hasIframe: true } },
+    });
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        30,
+        undefined,
+        undefined,
+        skybridgeClient([]) as never,
+      ),
+    ).rejects.toThrow(/did not complete/);
+  });
+
+  it("never extracts the acknowledgement while the research frame is present", async () => {
+    const ackWithFrame = {
+      finished: true,
+      stopVisible: false,
+      textLength: 127,
+      hasIframe: true,
+      turnCount: 1,
+      turnKey: "ack",
+      replyText: "Deep Research를 시작했어요.",
+      deepResearchFrameInScope: true,
+    };
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ackWithFrame } });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: ackWithFrame } });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: { value: { ...ackWithFrame, turnCount: 2, turnKey: "report", textLength: 5000 } },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: { value: { text: "Research report content", turnId: "t2", messageId: "m2" } },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({ result: { value: null } });
+
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
+    expect(result.text).toBe("Research report content");
+    expect(mockRuntime.evaluate).toHaveBeenCalledTimes(5);
+  });
+
+  it("takes the report from an in-progress research frame, not the finished acknowledgement", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: {
+        value: {
+          finished: true,
+          stopVisible: false,
+          textLength: 127,
+          hasIframe: true,
+          turnCount: 1,
+          turnKey: "ack",
+          replyText: "Deep Research를 시작했어요.",
+        },
+      },
+    });
+    let reads = 0;
+    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    const client = {
+      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+        listeners.set(event, listener);
+      }),
+      removeListener: vi.fn(),
+      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "deep-session",
+            targetInfo: {
+              type: "iframe",
+              url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+            },
+          });
+          return {};
+        }
+        if (method === "Page.getFrameTree" && sessionId === "deep-session") {
+          return { frameTree: { frame: { id: "sandbox", name: "root", url: "about:blank" } } };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          sessionId === "deep-session" &&
+          typeof (params as { contextId?: number }).contextId !== "number"
+        ) {
+          reads += 1;
+          return {
+            result: {
+              value:
+                reads < 3
+                  ? { completed: false, inProgress: true, textLength: 30 }
+                  : {
+                      completed: true,
+                      inProgress: false,
+                      textLength: 90,
+                      text: "FRAME_REPORT done",
+                    },
+            },
+          };
+        }
+        return {};
+      }),
+    };
+
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      60_000,
+      undefined,
+      undefined,
+      client as never,
+    );
+    expect(result.text).toBe("FRAME_REPORT done");
+  });
+
+  it("a research frame that never completes ends in the Deep Research timeout, not 'not started'", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: {
+        value: {
+          finished: true,
+          stopVisible: false,
+          textLength: 127,
+          hasIframe: true,
+          turnCount: 1,
+          turnKey: "ack",
+          deepResearchFrameInScope: true,
+        },
+      },
+    });
+    await expect(
+      waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 30),
+    ).rejects.toThrow(/did not complete/);
+  });
+
   it("does not return a foreign completed Deep Research report from another tab", async () => {
     // Cross-tab isolation: a shared/persistent Chrome profile can hold another
     // tab's COMPLETED Deep Research report. Target discovery must be scoped to the
@@ -2386,6 +2593,50 @@ describe("waitForDeepResearchCompletion", () => {
     const afterStop = run(false);
     expect(afterStop.stopVisible).toBe(false);
     expect(afterStop.finished).toBe(true);
+  });
+
+  it("sees the Deep research app frame only when it sits after this prompt", () => {
+    const expression = buildDeepResearchCompletionPollExpressionForTest(0);
+    const node = (attrs: Record<string, string>, text = "") => ({
+      textContent: text,
+      innerText: text,
+      dataset: {},
+      parentElement: null,
+      getAttribute: (name: string) => attrs[name] ?? null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      contains: () => false,
+      getBoundingClientRect: () => ({ width: 768, height: 484 }),
+      compareDocumentPosition: () => 0,
+    });
+    const frame = node({
+      title: "Deep research",
+      src: "https://mcp-app-79f7.web-sandbox.oaiusercontent.com/?app=skybridge",
+    });
+    const run = (position: number) => {
+      const prompt = {
+        ...node({ "data-content-search-unit-key": "t:0:user" }, "Briefly research"),
+        compareDocumentPosition: () => position,
+      };
+      const ack = node(
+        { "data-content-search-unit-key": "t:1:assistant" },
+        "Deep Research를 시작했어요.",
+      );
+      return new vm.Script(expression).runInNewContext({
+        document: {
+          body: { innerText: "" },
+          querySelector: () => null,
+          querySelectorAll: (selector: string) => {
+            if (selector === "iframe") return [frame];
+            if (selector.includes("data-turn-key")) return [prompt, ack];
+            if (selector.includes(":assistant")) return [ack];
+            return [];
+          },
+        },
+      }) as { deepResearchFrameInScope?: boolean };
+    };
+    expect(run(4).deepResearchFrameInScope).toBe(true); // DOCUMENT_POSITION_FOLLOWING
+    expect(run(2).deepResearchFrameInScope).toBe(false); // an earlier exchange's frame
   });
 
   it("reports which assistant turn it read, so a report after an acknowledgement is noticed", () => {
