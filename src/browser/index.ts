@@ -67,6 +67,7 @@ import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
+import { runSelectOnlyCheck } from "./selectOnly.js";
 import {
   isGeneratedImageAssistantAnswer,
   throwIfAssistantUiError,
@@ -861,8 +862,9 @@ async function runBrowserModeInternal(
     subject: "Browser upload",
   });
 
-  const promptText = options.prompt?.trim();
-  if (!promptText) {
+  const promptText = options.prompt?.trim() ?? "";
+  // A select-only check stops before the composer, so it has no prompt.
+  if (!promptText && options.config?.selectOnly !== true) {
     throw new Error("Prompt text is required when using browser mode.");
   }
 
@@ -1521,65 +1523,106 @@ async function runBrowserModeInternal(
     const updateConversationHint = conversationUrlMonitor.update;
     await captureRuntimeSnapshot();
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    if (config.desiredModel && modelStrategy !== "ignore" && !isResumingConversation) {
-      modelSelectionEvidence = await raceWithDisconnect(
-        withRetries(
-          () =>
-            ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
-              implicitDefault: config.modelIsImplicitDefault,
-            }),
-          {
-            retries: 2,
-            delayMs: 300,
-            onRetry: (attempt, error) => {
-              if (options.verbose) {
-                logger(
-                  `[retry] Model picker attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-                );
-              }
+    const applyRequestedSelection = async () => {
+      if (config.desiredModel && modelStrategy !== "ignore" && !isResumingConversation) {
+        modelSelectionEvidence = await raceWithDisconnect(
+          withRetries(
+            () =>
+              ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
+                implicitDefault: config.modelIsImplicitDefault,
+              }),
+            {
+              retries: 2,
+              delayMs: 300,
+              onRetry: (attempt, error) => {
+                if (options.verbose) {
+                  logger(
+                    `[retry] Model picker attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                  );
+                }
+              },
             },
-          },
-        ),
-      ).catch((error) => {
-        // Login has already been verified above. Preserve the picker failure instead of
-        // misdiagnosing an unavailable model as missing cookies.
-        throw normalizeAuthenticatedModelSelectionError(error);
+          ),
+        ).catch((error) => {
+          // Login has already been verified above. Preserve the picker failure instead of
+          // misdiagnosing an unavailable model as missing cookies.
+          throw normalizeAuthenticatedModelSelectionError(error);
+        });
+        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        logger(
+          `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
+        );
+      } else if (modelStrategy === "ignore" || isResumingConversation) {
+        modelSelectionEvidence = buildSkippedModelSelectionEvidence(
+          config.desiredModel,
+          modelStrategy,
+        );
+        logger(
+          isResumingConversation
+            ? "Model picker: skipped (resumed conversation)"
+            : "Model picker: skipped (strategy=ignore)",
+        );
+      }
+      if (shouldApplyThinkingTimeSelection(config)) {
+        const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+        thinkingSelectionEvidence = await raceWithDisconnect(
+          withRetries(
+            () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
+            {
+              retries: 2,
+              delayMs: 300,
+              onRetry: (attempt, error) => {
+                if (options.verbose) {
+                  logger(
+                    `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                  );
+                }
+              },
+            },
+          ),
+        );
+      }
+    };
+    if (config.selectOnly) {
+      const report = await runSelectOnlyCheck({
+        runtime: Runtime,
+        input: Input,
+        logger,
+        requestedModel:
+          modelStrategy === "select" && !isResumingConversation
+            ? (config.desiredModel ?? null)
+            : null,
+        requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
+          ? config.thinkingTime
+          : null,
+        applySelection: applyRequestedSelection,
+        readEvidence: () => ({
+          model: modelSelectionEvidence,
+          thinking: thinkingSelectionEvidence,
+        }),
       });
-      await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
-      logger(
-        `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
-      );
-    } else if (modelStrategy === "ignore" || isResumingConversation) {
-      modelSelectionEvidence = buildSkippedModelSelectionEvidence(
-        config.desiredModel,
-        modelStrategy,
-      );
-      logger(
-        isResumingConversation
-          ? "Model picker: skipped (resumed conversation)"
-          : "Model picker: skipped (strategy=ignore)",
-      );
+      runStatus = "complete";
+      return (completedResult = {
+        answerText: "",
+        answerMarkdown: "",
+        modelSelection: modelSelectionEvidence,
+        thinkingSelection: thinkingSelectionEvidence,
+        selectOnly: report,
+        tookMs: Date.now() - startedAt,
+        answerTokens: 0,
+        answerChars: 0,
+        chromePid: chrome.pid,
+        chromePort: chrome.port,
+        chromeHost,
+        userDataDir,
+        chromeTargetId: lastTargetId,
+        tabUrl: lastUrl,
+        promptSubmitted: false,
+        controllerPid: process.pid,
+      });
     }
+    await applyRequestedSelection();
     const deepResearch = config.researchMode === "deep";
-    if (shouldApplyThinkingTimeSelection(config)) {
-      const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
-      thinkingSelectionEvidence = await raceWithDisconnect(
-        withRetries(
-          () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
-          {
-            retries: 2,
-            delayMs: 300,
-            onRetry: (attempt, error) => {
-              if (options.verbose) {
-                logger(
-                  `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-                );
-              }
-            },
-          },
-        ),
-      );
-    }
     const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
     let profileLock: ProfileRunLock | null = null;
     const acquireProfileLockIfNeeded = async () => {
@@ -3139,57 +3182,99 @@ async function runRemoteBrowserMode(
     }
 
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    if (config.desiredModel && modelStrategy !== "ignore" && !config.resumeConversationUrl) {
-      modelSelectionEvidence = await withRetries(
-        () =>
-          ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
-            implicitDefault: config.modelIsImplicitDefault,
-          }),
-        {
-          retries: 2,
-          delayMs: 300,
-          onRetry: (attempt, error) => {
-            if (options.verbose) {
-              logger(
-                `[retry] Model picker attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-              );
-            }
+    const applyRequestedSelection = async () => {
+      if (config.desiredModel && modelStrategy !== "ignore" && !config.resumeConversationUrl) {
+        modelSelectionEvidence = await withRetries(
+          () =>
+            ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
+              implicitDefault: config.modelIsImplicitDefault,
+            }),
+          {
+            retries: 2,
+            delayMs: 300,
+            onRetry: (attempt, error) => {
+              if (options.verbose) {
+                logger(
+                  `[retry] Model picker attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                );
+              }
+            },
           },
-        },
-      );
-      await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
-      logger(
-        `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
-      );
-    } else if (modelStrategy === "ignore" || config.resumeConversationUrl) {
-      modelSelectionEvidence = buildSkippedModelSelectionEvidence(
-        config.desiredModel,
-        modelStrategy,
-      );
-      logger(
-        config.resumeConversationUrl
-          ? "Model picker: skipped (resumed conversation)"
-          : "Model picker: skipped (strategy=ignore)",
-      );
+        );
+        await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+        logger(
+          `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
+        );
+      } else if (modelStrategy === "ignore" || config.resumeConversationUrl) {
+        modelSelectionEvidence = buildSkippedModelSelectionEvidence(
+          config.desiredModel,
+          modelStrategy,
+        );
+        logger(
+          config.resumeConversationUrl
+            ? "Model picker: skipped (resumed conversation)"
+            : "Model picker: skipped (strategy=ignore)",
+        );
+      }
+      if (shouldApplyThinkingTimeSelection(config)) {
+        const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+        thinkingSelectionEvidence = await withRetries(
+          () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
+          {
+            retries: 2,
+            delayMs: 300,
+            onRetry: (attempt, error) => {
+              if (options.verbose) {
+                logger(
+                  `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                );
+              }
+            },
+          },
+        );
+      }
+    };
+    if (config.selectOnly) {
+      const report = await runSelectOnlyCheck({
+        runtime: Runtime,
+        input: Input,
+        logger,
+        requestedModel:
+          modelStrategy === "select" && !config.resumeConversationUrl
+            ? (config.desiredModel ?? null)
+            : null,
+        requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
+          ? config.thinkingTime
+          : null,
+        applySelection: applyRequestedSelection,
+        readEvidence: () => ({
+          model: modelSelectionEvidence,
+          thinking: thinkingSelectionEvidence,
+        }),
+      });
+      runStatus = "complete";
+      return {
+        answerText: "",
+        answerMarkdown: "",
+        modelSelection: modelSelectionEvidence,
+        thinkingSelection: thinkingSelectionEvidence,
+        selectOnly: report,
+        tookMs: Date.now() - startedAt,
+        answerTokens: 0,
+        answerChars: 0,
+        browserTransport: "cdp",
+        chromePort: port,
+        chromeHost: host,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot,
+        chromeTargetId: remoteTargetId ?? undefined,
+        tabUrl: lastUrl,
+        promptSubmitted: false,
+        controllerPid: process.pid,
+      };
     }
+    await applyRequestedSelection();
     const deepResearch = config.researchMode === "deep";
-    if (shouldApplyThinkingTimeSelection(config)) {
-      const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
-      thinkingSelectionEvidence = await withRetries(
-        () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
-        {
-          retries: 2,
-          delayMs: 300,
-          onRetry: (attempt, error) => {
-            if (options.verbose) {
-              logger(
-                `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-              );
-            }
-          },
-        },
-      );
-    }
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
       await claimBrowserTarget(Runtime, targetClaimId);
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);

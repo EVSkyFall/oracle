@@ -172,6 +172,42 @@ export interface BrowserAutomationConfig {
    * (Always allow > Allow once > Allow). Off unless listed; other prompts are left alone.
    */
   allowApps?: string[];
+  /**
+   * Select and verify the model and thinking time as a real run would, then restore the
+   * previous selection and stop: no prompt is staged or sent.
+   */
+  selectOnly?: boolean;
+}
+
+/** What ChatGPT's model picker shows: the model radio, the effort tier and its slider. */
+export interface BrowserModelPickerState {
+  /** Text of the picker button, e.g. "Thinking effort Medium". */
+  pickerLabel: string | null;
+  /** Label of the checked model radio, e.g. "GPT-6". */
+  modelLabel: string | null;
+  modelOptions: string[];
+  /** Effort tier shown at the top of the menu, e.g. "Medium" or "Pro". */
+  tierLabel: string | null;
+  sliderValue: number | null;
+  sliderMin: number | null;
+  sliderMax: number | null;
+  /** Latest live-region announcement, e.g. "Medium, 2 of 5." */
+  announcement: string | null;
+}
+
+/** Outcome of a select-only check. */
+export interface BrowserSelectOnlyReport {
+  /** The requested model and thinking time were selected and verified. */
+  verified: boolean;
+  reason?: string;
+  requestedModel: string | null;
+  requestedThinkingTime: string | null;
+  before: BrowserModelPickerState | null;
+  selected: BrowserModelPickerState | null;
+  restored: BrowserModelPickerState | null;
+  /** The picker shows the pre-check model and slider value again. */
+  restoreVerified: boolean;
+  restoreDetail?: string;
 }
 
 export interface BrowserRunOptions {
@@ -277,6 +313,8 @@ export interface BrowserRunResult {
   controllerPid?: number;
   /** Tool-permission prompts approved through allowApps during this run. */
   appApprovals?: BrowserAppApprovalRecord[];
+  /** Set on a select-only run, which sends nothing. */
+  selectOnly?: BrowserSelectOnlyReport;
 }
 
 export type ResolvedBrowserConfig = Required<

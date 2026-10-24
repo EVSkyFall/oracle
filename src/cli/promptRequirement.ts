@@ -9,6 +9,7 @@ interface PromptCheckOptions {
   renderMarkdown?: boolean;
   preview?: boolean | string;
   dryRun?: boolean;
+  browserSelectOnly?: boolean;
 }
 
 /**
@@ -26,6 +27,7 @@ export function shouldRequirePrompt(rawArgs: string[], options: PromptCheckOptio
     options.debugHelp ||
     options.route ||
     options.preflight ||
+    options.browserSelectOnly ||
     firstArg === "status" ||
     firstArg === "session",
   );

@@ -168,6 +168,7 @@ interface CliOptions extends OptionValues {
   browserApp?: string[];
   browserAppChip?: string[];
   browserAllowApp?: string[];
+  browserSelectOnly?: boolean;
   browserAllowCookieErrors?: boolean;
   browserAttachments?: string;
   browserInlineFiles?: boolean;
@@ -896,6 +897,12 @@ program
     )
       .argParser(collectTextValues)
       .default([]),
+  )
+  .addOption(
+    new Option(
+      "--browser-select-only",
+      "Check the model and thinking-time selection without sending anything: select and verify them as a real run would, print the evidence, restore the previous selection and close the tab. Exit 0 when verified and restored, 1 when not verified, 2 when verified but the previous selection could not be restored. No prompt needed.",
+    ),
   )
   .addOption(
     new Option(
@@ -2331,6 +2338,31 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       : config;
   })();
 
+  if (options.browserSelectOnly) {
+    if (!browserConfig || activeModel.startsWith("gemini")) {
+      throw new Error("--browser-select-only requires a ChatGPT run with --engine browser.");
+    }
+    if (remoteHost) {
+      // The remote service would treat the request as a normal run and send a prompt.
+      throw new Error(
+        "--browser-select-only runs against a local or --remote-chrome browser and cannot go through --remote-host.",
+      );
+    }
+    if (browserFollowup || browserConfig.resumeConversationUrl) {
+      throw new Error(
+        "--browser-select-only cannot resume a conversation: ChatGPT keeps a resumed conversation's model, so nothing would be selected.",
+      );
+    }
+    const { runBrowserSelectOnly } = await import("../src/cli/browserSelectOnly.js");
+    process.exitCode = await runBrowserSelectOnly({
+      browserConfig,
+      model: activeModel,
+      verbose: Boolean(options.verbose),
+      log: console.log,
+    });
+    return;
+  }
+
   if (previewMode) {
     if (!options.prompt) {
       throw new Error("Prompt is required when using --dry-run/preview.");
@@ -3097,6 +3129,10 @@ function printDebugHelp(cliName: string): void {
     ["--browser-no-focus", "Keep Chrome in the background during launch, new tabs, and send."],
     ["--no-browser-no-focus", "Let Chrome come to the front during launch, new tabs, and send."],
     ["--browser-keep-browser", "Leave Chrome running after completion."],
+    [
+      "--browser-select-only",
+      "Select and verify model/thinking time, restore the previous selection, send nothing.",
+    ],
   ]);
   console.log("");
   console.log(chalk.dim(`Tip: run \`${cliName} --help\` to see the primary option set.`));

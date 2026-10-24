@@ -71,6 +71,12 @@ export function createRemoteBrowserExecutor({ host, token, runOptions }: RemoteE
         "App mentions and app auto-approval (--browser-app, --browser-allow-app) are a local browser feature; --remote-host does not negotiate this capability yet, and an older host would drop them silently. Use local Chrome or --browser-attach-running.",
       );
     }
+    if (options.config?.selectOnly) {
+      // A host that does not know the flag would run a normal, prompt-sending session.
+      throw new Error(
+        "Select-only checks are a local browser feature; --remote-host does not negotiate them. Use local Chrome or --remote-chrome.",
+      );
+    }
     const callerSignal = options.signal;
     const imageOutputRequested = Boolean(options.generateImagePath || options.outputPath);
     if (callerSignal?.aborted)

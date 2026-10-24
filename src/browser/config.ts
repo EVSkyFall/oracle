@@ -73,6 +73,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   captureProviderNative: false,
   apps: [],
   allowApps: [],
+  selectOnly: false,
 };
 
 export function resolveBrowserConfig(
@@ -166,6 +167,7 @@ export function resolveBrowserConfig(
       config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative,
     apps: normalizeBrowserApps(config?.apps),
     allowApps: normalizeBrowserAllowApps(config?.allowApps),
+    selectOnly: config?.selectOnly === true,
     manualLogin,
     manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
     manualLoginCookieSync:
