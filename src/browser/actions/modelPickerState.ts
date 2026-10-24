@@ -44,11 +44,17 @@ export function findModelPickerMenu(doc: Document, button: Element | null): Elem
   );
 }
 
-/** Page function: reads the picker state from the open menu (or only the button when closed). */
+/**
+ * Page function: reads the picker state from the open menu (or only the button when closed).
+ * The tier label is the first candidate that names a known effort level (`levelOf`): the lines
+ * of the tier header, the slider's aria-valuetext, then the live announcements; the raw header
+ * line is the fallback when none does.
+ */
 export function readModelPickerMenuState(
   doc: Document,
   button: Element | null,
   menu: Element | null,
+  levelOf: (label: string) => unknown = () => null,
 ): BrowserModelPickerState {
   const visible = (node: Element) => {
     const rect = node.getBoundingClientRect();
@@ -88,11 +94,26 @@ export function readModelPickerMenuState(
   const announcements = Array.from(doc.querySelectorAll('[aria-live], [role="status"]'))
     .map((node) => flatText(node))
     .filter((text): text is string => Boolean(text) && (text as string).length <= 120);
-  const announcement = announcements.at(-1) ?? null;
-  const tierLabel =
-    firstLine(tierItem) ??
-    slider?.getAttribute("aria-valuetext") ??
-    (announcement ? announcement.split(",")[0]!.trim() || null : null);
+  const headerLines = String(
+    (tierItem as HTMLElement | undefined)?.innerText ?? tierItem?.textContent ?? "",
+  )
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const valueText = slider?.getAttribute("aria-valuetext")?.trim() || null;
+  // Newest announcement first; "Medium, 2 of 5." names the tier before its comma.
+  const spoken = announcements.reduceRight<Array<{ text: string; label: string }>>(
+    (list, text) => [...list, { text, label: text.split(/[,，、]/)[0]!.trim() }],
+    [],
+  );
+  const candidates = [
+    ...headerLines.map((label) => ({ label, text: null as string | null })),
+    ...(valueText ? [{ label: valueText, text: null as string | null }] : []),
+    ...spoken,
+  ];
+  const known = candidates.find((candidate) => candidate.label && levelOf(candidate.label));
+  const announcement = known?.text ?? announcements.at(-1) ?? null;
+  const tierLabel = known?.label ?? headerLines[0] ?? valueText ?? (spoken[0]?.label || null);
   return {
     pickerLabel: flatText(button),
     modelLabel: firstLine(checked),
@@ -110,7 +131,7 @@ export function readModelPickerMenuState(
 const PAGE_FUNCTIONS = `
   const __findPickerButton = () => (${findModelPickerButton.toString()})(document, ${JSON.stringify(PICKER_BUTTON_SELECTORS)});
   const __findPickerMenu = () => (${findModelPickerMenu.toString()})(document, __findPickerButton());
-  const __readPickerState = () => (${readModelPickerMenuState.toString()})(document, __findPickerButton(), __findPickerMenu());
+  const __readPickerState = () => (${readModelPickerMenuState.toString()})(document, __findPickerButton(), __findPickerMenu(), ${thinkingLevelFromTierLabel.toString()});
 `;
 
 const BUTTON_LOCATE = `() => { ${PAGE_FUNCTIONS} return __findPickerButton(); }`;

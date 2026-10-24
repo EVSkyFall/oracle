@@ -111,6 +111,42 @@ describe("model picker state", () => {
     });
   });
 
+  test("takes the tier from the first candidate that names a known level", () => {
+    class Lines extends FakeElement {
+      constructor(
+        attributes: Record<string, string>,
+        readonly lines: string,
+      ) {
+        super("div", attributes, [], lines.replace(/\n/g, ""));
+      }
+      override get innerText() {
+        return this.lines;
+      }
+    }
+    const read = (header: FakeElement, announcement: string) => {
+      const menu = new FakeElement("div", { role: "menu" }, [
+        header,
+        new FakeElement("div", { role: "menuitem", "aria-label": "Power" }, [
+          new FakeElement("span", { role: "slider", "aria-valuenow": "2" }),
+        ]),
+      ]);
+      const live = new FakeElement("div", { "aria-live": "polite" }, [], announcement);
+      return readModelPickerMenuState(
+        new FakeDocument([menu, live]) as unknown as Document,
+        null,
+        menu as unknown as Element,
+        thinkingLevelFromTierLabel,
+      );
+    };
+    expect(read(new Lines({ role: "menuitem" }, "Thinking effort\nMedium"), "").tierLabel).toBe(
+      "Medium",
+    );
+    expect(
+      read(new FakeElement("div", { role: "menuitem" }, [], "Switch model"), "High, 3 of 5."),
+    ).toMatchObject({ tierLabel: "High", announcement: "High, 3 of 5." });
+    expect(read(new FakeElement("div", { role: "menuitem" }, [], "5.6"), "").tierLabel).toBe("5.6");
+  });
+
   test("maps tier labels to thinking levels and leaves unknown labels alone", () => {
     expect(thinkingLevelFromTierLabel("Instant")).toBe("light");
     expect(thinkingLevelFromTierLabel("Medium")).toBe("standard");
