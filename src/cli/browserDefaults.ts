@@ -47,7 +47,14 @@ export interface BrowserDefaultsOptions {
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
   browserManualLoginCookieSync?: boolean;
+  browserApp?: string[];
+  browserAppChip?: string[];
 }
+
+const stringList = (value: unknown): string[] | undefined =>
+  Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+    : undefined;
 
 type SourceGetter = (key: keyof BrowserDefaultsOptions) => string | undefined;
 
@@ -216,5 +223,13 @@ export function applyBrowserDefaultsFromConfig(
     browser.manualLoginCookieSync !== undefined
   ) {
     options.browserManualLoginCookieSync = browser.manualLoginCookieSync;
+  }
+  const configuredApps = stringList(browser.apps);
+  if (isUnset("browserApp") && configuredApps) {
+    options.browserApp = configuredApps;
+  }
+  const configuredAppChips = stringList(browser.appChipFiles);
+  if (isUnset("browserAppChip") && configuredAppChips) {
+    options.browserAppChip = configuredAppChips;
   }
 }

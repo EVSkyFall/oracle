@@ -83,6 +83,13 @@ export interface BrowserConfigDefaults {
    * transcript is meant to be evidence rather than an answer.
    */
   captureProviderNative?: boolean;
+  /**
+   * Apps to mention in every ChatGPT prompt (--browser-app). User config only: a project
+   * config must not attach tools that can act on this machine.
+   */
+  apps?: string[];
+  /** Chip HTML files copied from ChatGPT, one per app (--browser-app-chip). User config only. */
+  appChipFiles?: string[];
 }
 
 export interface AzureConfig {

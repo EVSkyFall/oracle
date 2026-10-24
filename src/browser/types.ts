@@ -31,6 +31,14 @@ export type BrowserLogger = ((message: string) => void) & {
   sessionLog?: (message: string) => void;
 };
 
+/** A ChatGPT app/connector to mention in each prompt (for example CODEXish). */
+export interface BrowserAppMention {
+  /** Display name as ChatGPT shows it; matched case-insensitively. */
+  name: string;
+  /** Mention chip HTML copied from ChatGPT; pasted instead of using the "@" picker. */
+  chipHtml?: string;
+}
+
 export interface BrowserAttachment {
   path: string;
   displayPath: string;
@@ -144,6 +152,11 @@ export interface BrowserAutomationConfig {
   resumeConversationUrl?: string | null;
   /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
   captureProviderNative?: boolean;
+  /**
+   * Apps to mention in every submitted prompt (records, or plain names from config files);
+   * a mention that cannot be verified stops the send.
+   */
+  apps?: Array<BrowserAppMention | string>;
 }
 
 export interface BrowserRunOptions {
@@ -265,8 +278,10 @@ export type ResolvedBrowserConfig = Required<
     | "maxConcurrentTabs"
     | "researchMode"
     | "copyProfileSource"
+    | "apps"
   >
 > & {
+  apps: BrowserAppMention[];
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;

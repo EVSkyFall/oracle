@@ -1,5 +1,5 @@
 import { withoutBrowserCancellation } from "../cancellation.js";
-import type { ChromeClient, BrowserLogger } from "../types.js";
+import type { BrowserAppMention, ChromeClient, BrowserLogger } from "../types.js";
 import { randomUUID } from "node:crypto";
 import {
   INPUT_SELECTORS,
@@ -37,6 +37,7 @@ import {
   readComposerPromptText,
 } from "./composerTools.js";
 import { hasDeepResearchMention } from "./deepResearch.js";
+import { assertAppMentionsPresent, insertAppMentions } from "./appMentions.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -78,6 +79,8 @@ export async function submitPrompt(
     webSearch?: boolean;
     /** Deep Research was activated before staging; its editor mention must still be there. */
     deepResearch?: boolean;
+    /** Apps to mention ahead of the prompt text. */
+    apps?: readonly BrowserAppMention[];
   },
   prompt: string,
   logger: BrowserLogger,
@@ -98,6 +101,8 @@ export async function submitPrompt(
   }
 
   await waitForDomReady(runtime, logger, deps.inputTimeoutMs ?? undefined);
+  const apps = deps.apps ?? [];
+  if (apps.length > 0) await insertAppMentions(runtime, input, apps, logger);
   let observedLength: number;
   if (hasAttachments) {
     observedLength = await stageAttachmentPrompt(runtime, prompt, deps.attachmentNavigationUrl!);
@@ -366,6 +371,7 @@ export async function submitPrompt(
       { stage: "submit-prompt", code: "deep-research-mention-lost" },
     );
   }
+  await assertAppMentionsPresent(runtime, apps);
   await warnIfChatListRateLimited(runtime, logger);
 
   // Install before the click: a short answer can complete while commit verification runs.

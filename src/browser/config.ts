@@ -9,7 +9,7 @@ import {
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS,
   normalizeMaxConcurrentTabs,
 } from "./tabLeaseRegistry.js";
-import type { BrowserAutomationConfig, ResolvedBrowserConfig } from "./types.js";
+import type { BrowserAppMention, BrowserAutomationConfig, ResolvedBrowserConfig } from "./types.js";
 import { normalizeChatgptUrl } from "./utils.js";
 import { parseDuration } from "../duration.js";
 import os from "node:os";
@@ -71,6 +71,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   archiveConversations: "auto",
   resumeConversationUrl: null,
   captureProviderNative: false,
+  apps: [],
 };
 
 export function resolveBrowserConfig(
@@ -162,11 +163,40 @@ export function resolveBrowserConfig(
       config?.resumeConversationUrl ?? DEFAULT_BROWSER_CONFIG.resumeConversationUrl,
     captureProviderNative:
       config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative,
+    apps: normalizeBrowserApps(config?.apps),
     manualLogin,
     manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
     manualLoginCookieSync:
       config?.manualLoginCookieSync ?? DEFAULT_BROWSER_CONFIG.manualLoginCookieSync,
   };
+}
+
+/**
+ * Accepts app names or { name, chipHtml } records (saved sessions and config files may hold
+ * either), drops blanks, and merges duplicates case-insensitively, keeping the first chip.
+ */
+export function normalizeBrowserApps(value: unknown): BrowserAppMention[] {
+  if (!Array.isArray(value)) return [];
+  const apps: BrowserAppMention[] = [];
+  for (const entry of value) {
+    const record =
+      typeof entry === "string"
+        ? { name: entry }
+        : entry && typeof entry === "object"
+          ? (entry as { name?: unknown; chipHtml?: unknown })
+          : null;
+    const name = typeof record?.name === "string" ? record.name.trim() : "";
+    if (!name) continue;
+    const chipHtml =
+      typeof record?.chipHtml === "string" && record.chipHtml.trim() ? record.chipHtml : undefined;
+    const existing = apps.find((app) => app.name.toLowerCase() === name.toLowerCase());
+    if (existing) {
+      existing.chipHtml ??= chipHtml;
+      continue;
+    }
+    apps.push(chipHtml ? { name, chipHtml } : { name });
+  }
+  return apps;
 }
 
 function normalizeResearchMode(value: unknown): "off" | "search" | "deep" {

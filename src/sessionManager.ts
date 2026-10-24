@@ -6,6 +6,7 @@ import type { WriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import type {
+  BrowserAppMention,
   BrowserArchiveMode,
   BrowserArchiveResult,
   BrowserModelStrategy,
@@ -94,6 +95,8 @@ export interface BrowserSessionConfig {
   resumeConversationUrl?: string | null;
   /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
   captureProviderNative?: boolean;
+  /** Apps mentioned in every submitted prompt (--browser-app / --browser-app-chip). */
+  apps?: Array<BrowserAppMention | string>;
 }
 
 export interface BrowserRecoveryTarget {

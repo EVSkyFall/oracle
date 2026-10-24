@@ -1,4 +1,4 @@
-import type { BrowserLogger, ChromeClient } from "../types.js";
+import type { BrowserAppMention, BrowserLogger, ChromeClient } from "../types.js";
 import type { ProviderDomAdapter, ProviderDomFlowContext } from "../providerDomFlow.js";
 import { ensurePromptReady } from "../actions/navigation.js";
 import { submitPrompt, type AttachmentReadyExpectation } from "../actions/promptComposer.js";
@@ -20,6 +20,7 @@ interface ChatgptDomProviderState {
   onPromptSubmitted?: () => Promise<void> | void;
   webSearch?: boolean;
   deepResearch?: boolean;
+  apps?: BrowserAppMention[];
 }
 
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
@@ -55,6 +56,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       onPromptSubmitted: state.onPromptSubmitted,
       webSearch: state.webSearch,
       deepResearch: state.deepResearch,
+      apps: state.apps,
     },
     ctx.prompt,
     state.logger,

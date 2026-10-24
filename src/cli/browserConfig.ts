@@ -16,6 +16,7 @@ import type {
 } from "../browser/types.js";
 import type { CookieParam } from "../browser/types.js";
 import { getOracleHomeDir } from "../oracleHome.js";
+import { resolveBrowserAppMentions } from "./browserApps.js";
 
 const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
 const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
@@ -108,6 +109,8 @@ export interface BrowserFlagOptions {
   remoteChrome?: string;
   browserPort?: number;
   browserDebugPort?: number;
+  browserApp?: string[];
+  browserAppChip?: string[];
   model: ModelName;
   verbose?: boolean;
 }
@@ -369,6 +372,7 @@ export async function buildBrowserConfig(
         : "off",
     archiveConversations: options.browserArchive,
     captureProviderNative: options.browserCaptureProviderNative,
+    apps: await resolveBrowserAppMentions(options.browserApp, options.browserAppChip),
   };
 }
 

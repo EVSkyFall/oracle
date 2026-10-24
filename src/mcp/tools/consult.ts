@@ -27,7 +27,8 @@ export async function readSessionLogTail(
 import { performSessionRun } from "../../cli/sessionRunner.js";
 import { runDryRunSummary } from "../../cli/dryRun.js";
 import { CHATGPT_URL } from "../../browser/constants.js";
-import { resolveBrowserNoFocus } from "../../browser/config.js";
+import { normalizeBrowserApps, resolveBrowserNoFocus } from "../../browser/config.js";
+import { resolveBrowserAppMentions } from "../../cli/browserApps.js";
 import { CONSULT_PRESETS, browserThinkingTimeRawSchema, consultInputSchema } from "../types.js";
 import { applyConsultPreset } from "../consultPresets.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
@@ -37,7 +38,7 @@ import {
   resolveBrowserModelLabel,
   resolveDefaultBrowserThinkingTime,
 } from "../../cli/browserConfig.js";
-import type { BrowserModelStrategy } from "../../browser/types.js";
+import type { BrowserAppMention, BrowserModelStrategy } from "../../browser/types.js";
 import { normalizeThinkingTimeLevel } from "../../oracle/thinkingTime.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
 import { launchDetachedSession } from "../../cli/detachedSession.js";
@@ -122,6 +123,18 @@ const consultInputShape = {
     .optional()
     .describe(
       "Browser-only: additional prompts to submit sequentially in the same ChatGPT conversation after the initial answer.",
+    ),
+  browserApps: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Browser-only (ChatGPT): apps to mention in every submitted prompt, by their exact ChatGPT name (for example "CODEXish"). The run stops before sending if a mention cannot be verified.',
+    ),
+  browserAppChips: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Browser-only (ChatGPT): paths of files holding mention chip HTML copied from ChatGPT; pasted before trying the @ picker.",
     ),
   browserKeepBrowser: z
     .boolean()
@@ -338,6 +351,7 @@ export function buildConsultBrowserConfig({
   browserResearchMode,
   browserArchive,
   browserKeepBrowser,
+  apps,
 }: {
   userConfig: UserConfig;
   env: Record<string, string | undefined>;
@@ -349,8 +363,15 @@ export function buildConsultBrowserConfig({
   browserResearchMode?: "search" | "deep";
   browserArchive?: "auto" | "always" | "never";
   browserKeepBrowser?: boolean;
+  /** Resolved app mentions; defaults to the configured app names. */
+  apps?: BrowserAppMention[];
 }): BrowserSessionConfig {
-  const configuredBrowser = userConfig.browser ?? {};
+  // Config-only keys are resolved here, not copied into the session config.
+  const {
+    apps: configuredApps,
+    appChipFiles: _appChipFiles,
+    ...configuredBrowser
+  } = userConfig.browser ?? {};
   const envProfileDir = (env.ORACLE_BROWSER_PROFILE_DIR ?? "").trim();
   const hasProfileDir = envProfileDir.length > 0;
   const preferredLabel = (browserModelLabel ?? inputModel)?.trim();
@@ -364,6 +385,7 @@ export function buildConsultBrowserConfig({
     : (configuredBrowser.manualLogin ?? process.platform === "win32");
   const configuredThinkingTime = normalizeThinkingTimeLevel(configuredBrowser.thinkingTime);
   const modelStrategy = browserModelStrategy ?? configuredBrowser.modelStrategy;
+  const resolvedApps = apps ?? normalizeBrowserApps(configuredApps);
 
   return {
     ...configuredBrowser,
@@ -394,6 +416,7 @@ export function buildConsultBrowserConfig({
     archiveConversations: browserArchive ?? configuredBrowser.archiveConversations,
     desiredModel: desiredModelLabel || mapModelToBrowserLabel(runModel),
     modelIsImplicitDefault: !inputModel && !userConfig.model && !browserModelLabel,
+    ...(resolvedApps.length > 0 ? { apps: resolvedApps } : {}),
   };
 }
 
@@ -554,6 +577,8 @@ export async function runConsultTool(
     browserResearchMode,
     browserArchive,
     browserFollowUps,
+    browserApps,
+    browserAppChips,
     browserKeepBrowser,
     generateImage,
     outputPath,
@@ -594,6 +619,20 @@ export async function runConsultTool(
   const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
   let browserConfig: BrowserSessionConfig | undefined;
   if (resolvedEngine === "browser") {
+    let apps: BrowserAppMention[] | undefined;
+    try {
+      apps =
+        (await resolveBrowserAppMentions(
+          browserApps ?? userConfig.browser?.apps,
+          browserAppChips ?? userConfig.browser?.appChipFiles,
+          cwd,
+        )) ?? [];
+    } catch (error) {
+      return {
+        isError: true,
+        content: textContent(error instanceof Error ? error.message : String(error)),
+      };
+    }
     browserConfig = buildConsultBrowserConfig({
       userConfig,
       env: process.env,
@@ -605,6 +644,7 @@ export async function runConsultTool(
       browserResearchMode,
       browserArchive,
       browserKeepBrowser,
+      apps,
     });
   }
 

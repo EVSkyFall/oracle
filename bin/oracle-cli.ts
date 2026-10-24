@@ -165,6 +165,8 @@ interface CliOptions extends OptionValues {
   browserCaptureProviderNative?: boolean;
   browserResearch?: "off" | "search" | "deep";
   browserFollowUp?: string[];
+  browserApp?: string[];
+  browserAppChip?: string[];
   browserAllowCookieErrors?: boolean;
   browserAttachments?: string;
   browserInlineFiles?: boolean;
@@ -866,6 +868,22 @@ program
     new Option(
       "--browser-follow-up <prompt>",
       "Submit an additional prompt in the same ChatGPT browser conversation after the initial answer; repeat for multi-turn consults.",
+    )
+      .argParser(collectTextValues)
+      .default([]),
+  )
+  .addOption(
+    new Option(
+      "--browser-app <name>",
+      'Mention a ChatGPT app in every submitted prompt (for example "CODEXish"), chosen from the composer "@" picker by its exact name; repeatable. The run stops before sending if the mention cannot be verified.',
+    )
+      .argParser(collectTextValues)
+      .default([]),
+  )
+  .addOption(
+    new Option(
+      "--browser-app-chip <file>",
+      "Mention an app by pasting chip HTML copied from ChatGPT (file contents); repeatable. Used before the @ picker for that app, which stays the fallback.",
     )
       .argParser(collectTextValues)
       .default([]),
@@ -2264,6 +2282,15 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     options.browserFollowUp?.filter((entry) => entry.trim().length > 0).length ?? 0;
   if (engine !== "browser" && browserFollowUpCount > 0) {
     throw new Error("--browser-follow-up requires --engine browser.");
+  }
+  // Only typed flags: configured browser.apps must not break API or Gemini runs.
+  const browserAppRequested =
+    (getSource("browserApp") === "cli" && (options.browserApp?.length ?? 0) > 0) ||
+    (getSource("browserAppChip") === "cli" && (options.browserAppChip?.length ?? 0) > 0);
+  if (browserAppRequested && (engine !== "browser" || activeModel.startsWith("gemini"))) {
+    throw new Error(
+      "--browser-app/--browser-app-chip require a ChatGPT run with --engine browser.",
+    );
   }
 
   const sessionMode: SessionMode = engine === "browser" ? "browser" : "api";
