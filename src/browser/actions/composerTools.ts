@@ -23,6 +23,18 @@ export const COMPOSER_PLUS_SELECTORS = [
   'button[data-testid="composer-plus-btn"]',
 ];
 
+/**
+ * Inline editor tokens that are not prompt text: tool pills (Web search) and app or plugin
+ * mentions (Deep research, connected apps). Staged-prompt comparisons drop them.
+ */
+export const COMPOSER_TOKEN_SELECTOR = [
+  "[data-inline-selection-pill]",
+  "[data-inline-selection-pill-cursor-target]",
+  "[app-mention-name]",
+  "[plugin-mention-name]",
+  "[data-prompt-link-href]",
+].join(", ");
+
 /** Rows of the "+" panel and of the "@" mention picker share this list item. */
 export const COMPOSER_PANEL_ROW_SELECTOR = "button[data-list-navigation-item]";
 const LEGACY_PANEL_ROOT_SELECTOR =

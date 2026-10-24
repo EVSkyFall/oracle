@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildWebSearchVerificationExpression,
+  findWebSearchPanelRow,
   matchesWebSearchMenuLabel,
 } from "../../src/browser/actions/webSearch.js";
 import { FakeDocument, FakeElement } from "./domFixture.js";
@@ -73,6 +74,78 @@ describe("Web Search inline selection", () => {
     });
     expect(evaluate("Lost or replaced prompt").promptMatches).toBe(false);
   });
+  const evaluateVerification = (editor: Element, prompt: string) =>
+    new Function(
+      "document",
+      "HTMLElement",
+      `return ${buildWebSearchVerificationExpression(prompt)}`,
+    )(new FakeDocument([editor]), FakeElement);
+
+  test("accepts today's search pill, which has no data-id", () => {
+    const pill = new Element(
+      "span",
+      {
+        "data-inline-selection-pill": "",
+        "data-system-hint-type": "search",
+        "data-prompt-link-href": "chatgpt-system-hint://search",
+      },
+      [],
+      "Web search",
+    );
+    const editor = new Element("div", { contenteditable: "true", role: "textbox" }, [
+      new Element("p", {}, [pill], "Look this up"),
+    ]);
+    expect(evaluateVerification(editor, "Look this up")).toEqual({
+      selected: true,
+      promptMatches: true,
+    });
+  });
+
+  test("ignores app mentions when comparing the staged prompt", () => {
+    const pill = new Element(
+      "span",
+      { "data-inline-selection-pill": "", "data-system-hint-type": "search" },
+      [],
+      "Web search",
+    );
+    const mention = new Element(
+      "span",
+      {
+        "app-mention-name": "codexish",
+        "app-mention-display-name": "CODEXish",
+        "data-prompt-link-href": "app://asdk_app_example",
+      },
+      [],
+      "CODEXish",
+    );
+    const editor = new Element("div", { contenteditable: "true", role: "textbox" }, [
+      new Element("p", {}, [mention, pill], "Check the build"),
+    ]);
+    expect(evaluateVerification(editor, "Check the build")).toEqual({
+      selected: true,
+      promptMatches: true,
+    });
+  });
+
+  test("finds the Web search row by title in the + panel", () => {
+    const row = (title: string, text = title) => ({
+      index: 0,
+      title,
+      leaf: title,
+      aria: "",
+      text,
+      impression: null,
+      current: false,
+    });
+    expect(
+      findWebSearchPanelRow([
+        row("Add photos & files", "Add photos & files Upload from computer"),
+        row("Web search", "Web search Find real-time news and info"),
+      ]),
+    ).toBe(1);
+    expect(findWebSearchPanelRow([row("GitHub"), row("Web search settings")])).toBe(-1);
+  });
+
   test("keeps CLI, saved configuration, and MCP modes consistent", async () => {
     expect(
       (await buildBrowserConfig({ model: "gpt-5.5-pro", browserResearch: "search" })).researchMode,

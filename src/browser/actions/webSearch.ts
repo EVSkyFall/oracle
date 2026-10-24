@@ -2,13 +2,14 @@ import type { ChromeClient, BrowserLogger } from "../types.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { INPUT_SELECTORS } from "../constants.js";
 import { delay } from "../utils.js";
+import { captureComposerNavigationUrl, assertComposerPlusStayedInPlace } from "./attachments.js";
 import {
-  activateComposerPlus,
-  captureComposerNavigationUrl,
-  assertComposerPlusStayedInPlace,
-} from "./attachments.js";
-import { buildComposerNavigationValidationExpression } from "./attachmentContext.js";
-import { buildClickDispatcher } from "./domEvents.js";
+  COMPOSER_TOKEN_SELECTOR,
+  type ComposerPanelRow,
+  clickComposerPanelRow,
+  closeComposerPlusPanel,
+  openComposerPlusPanel,
+} from "./composerTools.js";
 
 export function matchesWebSearchMenuLabel(value: string): boolean {
   return [
@@ -19,14 +20,30 @@ export function matchesWebSearchMenuLabel(value: string): boolean {
   ].includes(value.replace(/\s+/g, "").toLowerCase());
 }
 
+/** The "+" panel row for Web Search, by its title (or the legacy combined label). */
+export function findWebSearchPanelRow(rows: readonly ComposerPanelRow[]): number {
+  return rows.findIndex((row) =>
+    [row.title, row.leaf, row.aria, row.text].some(
+      (value) => value.length > 0 && matchesWebSearchMenuLabel(value),
+    ),
+  );
+}
+
 export function buildWebSearchVerificationExpression(prompt: string): string {
   return `(() => {
     const visible = node => node instanceof HTMLElement && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
     const editor = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).find(visible);
     if (!editor) return { selected: false, promptMatches: false };
-    const chip = editor.querySelector('[data-inline-selection-pill][data-id="search"][data-system-hint-type="search"]');
+    // Current pills carry the system-hint type and link but no data-id; older ones had data-id="search".
+    const isSearchPill = node => {
+      const hint = node.getAttribute('data-system-hint-type');
+      return hint === 'search' ||
+        node.getAttribute('data-prompt-link-href') === 'chatgpt-system-hint://search' ||
+        (hint === null && node.getAttribute('data-id') === 'search');
+    };
+    const chip = Array.from(editor.querySelectorAll('[data-inline-selection-pill]')).find(isSearchPill);
     const copy = editor.cloneNode(true);
-    copy.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]').forEach(node => node.remove());
+    copy.querySelectorAll(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)}).forEach(node => node.remove());
     const readText = node => {
       if (node.nodeType === 3) return node.textContent ?? '';
       const text = Array.from(node.childNodes).map(readText).join('');
@@ -37,24 +54,7 @@ export function buildWebSearchVerificationExpression(prompt: string): string {
   })()`;
 }
 
-export function buildWebSearchSelectionExpression(navigationUrl: string): string {
-  return `(() => {
-    ${buildClickDispatcher()}
-    const matchesLabel = ${matchesWebSearchMenuLabel.toString()};
-    const navigation = ${buildComposerNavigationValidationExpression(navigationUrl)};
-    if (!navigation.contextMatches || navigation.workSelected || navigation.modeUnverified) return 'context-changed';
-    const visible = node => node instanceof HTMLElement && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
-    const roots = Array.from(document.querySelectorAll('main .popover, [data-radix-popper-content-wrapper], [data-floating-ui-portal], [role="menu"], [role="listbox"]')).filter(visible);
-    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll('[data-radix-collection-item], [role="menuitem"], [role="option"], .__menu-item, [class*="menu-item"]')));
-    const match = candidates.find(node => {
-      if (!visible(node) || node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true') return false;
-      return matchesLabel(node.textContent ?? '');
-    });
-    if (!match) return 'missing';
-    dispatchClickSequence(match);
-    return 'clicked';
-  })()`;
-}
+const WEB_SEARCH_STAGE = "web-search-activate";
 
 /** Web Search is an inline editor hint, so activate it after staging text/attachments. */
 export async function activateWebSearch(
@@ -73,26 +73,30 @@ export async function activateWebSearch(
     return result?.value?.selected === true && result?.value?.promptMatches === true;
   };
   if (await verify()) return;
-  const activated = await activateComposerPlus(runtime, input, navigationUrl);
-  if (activated.method === "unavailable")
-    throw new BrowserAutomationError("Web Search requires the ChatGPT composer tools menu.", {
-      stage: "web-search-activate",
-    });
-  const deadline = Date.now() + 5_000;
-  let clicked = false;
-  while (Date.now() < deadline) {
-    const outcome = await runtime.evaluate({
-      expression: buildWebSearchSelectionExpression(navigationUrl),
-      returnByValue: true,
-    });
-    if (outcome.result?.value === "clicked") {
-      clicked = true;
-      break;
-    }
-    if (outcome.exceptionDetails || outcome.result?.value !== "missing") break;
-    await delay(100);
+  const opened = await openComposerPlusPanel(runtime, input, {
+    navigationUrl,
+    stage: WEB_SEARCH_STAGE,
+  });
+  if (opened.status === "unavailable" || opened.status === "not-needed") {
+    throw new BrowserAutomationError(
+      `Web Search requires the ChatGPT composer tools menu (${opened.reason ?? "not available"}); the prompt was not submitted.`,
+      { stage: WEB_SEARCH_STAGE, code: "web-search-menu-unavailable" },
+    );
   }
-  if (clicked) {
+  try {
+    const choice = await clickComposerPanelRow(runtime, input, {
+      pick: findWebSearchPanelRow,
+      navigationUrl,
+      stage: WEB_SEARCH_STAGE,
+      target: "The Web search row",
+    });
+    if (choice.status !== "clicked") {
+      const available = choice.rows.map((row) => row.title || row.text).filter(Boolean);
+      throw new BrowserAutomationError(
+        `Web Search option not found in the composer + panel${available.length ? ` (available: ${available.join(", ")})` : ""}; the prompt was not submitted.`,
+        { stage: WEB_SEARCH_STAGE, code: "web-search-option-missing", available },
+      );
+    }
     const confirmationDeadline = Date.now() + 3_000;
     do {
       await assertComposerPlusStayedInPlace(runtime, navigationUrl);
@@ -102,9 +106,11 @@ export async function activateWebSearch(
       }
       await delay(100);
     } while (Date.now() < confirmationDeadline);
+  } finally {
+    await closeComposerPlusPanel(runtime, input).catch(() => false);
   }
   throw new BrowserAutomationError(
     "Web Search selection could not be verified; the prompt was not submitted. This pilot supports the English ChatGPT Web search control.",
-    { stage: "web-search-activate" },
+    { stage: WEB_SEARCH_STAGE },
   );
 }
