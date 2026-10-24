@@ -282,6 +282,8 @@ Browser mode keeps the local session as the source of truth, so Oracle can optio
 
 Oracle does not auto-archive failed, incomplete, running, project, Deep Research, or multi-turn sessions. Use `--browser-archive never` to disable archiving, or `--browser-archive always` when you explicitly want a successful browser conversation archived even outside the default one-shot policy. Archived chats are still visible and manageable from ChatGPT's own archive UI.
 
+Oracle archives through ChatGPT's own menus with trusted clicks. Today that is the chat's sidebar row: its "Chat actions" menu (or the row's only menu button), then "Archive". Earlier UIs had a conversation menu in the page header, which stays as a fallback but is used only while the open page is that chat. Oracle reads only the menu that belongs to the button it opened, so it never uses another chat's row or picks Delete or Unarchive. It counts the chat as archived when its row leaves the sidebar, the page leaves the chat, or ChatGPT shows an "archived" toast. A chat that could not be archived is a warning with the concrete cause (`conversation-menu-not-found`, `conversation-menu-not-opened`, `archive-menu-item-not-found` or `archive-not-confirmed`, plus what each menu showed); the run itself still succeeds.
+
 ### ChatGPT Project Sources
 
 ChatGPT Project Sources can act as explicit shared context for project workflows where chats should not implicitly share memory. This is especially useful with Developer Mode / Memory Off: separate chats do not see each other's conversation history, but they can read files attached to the Project Sources tab.

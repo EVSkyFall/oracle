@@ -1,11 +1,19 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  ARCHIVE_LABELS,
   archiveChatGptConversation,
-  buildArchiveConversationExpressionForTest,
+  conversationIdFromUrl,
+  findArchiveMenuItem,
+  findConversationRowMenuButton,
+  findHeaderConversationMenuButton,
+  findMenuForTrigger,
   isProjectChatgptUrl,
   isTemporaryChatgptUrl,
+  menuOffersUnarchive,
+  readArchiveSignals,
   resolveBrowserArchiveDecision,
 } from "../../src/browser/actions/archiveConversation.js";
+import { FakeDocument, FakeElement } from "./domFixture.js";
 
 describe("browser conversation archive policy", () => {
   test("archives successful non-project one-shots in auto mode", () => {
@@ -96,45 +104,11 @@ describe("browser conversation archive policy", () => {
 });
 
 describe("archiveChatGptConversation", () => {
-  test("returns archived result when the DOM action succeeds", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: { value: { status: "archived", conversationUrl: "https://chatgpt.com/c/abc" } },
-      }),
-    };
+  test("a failure is reported as not archived, never thrown", async () => {
+    const runtime = { evaluate: vi.fn().mockRejectedValue(new Error("target closed")) };
     const logger = vi.fn();
-
     await expect(
       archiveChatGptConversation(runtime as never, logger as never, {
-        mode: "auto",
-        conversationUrl: "https://chatgpt.com/c/abc",
-      }),
-    ).resolves.toMatchObject({
-      mode: "auto",
-      attempted: true,
-      archived: true,
-      conversationUrl: "https://chatgpt.com/c/abc",
-    });
-    expect(runtime.evaluate).toHaveBeenCalledWith(
-      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
-    );
-  });
-
-  test("returns a non-archived result when the DOM action is not confirmed", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            status: "skipped",
-            reason: "archive-not-confirmed",
-            conversationUrl: "https://chatgpt.com/c/abc",
-          },
-        },
-      }),
-    };
-
-    await expect(
-      archiveChatGptConversation(runtime as never, vi.fn() as never, {
         mode: "always",
         conversationUrl: "https://chatgpt.com/c/abc",
       }),
@@ -142,73 +116,153 @@ describe("archiveChatGptConversation", () => {
       mode: "always",
       attempted: true,
       archived: false,
-      reason: "archive-not-confirmed",
+      reason: "archive-failed",
+      error: "target closed",
       conversationUrl: "https://chatgpt.com/c/abc",
     });
-  });
-
-  test("keeps the archive expression scoped to Archive actions", () => {
-    const expression = buildArchiveConversationExpressionForTest();
-    expect(expression).toContain("findConversationMenuButton");
-    expect(expression).toContain("visibleMenuCandidates");
-    expect(expression).toContain("findArchiveMenuItem");
-    expect(expression).toContain("findArchiveConfirmationButton");
-    expect(expression).toContain("hasUnarchiveMenuItem");
-    expect(expression).toContain("PointerEvent");
-    expect(expression).toContain("waitForArchiveConfirmation");
-    expect(expression).toContain("archive-not-confirmed");
-    expect(expression).toContain("archive");
-    expect(expression).not.toContain("delete");
-  });
-
-  test("recognizes Japanese ChatGPT archive controls", () => {
-    const expression = buildArchiveConversationExpressionForTest();
-    expect(expression).toContain("その他");
-    expect(expression).toContain("会話オプション");
-    expect(expression).toContain("アーカイブ");
-    expect(expression).toContain("アーカイブを解除");
-    expect(expression).toContain("アーカイブしました");
+    expect(logger).toHaveBeenCalledWith("[browser] ChatGPT archive skipped (target closed).");
   });
 });
 
-// Every locale label this matcher relies on, one line per literal, checked against the
-// SPECIFIC matcher function that consumes it (not the whole serialized expression) — a
-// global `expression.toContain(label)` would still pass if a label were deleted from one
-// matcher while an identical label happened to survive in a sibling matcher, since several
-// of these labels (e.g. "archive", "アーカイブ") are deliberately repeated across matchers.
-// Labels are matched as quoted literals (`'label'`), not bare substrings: "アーカイブ" is
-// itself a substring of "アーカイブする", so a bare check would stay green even after the
-// standalone "アーカイブ" literal is deleted, as long as "アーカイブする" still exists.
-// A future PR that silently drops or renames a label now fails here instead of only
-// showing up as a live-account regression report — see docs/browser-mode.md's "self check"
-// ask and the localized-controls history in #407/#405.
-describe("archive expression locale label inventory", () => {
-  const expression = buildArchiveConversationExpressionForTest();
-  const quoted = (label: string) => `'${label}'`;
-
-  // Slice out one matcher function's own source, bounded by the next function's start,
-  // so an assertion against the slice can only be satisfied by that matcher's own labels.
-  const matcherSlice = (startMarker: string, endMarker: string): string => {
-    const start = expression.indexOf(startMarker);
-    if (start === -1) {
-      throw new Error(`matcher start marker not found in expression: ${startMarker}`);
-    }
-    const end = expression.indexOf(endMarker, start + startMarker.length);
-    if (end === -1) {
-      throw new Error(`matcher end marker not found in expression: ${endMarker}`);
-    }
-    return expression.slice(start, end);
-  };
-
-  const menuButtonSlice = matcherSlice("findConversationMenuButton", "visibleMenuCandidates");
-  const archiveItemSlice = matcherSlice("findArchiveMenuItem", "findArchiveConfirmationButton");
-  const confirmButtonSlice = matcherSlice("findArchiveConfirmationButton", "hasUnarchiveMenuItem");
-  const unarchiveMenuSlice = matcherSlice("hasUnarchiveMenuItem", "hasArchiveConfirmation");
-  const confirmationToastSlice = matcherSlice(
-    "hasArchiveConfirmation",
-    "waitForArchiveConfirmation",
+// Today's sidebar row (2026-10): a role="group" row inside a role="list", the chat link, and a
+// hover-revealed "Chat actions" menu button next to "Pin chat".
+const row = (id: string, buttons: FakeElement[] = [chatActions(id)]) =>
+  new FakeElement("div", { role: "listitem" }, [
+    new FakeElement("div", { role: "group", "aria-label": `Chat ${id}` }, [
+      new FakeElement("div", {}, [new FakeElement("a", { href: `/c/${id}` }, [], `Chat ${id}`)]),
+      new FakeElement("div", {}, buttons),
+    ]),
+  ]);
+const chatActions = (id: string, label = "Chat actions") =>
+  new FakeElement("button", {
+    id: `trigger-${id}`,
+    "aria-label": label,
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+  });
+const sidebar = (...rows: FakeElement[]) =>
+  new FakeElement("nav", {}, [new FakeElement("div", { role: "list" }, rows)]);
+const menu = (labels: string[], attrs: Record<string, string> = {}) =>
+  new FakeElement(
+    "div",
+    { role: "menu", ...attrs },
+    labels.map((label) => new FakeElement("div", { role: "menuitem" }, [], label)),
   );
+const doc = (...children: FakeElement[]) => new FakeDocument(children) as unknown as Document;
+const el = (node: FakeElement) => node as unknown as Element;
 
+describe("archive locators", () => {
+  test("reads the conversation id from ChatGPT URLs and paths", () => {
+    expect(conversationIdFromUrl("https://chatgpt.com/c/6add23d8-3344?x=1")).toBe("6add23d8-3344");
+    expect(conversationIdFromUrl("https://chatgpt.com/g/g-p-demo/project/c/abc#top")).toBe("abc");
+    expect(conversationIdFromUrl("/c/abc")).toBe("abc");
+    expect(conversationIdFromUrl("https://chatgpt.com/")).toBeNull();
+    expect(conversationIdFromUrl(undefined)).toBeNull();
+  });
+
+  test("finds this chat's own row menu button, never another row's", () => {
+    const page = doc(sidebar(row("bbb"), row("aaa"), row("ccc")));
+    const found = findConversationRowMenuButton(page, "aaa", ARCHIVE_LABELS.rowMenuButton);
+    expect(found?.getAttribute("id")).toBe("trigger-aaa");
+    expect(findConversationRowMenuButton(page, "zzz", ARCHIVE_LABELS.rowMenuButton)).toBeNull();
+  });
+
+  test("a row without its own menu button does not borrow a neighbour's", () => {
+    const page = doc(sidebar(row("bbb"), row("aaa", []), row("ccc")));
+    expect(findConversationRowMenuButton(page, "aaa", ARCHIVE_LABELS.rowMenuButton)).toBeNull();
+  });
+
+  test("a row's only menu button counts whatever its label, a labelled one wins over others", () => {
+    const unlabelled = doc(sidebar(row("aaa", [chatActions("aaa", "채팅 작업")])));
+    expect(
+      findConversationRowMenuButton(unlabelled, "aaa", ARCHIVE_LABELS.rowMenuButton)?.getAttribute(
+        "id",
+      ),
+    ).toBe("trigger-aaa");
+    const share = new FakeElement("button", {
+      id: "share-aaa",
+      "aria-label": "Share",
+      "aria-haspopup": "menu",
+    });
+    const two = doc(sidebar(row("aaa", [share, chatActions("aaa")])));
+    expect(
+      findConversationRowMenuButton(two, "aaa", ARCHIVE_LABELS.rowMenuButton)?.getAttribute("id"),
+    ).toBe("trigger-aaa");
+  });
+
+  test("the header menu button is never one inside the sidebar list", () => {
+    const more = new FakeElement("button", { id: "more", "aria-label": "More" });
+    const page = doc(
+      sidebar(row("aaa", [chatActions("aaa", "More")])),
+      new FakeElement("header", {}, [more]),
+    );
+    expect(
+      findHeaderConversationMenuButton(page, ARCHIVE_LABELS.headerMenuButton)?.getAttribute("id"),
+    ).toBe("more");
+    expect(
+      findHeaderConversationMenuButton(
+        doc(sidebar(row("aaa", [chatActions("aaa", "More")]))),
+        ARCHIVE_LABELS.headerMenuButton,
+      ),
+    ).toBeNull();
+  });
+
+  test("reads only the menu linked to the trigger", () => {
+    const trigger = chatActions("aaa");
+    trigger.setAttribute("aria-expanded", "true");
+    trigger.setAttribute("aria-controls", "menu-a");
+    const other = menu(["Pin", "Archive"], { id: "menu-b", "aria-labelledby": "trigger-bbb" });
+    const own = menu(["Rename", "Archive"], { id: "menu-a" });
+    expect(findMenuForTrigger(doc(sidebar(row("aaa")), other, own), el(trigger))).toBe(el(own));
+    expect(findMenuForTrigger(doc(other), el(trigger))).toBeNull();
+    // A closed trigger never adopts an unrelated open menu.
+    expect(findMenuForTrigger(doc(other), el(chatActions("aaa")))).toBeNull();
+    // Menus without link attributes: the only open one.
+    const bare = new FakeElement("button", { "aria-haspopup": "menu" });
+    const lone = menu(["Archive"]);
+    expect(findMenuForTrigger(doc(lone), el(bare))).toBe(el(lone));
+  });
+
+  test("picks Archive, never Delete, Unarchive or Restore", () => {
+    const today = menu(["Rename", "Pin", "Share", "Archive", "Delete", "Move to project"]);
+    expect(findArchiveMenuItem(el(today), ARCHIVE_LABELS)?.textContent).toBe("Archive");
+    expect(
+      findArchiveMenuItem(el(menu(["Pin", "Plugins", "View files in chat"])), ARCHIVE_LABELS),
+    ).toBeNull();
+    expect(findArchiveMenuItem(el(menu(["Unarchive", "Delete"])), ARCHIVE_LABELS)).toBeNull();
+    expect(findArchiveMenuItem(el(menu(["Restore chat", "Delete"])), ARCHIVE_LABELS)).toBeNull();
+    expect(
+      findArchiveMenuItem(el(menu(["삭제", "아카이브에 보관"])), ARCHIVE_LABELS)?.textContent,
+    ).toBe("아카이브에 보관");
+    expect(findArchiveMenuItem(el(menu(["보관 해제", "삭제"])), ARCHIVE_LABELS)).toBeNull();
+    expect(menuOffersUnarchive(el(menu(["Unarchive"])), ARCHIVE_LABELS)).toBe(true);
+    expect(menuOffersUnarchive(el(today), ARCHIVE_LABELS)).toBe(false);
+  });
+
+  test("no label list can select Delete", () => {
+    const all = Object.values(ARCHIVE_LABELS).flat();
+    expect(all.some((label) => "delete".includes(label) || label.includes("delete"))).toBe(false);
+  });
+
+  test("archive signals: the row, the open page and toasts", () => {
+    const page = doc(
+      sidebar(row("aaa")),
+      new FakeElement("div", { role: "status" }, [], "Chat archived"),
+    );
+    expect(readArchiveSignals(page, "aaa", ARCHIVE_LABELS)).toMatchObject({
+      rowPresent: true,
+      toast: true,
+    });
+    expect(readArchiveSignals(doc(sidebar(row("bbb"))), "aaa", ARCHIVE_LABELS)).toMatchObject({
+      rowPresent: false,
+      toast: false,
+    });
+  });
+});
+
+// Every label kept from earlier UIs, one per literal, checked in the list that consumes it, so a
+// change that drops or renames one fails here instead of in a live run (history: #407/#405).
+describe("archive locale label inventory", () => {
   test("conversation menu ('more options') labels are present", () => {
     for (const label of [
       "more",
@@ -219,37 +273,28 @@ describe("archive expression locale label inventory", () => {
       "その他",
       "会話オプション",
     ]) {
-      expect(menuButtonSlice).toContain(quoted(label));
+      expect(ARCHIVE_LABELS.headerMenuButton).toContain(label);
     }
   });
 
   test("archive menu-item labels are present", () => {
     for (const label of ["archive", "archiwizuj", "アーカイブ", "アーカイブする"]) {
-      expect(archiveItemSlice).toContain(quoted(label));
+      expect(ARCHIVE_LABELS.archiveItem).toContain(label);
     }
   });
 
   test("archive confirmation-button labels are present", () => {
-    for (const label of [
-      "archive",
-      "archiwizuj",
-      "アーカイブ",
-      "アーカイブする",
-      "archive conversation",
-    ]) {
-      expect(confirmButtonSlice).toContain(quoted(label));
+    for (const label of ["archive", "archiwizuj", "アーカイブ"]) {
+      expect(ARCHIVE_LABELS.confirmButtonExact).toContain(label);
+    }
+    for (const label of ["archive conversation", "アーカイブする"]) {
+      expect(ARCHIVE_LABELS.confirmButtonContains).toContain(label);
     }
   });
 
-  test("unarchive/restore exclusion labels are present in every matcher that excludes them", () => {
-    for (const label of ["unarchive", "restore", "アーカイブを解除"]) {
-      expect(archiveItemSlice).toContain(quoted(label));
-      expect(confirmButtonSlice).toContain(quoted(label));
-      expect(unarchiveMenuSlice).toContain(quoted(label));
-    }
-    // Polish restore/unarchive words only appear in the standalone unarchive-detection matcher.
-    for (const label of ["przywróć", "przywroc"]) {
-      expect(unarchiveMenuSlice).toContain(quoted(label));
+  test("unarchive/restore exclusion labels are present", () => {
+    for (const label of ["unarchive", "restore", "アーカイブを解除", "przywróć", "przywroc"]) {
+      expect(ARCHIVE_LABELS.unarchive).toContain(label);
     }
   });
 
@@ -263,7 +308,7 @@ describe("archive expression locale label inventory", () => {
       "アーカイブしました",
       "アーカイブされました",
     ]) {
-      expect(confirmationToastSlice).toContain(quoted(label));
+      expect(ARCHIVE_LABELS.toast).toContain(label);
     }
   });
 });
