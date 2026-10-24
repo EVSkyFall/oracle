@@ -55,7 +55,12 @@ import {
 } from "../browser/recoveryTarget.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import { delay, estimateTokenCount } from "../browser/utils.js";
-import type { BrowserLogger, SavedBrowserFile } from "../browser/types.js";
+import type {
+  BrowserAppApprovalRecord,
+  BrowserLogger,
+  SavedBrowserFile,
+} from "../browser/types.js";
+import { withAppApprovals } from "../browser/appApprovalRecords.js";
 import { computeFileSha256, sanitizeArtifactFilename } from "../browser/artifacts.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
@@ -244,7 +249,7 @@ export async function performSessionRun({
             result.noFocus === undefined
               ? browserConfig
               : { ...browserConfig, noFocus: result.noFocus },
-          runtime: result.runtime,
+          runtime: withAppApprovals(result.runtime, currentBrowser?.runtime),
           archive: result.archive,
           modelSelection: result.modelSelection,
           thinkingSelection: result.thinkingSelection,
@@ -618,8 +623,10 @@ export async function performSessionRun({
       log(formatBrowserReattachGuidance(sessionMeta.id));
     };
     if (connectionLost && mode === "browser" && browserCanReattach) {
-      const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
-        ?.runtime;
+      const runtime = withAppApprovals(
+        (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime,
+        currentBrowser?.runtime,
+      );
       const recoverableRuntime = runtime ?? currentBrowser?.runtime;
       currentBrowser = {
         ...currentBrowser,
@@ -735,8 +742,10 @@ export async function performSessionRun({
       return;
     }
     if (assistantTimeout && mode === "browser" && browserCanReattach) {
-      const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
-        ?.runtime;
+      const runtime = withAppApprovals(
+        (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime,
+        currentBrowser?.runtime,
+      );
       log(dim("Assistant response timed out; marking capture incomplete for reattach."));
       const timeoutResponse = {
         status: "incomplete",
@@ -853,7 +862,10 @@ export async function performSessionRun({
     }
     const browserRuntime =
       mode === "browser" && browserCanReattach
-        ? (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime
+        ? withAppApprovals(
+            (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime,
+            currentBrowser?.runtime,
+          )
         : undefined;
     if (!cloudflareChallenge && browserCanReattach) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
@@ -1403,6 +1415,16 @@ async function autoReattachUntilComplete({
   }) as BrowserLogger;
   logger.verbose = true;
 
+  let knownRuntime = runtime;
+  const persistApproval = async (record: BrowserAppApprovalRecord) => {
+    knownRuntime = withAppApprovals({ ...knownRuntime, appApprovals: [record] }, knownRuntime);
+    await sessionStore
+      .updateSession(sessionMeta.id, {
+        browser: { ...browserMetadata, config: browserConfig, runtime: knownRuntime },
+      })
+      .catch(() => undefined);
+  };
+
   let attempt = 0;
   for (;;) {
     checkCancellation();
@@ -1427,6 +1449,7 @@ async function autoReattachUntilComplete({
         resumeBrowserSession(runtime, reattachConfig, logger, {
           promptPreview: sessionMeta.promptPreview,
           signal,
+          onAppApproval: persistApproval,
         }),
         signal,
       );
@@ -1497,7 +1520,10 @@ async function autoReattachUntilComplete({
         browser: {
           ...browserMetadata,
           config: browserConfig,
-          runtime,
+          runtime: withAppApprovals(
+            { ...runtime, appApprovals: result.appApprovals },
+            knownRuntime,
+          ),
         },
         artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
         response: { status: "completed" },
@@ -1526,7 +1552,7 @@ async function autoReattachUntilComplete({
           browser: {
             ...browserMetadata,
             config: browserConfig,
-            runtime,
+            runtime: knownRuntime,
           },
           response: { status: "error", incompleteReason: "incomplete-capture" },
           error: {

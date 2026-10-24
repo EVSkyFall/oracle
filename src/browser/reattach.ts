@@ -12,7 +12,7 @@ import {
   ensurePromptReady,
   waitForResumedConversationHydration,
 } from "./pageActions.js";
-import type { BrowserLogger, ChromeClient } from "./types.js";
+import type { BrowserAppApprovalRecord, BrowserLogger, ChromeClient } from "./types.js";
 import {
   launchChrome,
   connectToChrome,
@@ -48,6 +48,7 @@ import {
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { withAppApprovalMonitor } from "./actions/appApprovals.js";
+import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
@@ -70,12 +71,16 @@ export interface ReattachDeps {
   promptPreview?: string;
   signal?: AbortSignal;
   createTemporaryProfile?: () => Promise<string>;
+  /** Called as soon as an allowed app's tool prompt is approved while reattached. */
+  onAppApproval?: (record: BrowserAppApprovalRecord) => void | Promise<void>;
 }
 
 export interface ReattachResult {
   answerText: string;
   answerMarkdown: string;
   captureTarget?: BrowserRecoveryCapture;
+  /** Tool prompts approved while the answer was awaited. */
+  appApprovals?: BrowserAppApprovalRecord[];
 }
 
 export async function resumeBrowserSession(
@@ -85,10 +90,20 @@ export async function resumeBrowserSession(
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
   const cancellation = new BrowserCancellation(deps.signal, logger);
+  const approvals: BrowserAppApprovalRecord[] = [];
+  const collectingDeps: ReattachDeps = {
+    ...deps,
+    onAppApproval: async (record) => {
+      approvals.push(record);
+      await deps.onAppApproval?.(record);
+    },
+  };
   try {
-    return await cancellation.run(() =>
-      resumeBrowserSessionInternal(runtime, config, logger, deps, cancellation),
+    const result = await cancellation.run(() =>
+      resumeBrowserSessionInternal(runtime, config, logger, collectingDeps, cancellation),
     );
+    const appApprovals = mergeAppApprovalRecords(result.appApprovals, approvals);
+    return appApprovals.length > 0 ? { ...result, appApprovals } : result;
   } finally {
     cancellation.dispose();
   }
@@ -257,6 +272,7 @@ async function resumeBrowserSessionInternal(
     const approvalMonitor = {
       allowApps: normalizeBrowserAllowApps(config?.allowApps),
       logger,
+      onApproval: deps.onAppApproval,
     };
     if (config?.researchMode === "deep") {
       const waitForDeepResearch =
@@ -539,7 +555,11 @@ async function resumeBrowserSessionViaNewChrome(
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
-    const approvalMonitor = { allowApps: resolved.allowApps, logger };
+    const approvalMonitor = {
+      allowApps: resolved.allowApps,
+      logger,
+      onApproval: deps.onAppApproval,
+    };
     if (resolved.researchMode === "deep") {
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;

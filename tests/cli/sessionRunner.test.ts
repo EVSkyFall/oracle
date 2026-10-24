@@ -1894,6 +1894,48 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("Auto-reattach attempt 1");
   });
 
+  test("keeps approvals recorded during the run when a failure reports its own runtime", async () => {
+    const approval = {
+      app: "CODEXish",
+      button: "Always allow",
+      toolText: "CODEXish wants to run echo",
+      approvedAt: "2026-10-25T00:00:00.000Z",
+    };
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.({
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        tabUrl: "https://chatgpt.com/c/demo",
+        promptSubmitted: true,
+        appApprovals: [approval],
+      });
+      throw new BrowserAutomationError("Chrome window closed before oracle finished.", {
+        stage: "connection-lost",
+        recoverableDisconnect: false,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      });
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime?.appApprovals).toEqual([approval]);
+  });
+
   test("skips auto-reattach when disconnect is classified non-recoverable", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome window closed before oracle finished. Please keep it open until completion.",

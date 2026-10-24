@@ -13,6 +13,7 @@ import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { withAppApprovals } from "../browser/appApprovalRecords.js";
 import { retireRecoveredBrowserTarget } from "../browser/recoveryTarget.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
@@ -328,6 +329,27 @@ export async function attachSession(
         `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
       ),
     );
+    // Reattach lines also go to the session log, so approvals made here are on record.
+    const logPath = await sessionStore
+      .getPaths(sessionId)
+      .then((paths) => paths.log)
+      .catch(() => null);
+    let logWrites: Promise<void> = Promise.resolve();
+    const appendSessionLog = (line: string) => {
+      if (!logPath) return;
+      logWrites = logWrites
+        .then(() =>
+          fs.appendFile(
+            logPath,
+            `[reattach] ${line}
+`,
+            "utf8",
+          ),
+        )
+        .catch(() => undefined);
+    };
+    let knownRuntime = runtime;
+    const browserMetadata = metadata.browser;
     try {
       const result = await resumeBrowserSession(
         runtime as NonNullable<typeof runtime>,
@@ -336,12 +358,25 @@ export async function attachSession(
           ((message?: string) => {
             if (message) {
               console.log(dim(message));
+              appendSessionLog(message);
             }
           }) as unknown as BrowserLogger,
           { verbose: true },
         ),
-        { promptPreview: metadata.promptPreview },
+        {
+          promptPreview: metadata.promptPreview,
+          onAppApproval: async (record) => {
+            knownRuntime = withAppApprovals(
+              { ...knownRuntime, appApprovals: [record] },
+              knownRuntime,
+            );
+            await sessionStore
+              .updateSession(sessionId, { browser: { ...browserMetadata, runtime: knownRuntime } })
+              .catch(() => undefined);
+          },
+        },
       );
+      await logWrites;
       const outputTokens = estimateTokenCount(result.answerMarkdown);
       const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, result);
       await writeReattachAnswer(
@@ -374,7 +409,10 @@ export async function attachSession(
         errorMessage: undefined,
         browser: {
           config: metadata.browser?.config,
-          runtime,
+          runtime: withAppApprovals(
+            { ...runtime, appApprovals: result.appApprovals },
+            knownRuntime,
+          ),
           modelSelection: metadata.browser?.modelSelection,
           thinkingSelection: metadata.browser?.thinkingSelection,
           warnings: metadata.browser?.warnings,

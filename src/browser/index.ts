@@ -909,6 +909,9 @@ async function runBrowserModeInternal(
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
   const appApprovals: BrowserAppApprovalRecord[] = [];
+  // Error and timeout paths overwrite the session runtime, so they must carry the approvals too.
+  const approvalRuntime = () =>
+    appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {};
   const appApprovalMonitors = new Set<() => Promise<void>>();
   const buildRuntimeDiagnostics = () => ({
     chromePid: chrome.pid,
@@ -922,6 +925,7 @@ async function runBrowserModeInternal(
     submittedPromptHash,
     ownedRecoveryTarget,
     controllerPid: process.pid,
+    ...approvalRuntime(),
   });
   const emitRuntimeHint = async (): Promise<void> => {
     if (!chrome?.port) {
@@ -1253,6 +1257,7 @@ async function runBrowserModeInternal(
                 submittedPromptHash,
                 ownedRecoveryTarget,
                 controllerPid: process.pid,
+                ...approvalRuntime(),
                 researchPlan,
               },
             }),
@@ -2421,6 +2426,7 @@ async function runBrowserModeInternal(
         submittedPromptHash,
         ownedRecoveryTarget,
         controllerPid: process.pid,
+        ...approvalRuntime(),
       };
       const reuseProfileHint =
         `oracle --engine browser --browser-manual-login ` +
@@ -2505,6 +2511,7 @@ async function runBrowserModeInternal(
           submittedPromptHash,
           ownedRecoveryTarget,
           controllerPid: process.pid,
+          ...approvalRuntime(),
           researchPlan,
         },
       },
@@ -2944,6 +2951,9 @@ async function runRemoteBrowserMode(
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
   const appApprovals: BrowserAppApprovalRecord[] = [];
+  // Error and timeout paths overwrite the session runtime, so they must carry the approvals too.
+  const approvalRuntime = () =>
+    appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {};
   const appApprovalMonitors = new Set<() => Promise<void>>();
   const runtimeHintCb = options.runtimeHintCb;
   const emitRuntimeHint = async () => {
@@ -3008,6 +3018,7 @@ async function runRemoteBrowserMode(
     submittedPromptHash,
     ownedRecoveryTarget,
     controllerPid: process.pid,
+    ...approvalRuntime(),
   });
 
   try {
@@ -3966,6 +3977,7 @@ async function runRemoteBrowserMode(
         submittedPromptHash,
         ownedRecoveryTarget,
         controllerPid: process.pid,
+        ...approvalRuntime(),
         researchPlan,
       },
     });
