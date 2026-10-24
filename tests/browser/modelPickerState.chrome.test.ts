@@ -13,7 +13,12 @@ import {
 // Run with ORACLE_CHROME_FIXTURES=1 on a machine with Chrome installed.
 const enabled = process.env.ORACLE_CHROME_FIXTURES === "1";
 
-function fixture(keys: "horizontal" | "vertical", rtl: boolean, layered: boolean): string {
+function fixture(
+  keys: "horizontal" | "vertical",
+  rtl: boolean,
+  layered: boolean,
+  sliderDelayMs = 0,
+): string {
   // Layered mirrors chatgpt.com (2026-10-25): the model radios sit under the effort panel and
   // its "Select model" header brings them to the front.
   const layer = layered ? "position: absolute; inset: 0; background: #fff;" : "";
@@ -52,7 +57,9 @@ function fixture(keys: "horizontal" | "vertical", rtl: boolean, layered: boolean
   };
   window.setPicker = (model, value) => { state.model = model; state.value = value; render(); };
   window.pickerState = () => ({ open: state.open, model: state.model, value: state.value });
-  $('picker').addEventListener('pointerdown', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.open = !state.open; state.view = 'effort'; render(); });
+  // The slider mounts a beat after the menu opens, as on chatgpt.com.
+  const mountSlider = () => { $('slider').style.display = 'none'; setTimeout(() => { $('slider').style.display = ''; }, ${sliderDelayMs}); };
+  $('picker').addEventListener('pointerdown', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.open = !state.open; state.view = 'effort'; render(); if (state.open) mountSlider(); });
   $('tier').addEventListener('click', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.view = 'models'; render(); });
   for (const radio of document.querySelectorAll('[role="menuitemradio"]')) radio.addEventListener('click', (event) => {
     if (!event.isTrusted) { window.untrusted++; return; }
@@ -76,12 +83,13 @@ function fixture(keys: "horizontal" | "vertical", rtl: boolean, layered: boolean
 
 describe.runIf(enabled)("model picker snapshot and restore in real Chrome", () => {
   test.each([
-    ["horizontal", false, true],
-    ["horizontal", true, true],
-    ["vertical", false, false],
+    ["horizontal", false, true, 0],
+    ["horizontal", true, true, 0],
+    ["vertical", false, false, 0],
+    ["horizontal", false, true, 800],
   ] as const)(
-    "reads the picker and restores model and effort (%s keys, rtl=%s, layered=%s)",
-    async (keys, rtl, layered) => {
+    "reads the picker and restores model and effort (%s keys, rtl=%s, layered=%s, slider mounts after %s ms)",
+    async (keys, rtl, layered, sliderDelayMs) => {
       const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-picker-fixture-"));
       const chrome = await chromeLauncher.launch({
         chromeFlags: ["--headless=new", "--window-size=900,700", "--no-first-run"],
@@ -93,7 +101,7 @@ describe.runIf(enabled)("model picker snapshot and restore in real Chrome", () =
         const { Page, Runtime, Input } = client;
         await Promise.all([Page.enable(), Runtime.enable()]);
         await Page.navigate({
-          url: `data:text/html;base64,${Buffer.from(fixture(keys, rtl, layered)).toString("base64")}`,
+          url: `data:text/html;base64,${Buffer.from(fixture(keys, rtl, layered, sliderDelayMs)).toString("base64")}`,
         });
         await Page.loadEventFired();
         const logger = Object.assign(vi.fn(), { verbose: false });
@@ -128,4 +136,43 @@ describe.runIf(enabled)("model picker snapshot and restore in real Chrome", () =
     },
     60_000,
   );
+
+  test("a restore target without its effort is never reported as restored", async () => {
+    const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-picker-fixture-"));
+    const chrome = await chromeLauncher.launch({
+      chromeFlags: ["--headless=new", "--window-size=900,700", "--no-first-run"],
+      userDataDir,
+    });
+    let client: Awaited<ReturnType<typeof CDP>> | undefined;
+    try {
+      client = await CDP({ port: chrome.port });
+      const { Page, Runtime, Input } = client;
+      await Promise.all([Page.enable(), Runtime.enable()]);
+      await Page.navigate({
+        url: `data:text/html;base64,${Buffer.from(fixture("horizontal", false, true)).toString("base64")}`,
+      });
+      await Page.loadEventFired();
+      await Runtime.evaluate({ expression: "window.setPicker('GPT-6', 4)" });
+      const restore = await restoreModelPickerState(
+        Runtime,
+        Input,
+        {
+          pickerLabel: null,
+          modelLabel: "GPT-6",
+          modelOptions: [],
+          tierLabel: null,
+          sliderValue: null,
+          sliderMin: null,
+          sliderMax: null,
+          announcement: null,
+        },
+        Object.assign(vi.fn(), { verbose: false }),
+      );
+      expect(restore.restored).toBe(false);
+    } finally {
+      await client?.close().catch(() => undefined);
+      chrome.kill();
+      await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }, 60_000);
 });

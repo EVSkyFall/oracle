@@ -1528,12 +1528,12 @@ async function runBrowserModeInternal(
     const updateConversationHint = conversationUrlMonitor.update;
     await captureRuntimeSnapshot();
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    const applyRequestedSelection = async () => {
+    const applyRequestedSelection = async (runtime: ChromeClient["Runtime"] = Runtime) => {
       if (config.desiredModel && modelStrategy !== "ignore" && !isResumingConversation) {
         modelSelectionEvidence = await raceWithDisconnect(
           withRetries(
             () =>
-              ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
+              ensureModelSelection(runtime, config.desiredModel as string, logger, modelStrategy, {
                 implicitDefault: config.modelIsImplicitDefault,
               }),
             {
@@ -1553,7 +1553,7 @@ async function runBrowserModeInternal(
           // misdiagnosing an unavailable model as missing cookies.
           throw normalizeAuthenticatedModelSelectionError(error);
         });
-        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        await raceWithDisconnect(ensurePromptReady(runtime, config.inputTimeoutMs, logger));
         logger(
           `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
         );
@@ -1572,7 +1572,7 @@ async function runBrowserModeInternal(
         const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
         thinkingSelectionEvidence = await raceWithDisconnect(
           withRetries(
-            () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
+            () => ensureThinkingTime(runtime, config.thinkingTime, logger, thinkingTargetModel),
             {
               retries: 2,
               delayMs: 300,
@@ -1600,7 +1600,7 @@ async function runBrowserModeInternal(
         requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
           ? config.thinkingTime
           : null,
-        applySelection: applyRequestedSelection,
+        applySelection: (runtime) => applyRequestedSelection(runtime),
         readEvidence: () => ({
           model: modelSelectionEvidence,
           thinking: thinkingSelectionEvidence,
@@ -3193,11 +3193,11 @@ async function runRemoteBrowserMode(
     }
 
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    const applyRequestedSelection = async () => {
+    const applyRequestedSelection = async (runtime: ChromeClient["Runtime"] = Runtime) => {
       if (config.desiredModel && modelStrategy !== "ignore" && !config.resumeConversationUrl) {
         modelSelectionEvidence = await withRetries(
           () =>
-            ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy, {
+            ensureModelSelection(runtime, config.desiredModel as string, logger, modelStrategy, {
               implicitDefault: config.modelIsImplicitDefault,
             }),
           {
@@ -3212,7 +3212,7 @@ async function runRemoteBrowserMode(
             },
           },
         );
-        await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+        await ensurePromptReady(runtime, config.inputTimeoutMs, logger);
         logger(
           `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
         );
@@ -3230,7 +3230,7 @@ async function runRemoteBrowserMode(
       if (shouldApplyThinkingTimeSelection(config)) {
         const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
         thinkingSelectionEvidence = await withRetries(
-          () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
+          () => ensureThinkingTime(runtime, config.thinkingTime, logger, thinkingTargetModel),
           {
             retries: 2,
             delayMs: 300,
@@ -3257,7 +3257,7 @@ async function runRemoteBrowserMode(
         requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
           ? config.thinkingTime
           : null,
-        applySelection: applyRequestedSelection,
+        applySelection: (runtime) => applyRequestedSelection(runtime),
         readEvidence: () => ({
           model: modelSelectionEvidence,
           thinking: thinkingSelectionEvidence,

@@ -213,18 +213,45 @@ export async function closeModelPicker(
   return !(await isPickerMenuOpen(runtime));
 }
 
-/** Opens the picker, reads what it shows and closes it again. Null when it cannot be opened. */
+// The tier header and the effort slider render a beat after the menu itself.
+const SLIDER_MOUNT_WAIT_MS = 3_000;
+
+/** Whether a picker reading has both the model and the effort it shows. */
+export function isCompletePickerState(
+  state: BrowserModelPickerState | null | undefined,
+): state is BrowserModelPickerState {
+  return Boolean(
+    state?.modelLabel &&
+    (state.sliderValue !== null || thinkingLevelFromTierLabel(state.tierLabel) !== null),
+  );
+}
+
+async function readOpenStateWhenMounted(
+  runtime: ChromeClient["Runtime"],
+): Promise<BrowserModelPickerState | null> {
+  let state: BrowserModelPickerState | null = null;
+  await waitFor(async () => {
+    state = await readOpenState(runtime);
+    return Boolean(state?.modelLabel && state.sliderValue !== null);
+  }, SLIDER_MOUNT_WAIT_MS);
+  return state;
+}
+
+/**
+ * Opens the picker, reads what it shows (waiting for the slider to mount) and closes it again.
+ * Null when it cannot be opened; a picker without a mounted slider is returned as read.
+ */
 export async function readModelPickerState(
   runtime: ChromeClient["Runtime"],
   input: ChromeClient["Input"] | undefined,
 ): Promise<BrowserModelPickerState | null> {
-  if (!(await openModelPicker(runtime, input))) return null;
-  // The tier header and slider render a beat after the menu itself.
-  let state: BrowserModelPickerState | null = null;
-  await waitFor(async () => {
-    state = await readOpenState(runtime);
-    return Boolean(state && (state.modelLabel || state.sliderValue !== null));
-  }, 1_500);
+  let opened = await openModelPicker(runtime, input);
+  if (!opened) {
+    await delay(500);
+    opened = await openModelPicker(runtime, input);
+  }
+  if (!opened) return null;
+  const state = await readOpenStateWhenMounted(runtime);
   await closeModelPicker(runtime, input);
   return state;
 }
@@ -303,7 +330,7 @@ async function moveSlider(
     { up: ["ArrowRight", 39], down: ["ArrowLeft", 37] },
     { up: ["ArrowUp", 38], down: ["ArrowDown", 40] },
   ] as const;
-  let current = (await readOpenState(runtime))?.sliderValue ?? null;
+  let current = (await readOpenStateWhenMounted(runtime))?.sliderValue ?? null;
   // Presses one key and returns the value it settled on (unchanged when the key did nothing).
   const press = async ([key, code]: readonly [string, number]) => {
     const before = current;
@@ -359,10 +386,13 @@ export async function restoreModelPickerState(
   logger: BrowserLogger,
 ): Promise<ModelPickerRestoreResult> {
   const problems: string[] = [];
+  if (!isCompletePickerState(target)) {
+    return { restored: false, state: null, detail: "the selection to restore is incomplete" };
+  }
   if (!(await openModelPicker(runtime, input))) {
     return { restored: false, state: null, detail: "the model picker did not open" };
   }
-  let state = await readOpenState(runtime);
+  let state = await readOpenStateWhenMounted(runtime);
   if (target.modelLabel && state?.modelLabel !== target.modelLabel) {
     const label = target.modelLabel;
     if (await chooseModelRadio(runtime, input, label)) {
@@ -379,9 +409,10 @@ export async function restoreModelPickerState(
     } else {
       problems.push(`model option "${label}" not clickable`);
     }
-    state = await readOpenState(runtime);
+    // A model switch remounts the effort slider; wait for it before moving it.
+    state = await readOpenStateWhenMounted(runtime);
   }
-  if (target.sliderValue !== null && state && state.sliderValue !== target.sliderValue) {
+  if (target.sliderValue !== null && state?.sliderValue !== target.sliderValue) {
     const reached = await moveSlider(runtime, input, target.sliderValue);
     if (reached !== target.sliderValue) {
       problems.push(`effort slider stopped at ${reached ?? "unknown"}`);
@@ -389,9 +420,15 @@ export async function restoreModelPickerState(
   }
   await closeModelPicker(runtime, input);
   const finalState = await readModelPickerState(runtime, input);
-  const modelOk = !target.modelLabel || finalState?.modelLabel === target.modelLabel;
-  const sliderOk = target.sliderValue === null || finalState?.sliderValue === target.sliderValue;
-  const restored = Boolean(finalState) && modelOk && sliderOk;
+  // Every field must read back equal; a field that cannot be read is not a restore.
+  const modelOk = finalState?.modelLabel === target.modelLabel;
+  const tierOk =
+    target.sliderValue !== null
+      ? finalState?.sliderValue === target.sliderValue
+      : finalState?.sliderValue === null &&
+        thinkingLevelFromTierLabel(finalState.tierLabel) ===
+          thinkingLevelFromTierLabel(target.tierLabel);
+  const restored = Boolean(finalState) && modelOk && tierOk;
   if (!restored && problems.length === 0) {
     problems.push(finalState ? "the picker shows a different selection" : "picker unreadable");
   }

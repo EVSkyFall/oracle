@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { BrowserModelPickerState } from "../../src/browser/types.js";
 import { BrowserRunCancelledError } from "../../src/oracle/errors.js";
+import { BrowserCancellation } from "../../src/browser/cancellation.js";
 
 const picker = vi.hoisted(() => ({
   readModelPickerState: vi.fn(),
@@ -143,7 +144,7 @@ describe("select-only check", () => {
     expect(unverified.reason).toContain('thinking time "pro" was not verified');
   });
 
-  test("skips the restore when nothing changed and reports an unreadable starting point", async () => {
+  test("skips the restore when nothing changed", async () => {
     picker.readModelPickerState.mockResolvedValueOnce(MEDIUM).mockResolvedValueOnce(MEDIUM);
     const unchanged = await runSelectOnlyCheck(
       options({
@@ -156,22 +157,83 @@ describe("select-only check", () => {
     );
     expect(picker.restoreModelPickerState).not.toHaveBeenCalled();
     expect(unchanged).toMatchObject({ verified: true, restoreVerified: true });
-
-    picker.readModelPickerState.mockResolvedValueOnce(null).mockResolvedValueOnce(PRO);
-    const unreadable = await runSelectOnlyCheck(options());
-    expect(picker.restoreModelPickerState).not.toHaveBeenCalled();
-    expect(unreadable.restoreVerified).toBe(false);
-    expect(unreadable.restoreDetail).toContain("could not be read");
   });
 
-  test("still restores when the picker cannot be read after the selection", async () => {
+  test.each([
+    ["an unreadable picker", null],
+    ["a picker without its model", { ...MEDIUM, modelLabel: null }],
+    [
+      "a picker whose effort slider never mounted",
+      { ...MEDIUM, sliderValue: null, tierLabel: null },
+    ],
+  ])("changes nothing when the starting point is incomplete (%s)", async (_case, before) => {
+    picker.readModelPickerState.mockResolvedValueOnce(before);
+    const applySelection = vi.fn(async () => undefined);
+    const result = await runSelectOnlyCheck(options({ applySelection }));
+    expect(applySelection).not.toHaveBeenCalled();
+    expect(picker.restoreModelPickerState).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ verified: false, restoreVerified: true });
+    expect(result.reason).toContain("nothing was changed");
+  });
+
+  test("a picker that cannot be read, or shows no known tier, after selecting is not verified", async () => {
     picker.readModelPickerState
       .mockResolvedValueOnce(MEDIUM)
       .mockRejectedValueOnce(new Error("Execution context was destroyed"));
     picker.restoreModelPickerState.mockResolvedValue({ restored: true, state: MEDIUM });
-    const report = await runSelectOnlyCheck(options());
+    const unreadable = await runSelectOnlyCheck(options());
     expect(picker.restoreModelPickerState).toHaveBeenCalledTimes(1);
-    expect(report).toMatchObject({ selected: null, restoreVerified: true });
+    expect(unreadable).toMatchObject({ verified: false, selected: null, restoreVerified: true });
+
+    picker.readModelPickerState
+      .mockResolvedValueOnce(MEDIUM)
+      .mockResolvedValueOnce(state("Turbo", 4));
+    const unknownTier = await runSelectOnlyCheck(options());
+    expect(unknownTier.verified).toBe(false);
+    expect(unknownTier.reason).toContain('tier "Turbo" instead of "pro"');
+  });
+
+  test("after a cancel, page-side selection work finishes before the restore", async () => {
+    const events: string[] = [];
+    const controller = new AbortController();
+    const cancellation = new BrowserCancellation(controller.signal);
+    // The run's Runtime is the cancellation proxy: it stops waiting on abort, the page does not.
+    const pageRuntime = {
+      evaluate: vi.fn(
+        () =>
+          new Promise((resolve) =>
+            setTimeout(() => {
+              events.push("page selection finished");
+              resolve({ result: { value: { status: "switched" } } });
+            }, 300),
+          ),
+      ),
+    };
+    const runtime = cancellation.client({ Runtime: pageRuntime } as never).Runtime;
+    picker.readModelPickerState.mockImplementation(async () => {
+      events.push("read");
+      return events.includes("page selection finished") ? PRO : MEDIUM;
+    });
+    picker.restoreModelPickerState.mockImplementation(async () => {
+      events.push("restore");
+      return { restored: true, state: MEDIUM };
+    });
+    await expect(
+      cancellation.run(() =>
+        runSelectOnlyCheck(
+          options({
+            runtime,
+            applySelection: async (selectionRuntime = runtime) => {
+              setTimeout(() => controller.abort(), 50);
+              await selectionRuntime.evaluate({ expression: "select Pro" });
+            },
+          }),
+        ),
+      ),
+    ).rejects.toBeInstanceOf(BrowserRunCancelledError);
+    expect(events).toEqual(["read", "page selection finished", "read", "restore"]);
+    picker.readModelPickerState.mockReset();
+    picker.restoreModelPickerState.mockReset();
   });
 
   test("a cancelled check restores before it reports the cancellation", async () => {
