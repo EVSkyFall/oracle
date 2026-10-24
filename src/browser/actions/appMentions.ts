@@ -5,12 +5,14 @@ import { BrowserAutomationError } from "../../oracle/errors.js";
 import { captureComposerNavigationUrl } from "./attachmentContext.js";
 import {
   COMPOSER_MENTION_SELECTOR,
+  COMPOSER_PANEL_ROW_SELECTOR,
   COMPOSER_TOKEN_SELECTOR,
   closeComposerPlusPanel,
   composerRowTitleEquals,
   guardedTrustedClick,
   readComposerPanelRows,
   readComposerPromptText,
+  readComposerRowLabels,
   readMentionNames,
 } from "./composerTools.js";
 
@@ -166,6 +168,15 @@ async function pickMentionFromAtPicker(
   let available: string[] = [];
   let outcome: PickerOutcome | null = null;
   const token = `app-mention-${Date.now()}`;
+  // Enter is never pressed here: once the picker has closed, Enter in the composer sends the
+  // typed "@query" as a prompt. Only a click on a row of the open picker may insert a mention.
+  const rowLocate = (index: number) => `() => {
+    const stored = window.__oracleComposerRows?.token === ${JSON.stringify(token)} ? window.__oracleComposerRows.nodes[${index}] ?? null : null;
+    if (!stored || !stored.isConnected || !stored.matches(${JSON.stringify(COMPOSER_PANEL_ROW_SELECTOR)})) return null;
+    const labels = (${readComposerRowLabels.toString()})(stored);
+    const wanted = ${JSON.stringify(app.name.trim().toLowerCase())};
+    return [labels.title, labels.leaf, labels.aria].some(value => value.toLowerCase() === wanted) ? stored : null;
+  }`;
   for (let poll = 0; poll < 30 && !outcome; poll += 1) {
     const rows = await readComposerPanelRows(runtime, token);
     available = rows.map((row) => row.title || row.text).filter(Boolean);
@@ -174,24 +185,31 @@ async function pickMentionFromAtPicker(
       await delay(150);
       continue;
     }
-    const clicked = await guardedTrustedClick(runtime, input, {
-      locate: `() => window.__oracleComposerRows?.token === ${JSON.stringify(token)} ? window.__oracleComposerRows.nodes[${row.index}] ?? null : null`,
-      navigationUrl,
-      stage: APP_MENTION_STAGE,
-      target: `The ${app.name} row of the @ picker`,
-      settleTimeoutMs: 1_500,
-    });
-    if (clicked.status === "clicked" && (await waitForMention(runtime, app.name))) {
-      outcome = { ok: true };
-    } else if (row.current) {
-      // The highlighted row is what Enter inserts.
-      await pressKey(input, "Enter", { code: "Enter", keyCode: 13, text: "\r" });
-      outcome = (await waitForMention(runtime, app.name))
-        ? { ok: true }
-        : { ok: false, reason: "the @ picker row did not become a mention", available };
-    } else {
-      outcome = { ok: false, reason: "the @ picker row did not become a mention", available };
+    let clicked: Awaited<ReturnType<typeof guardedTrustedClick>>;
+    try {
+      clicked = await guardedTrustedClick(runtime, input, {
+        locate: rowLocate(row.index),
+        navigationUrl,
+        stage: APP_MENTION_STAGE,
+        target: `The ${app.name} row of the @ picker`,
+        settleTimeoutMs: 1_500,
+      });
+    } catch (error) {
+      outcome = {
+        ok: false,
+        reason: `the @ picker row could not be clicked safely (${error instanceof Error ? error.message : String(error)})`,
+        available,
+      };
+      break;
     }
+    if (clicked.status !== "clicked") {
+      // Nothing was clicked (the row moved, re-rendered or was covered): look for it again.
+      await delay(150);
+      continue;
+    }
+    outcome = (await waitForMention(runtime, app.name))
+      ? { ok: true }
+      : { ok: false, reason: "the @ picker row did not become a mention", available };
   }
   if (outcome?.ok) return outcome;
   await removeTypedQuery(runtime, input, before.text, typed);
@@ -221,9 +239,10 @@ async function removeTypedQuery(
 }
 
 /**
- * Inserts one mention per requested app before the prompt is staged. A pasted chip (when the
- * caller supplied one) is tried first, then the "@" picker; an app that cannot be verified
- * stops the run before anything is sent.
+ * Inserts one mention per requested app before the prompt is staged: the "@" picker first (it
+ * finds the app by its current name), then a pasted chip when the caller supplied one (a chip
+ * pins an app id that can go stale while its name still matches). An app that cannot be
+ * verified stops the run before anything is sent.
  */
 export async function insertAppMentions(
   runtime: ChromeClient["Runtime"],
@@ -237,22 +256,24 @@ export async function insertAppMentions(
       continue;
     }
     const failures: string[] = [];
-    let available: string[] = [];
-    if (app.chipHtml) {
-      if (await pasteMentionChip(runtime, app)) {
-        logger(`[browser] App mention ${app.name}: attached (pasted chip).`);
-        continue;
-      }
-      failures.push("the pasted chip did not become a mention");
-    }
     const picked = await pickMentionFromAtPicker(runtime, input, app);
     if (picked.ok) {
       logger(`[browser] App mention ${app.name}: attached (@ picker).`);
       continue;
     }
     failures.push(picked.reason);
-    available = picked.available;
-    if (!app.chipHtml) failures.push("no --browser-app-chip fallback was given");
+    const available = picked.available;
+    if (app.chipHtml) {
+      if (await pasteMentionChip(runtime, app)) {
+        logger(
+          `[browser] App mention ${app.name}: attached (pasted chip; the @ picker failed: ${picked.reason}).`,
+        );
+        continue;
+      }
+      failures.push("the pasted chip did not become a mention");
+    } else {
+      failures.push("no --browser-app-chip fallback was given");
+    }
     throw new BrowserAutomationError(
       `Could not attach the ChatGPT app "${app.name}" to the prompt (${failures.join("; ")})${available.length ? `; @ picker offered: ${available.join(", ")}` : ""}. Nothing was sent.`,
       { stage: APP_MENTION_STAGE, code: "app-mention-unverified", app: app.name, available },

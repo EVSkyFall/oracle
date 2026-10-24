@@ -885,7 +885,7 @@ program
   .addOption(
     new Option(
       "--browser-app-chip <file>",
-      "Mention an app by pasting chip HTML copied from ChatGPT (file contents); repeatable. Used before the @ picker for that app, which stays the fallback.",
+      "Chip HTML copied from ChatGPT (file contents) for an app mention; repeatable. Pasted only when the @ picker cannot attach that app.",
     )
       .argParser(collectTextValues)
       .default([]),

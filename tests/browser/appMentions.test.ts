@@ -138,30 +138,53 @@ describe("editor mention detection", () => {
 describe("inserting app mentions", () => {
   const logger = Object.assign(vi.fn(), { verbose: false });
 
-  test("pastes a supplied chip and verifies it without typing", async () => {
+  test("tries the @ picker first and pastes a supplied chip only after it failed", async () => {
+    const events: string[] = [];
+    let editorText = "";
     let pasted = false;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "location.href") return { result: { value: "https://chatgpt.com/" } };
         if (expression.includes("new ClipboardEvent('paste'")) {
+          events.push("paste");
           pasted = true;
           return { result: { value: true } };
         }
-        if (expression.includes("plugin-mention-display-name")) {
+        if (expression.includes("const mentions = Array.from(editor.querySelectorAll(")) {
           return { result: { value: pasted ? ["CODEXish"] : [] } };
         }
-        return { result: { value: { focused: true, text: "" } } };
+        if (expression.includes("window.__oracleComposerRows = {"))
+          return { result: { value: [] } };
+        if (expression.includes("return { plus: Boolean(plus), expanded")) {
+          return { result: { value: { plus: true, expanded: false, rows: 0 } } };
+        }
+        return { result: { value: { focused: true, text: editorText } } };
       }),
     };
-    const input = { dispatchKeyEvent: vi.fn(), insertText: vi.fn(), dispatchMouseEvent: vi.fn() };
+    const input = {
+      insertText: vi.fn(),
+      dispatchMouseEvent: vi.fn(),
+      dispatchKeyEvent: vi.fn(async (event: { type: string; text?: string; key: string }) => {
+        if (event.type !== "keyDown") return;
+        events.push(`key:${event.key}`);
+        if (event.key === "Backspace") editorText = editorText.slice(0, -1);
+        else if (event.text) editorText += event.text;
+      }),
+    };
     await insertAppMentions(
       runtime as never,
       input as never,
       [{ name: "CODEXish", chipHtml: PLUGIN_CHIP }],
       logger,
     );
-    expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
-    expect(logger).toHaveBeenCalledWith("[browser] App mention CODEXish: attached (pasted chip).");
-  });
+    expect(events[0]).toBe("key:@");
+    expect(events.at(-1)).toBe("paste");
+    expect(events).not.toContain("key:Enter");
+    expect(editorText).toBe("");
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringContaining("[browser] App mention CODEXish: attached (pasted chip;"),
+    );
+  }, 20_000);
 
   test("stops before submit and removes the typed query when the picker has no such app", async () => {
     let editorText = "";
@@ -213,7 +236,10 @@ describe("inserting app mentions", () => {
     });
     expect(editorText).toBe("");
     expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
-  });
+    expect(input.dispatchKeyEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ key: "Enter" }),
+    );
+  }, 20_000);
 
   test("fails before submit when staging dropped a mention", async () => {
     const runtime = { evaluate: vi.fn(async () => ({ result: { value: ["Slack"] } })) };
