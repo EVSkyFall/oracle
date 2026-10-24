@@ -106,7 +106,9 @@ const run = async (
       }),
     ).rejects.toThrow("stop-at-first-click");
   } finally {
-    if (profile) await rm(profile, { recursive: true, force: true });
+    // Windows: the background lease release can still be deleting files in the profile.
+    if (profile)
+      await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   const tabOptions = connectWithNewTabMock.mock.calls[0]?.[4];
   return {
