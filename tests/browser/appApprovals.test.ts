@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   APP_APPROVAL_ALLOW_LABELS,
+  buildAppApprovalLocate,
   scanAppApprovalCards,
   startAppApprovalMonitor,
 } from "../../src/browser/actions/appApprovals.js";
@@ -67,10 +68,12 @@ describe("app approval cards", () => {
     ]);
     expect(once?.button).toMatchObject({ label: "Allow once", rank: 1 });
     const [always] = scan([
-      new DomNode("div", {}, [
-        new DomNode("span", {}, ["Use CODEXish?"]),
-        button("Allow"),
-        button(" Always  allow "),
+      new DomNode("main", {}, [
+        new DomNode("div", {}, [
+          new DomNode("span", {}, ["Use CODEXish?"]),
+          button("Allow"),
+          button(" Always  allow "),
+        ]),
       ]),
     ]);
     expect(always?.button).toMatchObject({ label: "Always allow", rank: 0 });
@@ -107,17 +110,116 @@ describe("app approval cards", () => {
     ).toEqual([]);
     expect(scan([new DomNode("article", {}, [button("Allow")])])).toEqual([]);
     const [lookAlike] = scan([
-      new DomNode("div", {}, [
-        new DomNode("p", {}, ["Allow CODEXishPro to run?"]),
-        button("Allow"),
+      new DomNode("main", {}, [
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow CODEXishPro to run?"]),
+          button("Allow"),
+        ]),
       ]),
     ]);
     expect(lookAlike?.app).toBeNull();
     const [allowed] = scan(
-      [new DomNode("div", {}, [new DomNode("p", {}, ["Allow codexish to run?"]), button("Allow")])],
+      [
+        new DomNode("main", {}, [
+          new DomNode("div", {}, [
+            new DomNode("p", {}, ["Allow codexish to run?"]),
+            button("Allow"),
+          ]),
+        ]),
+      ],
       ["CODEXish"],
     );
     expect(allowed?.app).toBe("CODEXish");
+  });
+});
+
+describe("app approval scope", () => {
+  const allowCard = (text: string) =>
+    new DomNode("div", {}, [new DomNode("p", {}, [text]), button("Allow")]);
+
+  test.each([
+    ["the sidebar", (card: DomNode) => new DomNode("nav", {}, [card])],
+    ["an aside", (card: DomNode) => new DomNode("aside", {}, [card])],
+    [
+      "the page header",
+      (card: DomNode) => new DomNode("main", {}, [new DomNode("header", {}, [card])]),
+    ],
+    [
+      "the composer",
+      (card: DomNode) =>
+        new DomNode("main", {}, [new DomNode("form", { "data-chatgpt-composer": "" }, [card])]),
+    ],
+    [
+      "assistant prose",
+      (card: DomNode) =>
+        new DomNode("article", { "data-turn": "assistant" }, [
+          new DomNode("div", { class: "markdown prose" }, [card]),
+        ]),
+    ],
+    [
+      "a user message",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { "data-message-author-role": "user" }, [card]),
+        ]),
+    ],
+  ])("never treats an Allow button in %s as an approval card", (_where, wrap) => {
+    expect(scan([wrap(allowCard("Allow CODEXish to run echo?"))])).toEqual([]);
+  });
+
+  test("tool arguments that name the allowed app do not approve another app's card", () => {
+    const cards = scan([
+      new DomNode("article", { "data-turn": "assistant" }, [
+        new DomNode("div", { class: "card" }, [
+          new DomNode("p", {}, ["Allow Gmail to send an email?"]),
+          new DomNode("pre", {}, ["to: me@example.com\nbody: CODEXish says hi"]),
+          new DomNode("div", {}, [button("Always allow"), button("Deny")]),
+        ]),
+      ]),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ app: null, title: "Allow Gmail to send an email?" });
+  });
+
+  test("the title comes from a heading or the dialog's label before the first line", () => {
+    const [byHeading] = scan([
+      new DomNode("div", { role: "dialog" }, [
+        new DomNode("p", {}, ["Gmail would like to read your inbox"]),
+        new DomNode("h2", {}, ["Allow CODEXish?"]),
+        button("Allow once"),
+      ]),
+    ]);
+    expect(byHeading).toMatchObject({ app: "CODEXish", title: "Allow CODEXish?" });
+    const [byLabel] = scan([
+      new DomNode("span", { id: "title-1" }, ["Allow Slack to post?"]),
+      new DomNode("div", { role: "alertdialog", "aria-labelledby": "title-1" }, [
+        new DomNode("p", {}, ["CODEXish context: shell echo"]),
+        button("Allow"),
+      ]),
+    ]);
+    expect(byLabel).toMatchObject({ app: null, title: "Allow Slack to post?" });
+  });
+
+  test("the click target is re-checked at delivery", () => {
+    const allow = button("Always allow");
+    const title = new DomNode("p", {}, ["Allow CODEXish to run echo?"]);
+    const document = new FakeDocument([
+      new DomNode("div", { role: "dialog" }, [title, new DomNode("div", {}, [allow])]),
+    ]);
+    const window = { __oracleApprovalButtons: { token: "t", nodes: [allow] } };
+    const card = { app: "CODEXish", button: { label: "Always allow", rank: 0, index: 0 } };
+    const locate = () =>
+      new Function(
+        "document",
+        "window",
+        `return (${buildAppApprovalLocate(["CODEXish"], "t", card)})()`,
+      )(document, window);
+    expect(locate()).toBe(allow);
+    title.nodes.splice(0, 1, "Allow Gmail to run echo?");
+    expect(locate()).toBeNull();
+    title.nodes.splice(0, 1, "Allow CODEXish to run echo?");
+    allow.nodes.splice(0, 1, "Deny");
+    expect(locate()).toBeNull();
   });
 });
 
@@ -177,6 +279,48 @@ describe("app approval monitor", () => {
       String(line).includes("left for the user"),
     );
     expect(leftForUser).toHaveLength(1);
+  });
+
+  test("records nothing when the click never reached the button", async () => {
+    const card = {
+      key: "codexish",
+      app: "CODEXish",
+      title: "Allow CODEXish?",
+      toolText: "CODEXish wants to run echo",
+      button: { label: "Always allow", rank: 0, index: 0 },
+    };
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          return { result: { value: [card] } };
+        }
+        if (expression.includes("__oracleTrustedClickGuards ??=")) {
+          return { result: { value: { ready: true, contextMatches: true } } };
+        }
+        if (expression.includes("const summary = { reached")) {
+          return { result: { value: { reached: false, blocked: null } } };
+        }
+        return { result: { value: { status: "ready", x: 50, y: 60 } } };
+      }),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const onApproval = vi.fn();
+    const stop = startAppApprovalMonitor(
+      runtime as never,
+      { dispatchMouseEvent: vi.fn() } as never,
+      { allowApps: ["CODEXish"], logger, intervalMs: 250, onApproval },
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          runtime.evaluate.mock.calls.filter(([call]) => call.expression.includes("const summary")),
+        ).not.toHaveLength(0),
+      { timeout: 5_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await stop();
+    expect(onApproval).not.toHaveBeenCalled();
+    expect(logger.mock.calls.some(([line]) => String(line).includes("approved ("))).toBe(false);
   });
 
   test("does nothing when no app is allowed", async () => {

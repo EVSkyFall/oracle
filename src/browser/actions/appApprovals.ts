@@ -19,8 +19,10 @@ export const APP_APPROVAL_ALLOW_LABELS: ReadonlyArray<{ label: string; rank: num
 export interface AppApprovalCard {
   /** Stable text key for "log once" bookkeeping. */
   key: string;
-  /** The allowed app the card names, or null when it names none of them. */
+  /** The allowed app the card's title names, or null when it names none of them. */
   app: string | null;
+  /** The card's title: its heading, its labelling text, or else its first line. */
+  title: string;
   /** Card text without its buttons: what ChatGPT asks to run. */
   toolText: string;
   /** Best allow-type button (lowest rank) and its index in the remembered button list. */
@@ -28,10 +30,12 @@ export interface AppApprovalCard {
 }
 
 /**
- * Finds visible approval cards: the nearest ancestor of an allow-type button that has text of
- * its own (the card), never climbing past a dialog or a conversation turn. Assistant prose and
- * user messages inside that region do not count, so a prompt that names an app cannot make
- * another app's card look approved. Injected into the page with Function.prototype.toString.
+ * Finds visible approval cards. A candidate is an allow-type button inside a dialog or the
+ * conversation thread, and never inside page chrome (nav, aside, header), the composer, a user
+ * message or assistant prose. Its card is the nearest ancestor with text of its own, and the
+ * allowed app must be named in the card's title (heading, aria-labelledby/aria-label text, or
+ * else its first line), so tool arguments shown in another app's card that mention an allowed
+ * app cannot approve that card. Injected into the page with Function.prototype.toString.
  */
 export function scanAppApprovalCards(
   doc: Document,
@@ -48,6 +52,15 @@ export function scanAppApprovalCards(
     return rect.width > 0 && rect.height > 0;
   };
   const BUTTON = 'button, [role="button"]';
+  const DIALOG = '[role="dialog"], [role="alertdialog"]';
+  const TURN =
+    '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article';
+  const USER = '[data-message-author-role="user"], [data-turn="user"]';
+  const PROSE = '.markdown, [class*="markdown"], [class*="prose"]';
+  // Places that never hold a permission card of the current turn.
+  const OFF_LIMITS = `${PROSE}, ${USER}, form, [contenteditable="true"], [role="textbox"], [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
+  const PAGE_CHROME = 'nav, aside, header, [data-testid*="sidebar" i]';
+  const ARGUMENTS = "code, pre, samp, kbd";
   // textContent avoids a layout pass per button on every poll.
   const label = (button: Element): string =>
     normalize(button.textContent) || normalize(button.getAttribute("aria-label"));
@@ -55,7 +68,7 @@ export function scanAppApprovalCards(
     const text = label(button).toLowerCase();
     return labels.find((entry) => entry.label === text)?.rank ?? -1;
   };
-  const textOf = (root: Element, keep: Element): string => {
+  const textOf = (root: Element, skip: string): string => {
     const parts: string[] = [];
     const walk = (node: Node): void => {
       if (node.nodeType === 3) {
@@ -64,32 +77,69 @@ export function scanAppApprovalCards(
       }
       if (node.nodeType !== 1) return;
       const element = node as Element;
-      if (element.matches(BUTTON)) return;
-      if (element.getAttribute("aria-hidden") === "true") return;
-      if (
-        element !== root &&
-        !element.contains(keep) &&
-        element.matches(
-          '.markdown, [class*="markdown"], [class*="prose"], [data-message-author-role="user"], [data-turn="user"]',
-        )
-      ) {
-        return;
-      }
+      if (element.matches(skip) || element.getAttribute("aria-hidden") === "true") return;
       for (const child of Array.from(element.childNodes)) walk(child);
     };
     walk(root);
     return normalize(parts.join(" "));
   };
-  const DIALOG = '[role="dialog"], [role="alertdialog"]';
-  const TURN =
-    '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article, main, body';
-  const cardOf = (button: Element): { card: Element; text: string } | null => {
+  const regionOf = (button: Element): Element | null => {
+    const region = button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main");
+    if (!region || region.matches(USER) || region.closest(PAGE_CHROME)) return null;
+    const dialog = region.matches(DIALOG);
+    for (let node = button.parentElement; node && node !== region; node = node.parentElement) {
+      if (node.matches(OFF_LIMITS)) return null;
+      if (!dialog && node.matches(PAGE_CHROME)) return null;
+    }
+    return region;
+  };
+  const cardOf = (button: Element, region: Element): Element | null => {
     for (let node = button.parentElement; node; node = node.parentElement) {
-      if (node.matches(TURN) && !node.matches(DIALOG)) return null;
-      const text = textOf(node, button);
-      if (text || node.matches(DIALOG)) return { card: node, text };
+      if (textOf(node, `${BUTTON}, ${PROSE}, ${USER}`)) return node;
+      if (node === region) return null;
     }
     return null;
+  };
+  const textById = (ids: string | null): string =>
+    normalize(
+      String(ids ?? "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => {
+          const target = Array.from(doc.querySelectorAll("[id]")).find(
+            (node) => node.getAttribute("id") === id,
+          );
+          return target ? textOf(target, BUTTON) : "";
+        })
+        .join(" "),
+    );
+  const firstLine = (card: Element): string => {
+    const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
+    const holders = [card, ...Array.from(card.querySelectorAll("*"))];
+    for (const element of holders) {
+      if (element.matches(skip) || element.closest(ARGUMENTS)) continue;
+      if (element.closest(BUTTON) && element !== card) continue;
+      const own = Array.from(element.childNodes)
+        .filter((child) => child.nodeType === 3)
+        .map((child) => normalize(child.nodeValue))
+        .join(" ")
+        .trim();
+      if (own) return textOf(element, skip);
+    }
+    return "";
+  };
+  const titleOf = (card: Element, region: Element): string => {
+    const heading = Array.from(
+      card.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6'),
+    ).find((node) => !node.closest(PROSE));
+    if (heading && textOf(heading, BUTTON)) return textOf(heading, BUTTON);
+    for (const owner of region.matches(DIALOG) ? [card, region] : [card]) {
+      const labelled = textById(owner.getAttribute("aria-labelledby"));
+      if (labelled) return labelled;
+      const named = normalize(owner.getAttribute("aria-label"));
+      if (named) return named;
+    }
+    return firstLine(card);
   };
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const names = (text: string): string | null =>
@@ -97,26 +147,30 @@ export function scanAppApprovalCards(
       new RegExp(`(^|[^A-Za-z0-9_])${escape(app.trim())}($|[^A-Za-z0-9_])`, "i").test(text),
     ) ?? null;
 
-  const byCard = new Map<Element, { text: string; best: Element; rank: number }>();
+  const byCard = new Map<Element, { region: Element; best: Element; rank: number }>();
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
     if (!visible(button)) continue;
     if (button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true")
       continue;
     const rank = rankOf(button);
     if (rank < 0) continue;
-    const found = cardOf(button);
-    if (!found) continue;
-    const current = byCard.get(found.card);
-    if (!current || rank < current.rank)
-      byCard.set(found.card, { text: found.text, best: button, rank });
+    const region = regionOf(button);
+    if (!region) continue;
+    const card = cardOf(button, region);
+    if (!card) continue;
+    const current = byCard.get(card);
+    if (!current || rank < current.rank) byCard.set(card, { region, best: button, rank });
   }
   const cards: AppApprovalCard[] = [];
   const buttons: Element[] = [];
-  for (const { text, best, rank } of byCard.values()) {
+  for (const [card, { region, best, rank }] of byCard.entries()) {
+    const title = titleOf(card, region);
+    const text = textOf(card, `${BUTTON}, ${PROSE}, ${USER}`);
     buttons.push(best);
     cards.push({
-      key: text.slice(0, 300),
-      app: names(text),
+      key: `${title}\n${text}`.slice(0, 400),
+      app: names(title),
+      title: title.slice(0, 200),
       toolText: text.slice(0, 500),
       button: { label: label(best), rank, index: buttons.length - 1 },
     });
@@ -134,6 +188,25 @@ export function buildAppApprovalScanExpression(
     window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons };
     return cards;
   })()`;
+}
+
+/**
+ * Page function source for the click target: the remembered button, but only while a fresh
+ * scan still finds it as the allow-type button of a card whose title names the same app.
+ */
+export function buildAppApprovalLocate(
+  allowApps: readonly string[],
+  token: string,
+  card: Pick<AppApprovalCard, "app" | "button">,
+): string {
+  return `() => {
+    const stored = window.__oracleApprovalButtons?.token === ${JSON.stringify(token)} ? window.__oracleApprovalButtons.nodes[${card.button.index}] ?? null : null;
+    if (!stored || !stored.isConnected) return null;
+    const scan = ${scanAppApprovalCards.toString()};
+    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_ALLOW_LABELS)});
+    const now = cards[buttons.indexOf(stored)];
+    return now && now.app === ${JSON.stringify(card.app)} && now.button.label === ${JSON.stringify(card.button.label)} ? stored : null;
+  }`;
 }
 
 export interface AppApprovalMonitorOptions {
@@ -185,7 +258,7 @@ export function startAppApprovalMonitor(
         if (!leftForUser.has(card.key)) {
           leftForUser.add(card.key);
           options.logger(
-            `[browser] App approval for "${card.toolText.slice(0, 160)}" left for the user (it names no app in --browser-allow-app).`,
+            `[browser] App approval for "${(card.title || card.toolText).slice(0, 160)}" left for the user (its title names no app in --browser-allow-app).`,
           );
         }
         continue;
@@ -199,7 +272,7 @@ export function startAppApprovalMonitor(
       }
       lastClick.set(card.key, Date.now());
       const clicked = await guardedTrustedClick(runtime, input, {
-        locate: `() => window.__oracleApprovalButtons?.token === ${JSON.stringify(token)} ? window.__oracleApprovalButtons.nodes[${card.button.index}] ?? null : null`,
+        locate: buildAppApprovalLocate(allowApps, token, card),
         stage: "app-approval",
         target: `The "${card.button.label}" button for ${card.app}`,
         settleTimeoutMs: 1_500,
