@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -27,8 +28,38 @@ const REGISTRY_LOCK_TIMEOUT_MS = 10_000;
 const REGISTRY_LOCK_OWNER_FILENAME = "owner.json";
 const REGISTRY_RECOVERY_POLL_MS = 50;
 const LEGACY_OWNERLESS_LOCK_STALE_MS = 5 * 60 * 1000;
+// A live owner publishes owner.json within milliseconds of mkdir, so a lock directory that
+// stays completely empty is left over from a crash or a failed unlock.
+const EMPTY_OWNERLESS_LOCK_STALE_MS = 5_000;
 const PROCESS_START_TIME_TOLERANCE_MS = 10_000;
 const REGISTRY_RENAME_RETRY_ATTEMPTS = 6;
+// Windows keeps a deleted owner.json "delete pending" while a waiter still has it open, so the
+// directory removal fails with ENOTEMPTY until that handle closes.
+export const REGISTRY_LOCK_REMOVE_ATTEMPTS = 12;
+const REGISTRY_LOCK_REMOVE_MAX_DELAY_MS = 500;
+// The owner identity probe spawns a process on Windows; a live owner normally holds the lock
+// for milliseconds, so waiters only pay for the probe once a wait gets long.
+const LOCK_OWNER_PROBE_AFTER_MS = 2_000;
+const LOCK_OWNER_PROBE_TTL_MS = 2_000;
+const BACKGROUND_RETRY_MAX_DELAY_MS = 30_000;
+
+class RegistryLockTimeoutError extends Error {
+  readonly code = "ORACLE_TAB_LEASE_LOCK_TIMEOUT";
+}
+
+const TRANSIENT_FS_CODES = new Set(["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"]);
+
+function isTransientLockError(error: unknown): boolean {
+  if (error instanceof RegistryLockTimeoutError) return true;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && TRANSIENT_FS_CODES.has(code);
+}
+
+// Unref'd so background cleanup never keeps a finished CLI process alive.
+const backgroundDelay = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms).unref?.();
+  });
 
 export interface BrowserTabLeaseRecord {
   id: string;
@@ -127,42 +158,56 @@ export async function acquireBrowserTabLease(
   const startedAt = now();
   let warned = false;
   let lastHeartbeatAt = 0;
+  let lockWaitLoggedAt = 0;
+  const liveness = {
+    isProcessAlive: deps.isProcessAlive ?? isProcessAlive,
+    readProcessStartTimeMs: deps.readProcessStartTimeMs ?? readProcessStartTimeMs,
+  };
 
   for (;;) {
     options.signal?.throwIfAborted();
-    const acquired = await withRegistryLock(
-      profileDir,
-      async () => {
-        options.signal?.throwIfAborted();
-        const registry = await readRegistry(profileDir);
-        const active = await pruneStaleLeases(registry.leases, {
-          nowMs: now(),
-          staleMs,
-          isProcessAlive: deps.isProcessAlive ?? isProcessAlive,
-          readProcessStartTimeMs: deps.readProcessStartTimeMs ?? readProcessStartTimeMs,
-        });
-        if (active.length >= maxConcurrentTabs) {
-          if (active.length !== registry.leases.length) {
-            await writeRegistry(profileDir, { version: 1, leases: active });
+    // Identity probes are slow on Windows; run them before taking the lock so it stays short.
+    const probes = await probeStaleLeases(profileDir, { nowMs: now(), staleMs, ...liveness });
+    let acquired: BrowserTabLeaseRecord | null;
+    try {
+      acquired = await withRegistryLock(
+        profileDir,
+        async () => {
+          options.signal?.throwIfAborted();
+          const registry = await readRegistry(profileDir);
+          const active = pruneStaleLeases(registry.leases, { nowMs: now(), staleMs, probes });
+          if (active.length >= maxConcurrentTabs) {
+            if (active.length !== registry.leases.length) {
+              await writeRegistry(profileDir, { version: 1, leases: active });
+            }
+            return null;
           }
-          return null;
-        }
-        const timestamp = new Date(now()).toISOString();
-        const lease: BrowserTabLeaseRecord = {
-          id: leaseId,
-          pid,
-          ...(processStartedAtMs === null ? {} : { processStartedAtMs }),
-          sessionId: options.sessionId,
-          chromeHost: options.chromeHost,
-          chromePort: options.chromePort,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        };
-        await writeRegistry(profileDir, { version: 1, leases: [...active, lease] });
-        return lease;
-      },
-      options.signal,
-    );
+          const timestamp = new Date(now()).toISOString();
+          const lease: BrowserTabLeaseRecord = {
+            id: leaseId,
+            pid,
+            ...(processStartedAtMs === null ? {} : { processStartedAtMs }),
+            sessionId: options.sessionId,
+            chromeHost: options.chromeHost,
+            chromePort: options.chromePort,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          };
+          await writeRegistry(profileDir, { version: 1, leases: [...active, lease] });
+          return lease;
+        },
+        options.signal,
+      );
+    } catch (error) {
+      if (!(error instanceof RegistryLockTimeoutError)) throw error;
+      // Another controller is holding the registry lock for a while (for example while it
+      // closes Chrome); keep waiting for a slot within this run's own time budget.
+      if (now() - lockWaitLoggedAt >= 30_000) {
+        options.logger?.(`[browser] ChatGPT browser slot registry is busy; still waiting.`);
+        lockWaitLoggedAt = now();
+      }
+      acquired = null;
+    }
 
     if (acquired) {
       options.logger?.(
@@ -205,7 +250,15 @@ export async function acquireBrowserTabLease(
           released = true;
           clearInterval(heartbeat);
           await heartbeatPromise?.catch(() => undefined);
-          await releaseBrowserTabLease(profileDir, leaseId, options.logger, releaseOptions);
+          try {
+            await releaseBrowserTabLease(profileDir, leaseId, options.logger, releaseOptions);
+          } catch (error) {
+            // A long-lived controller (MCP) would otherwise hold this slot until it exits.
+            if (isTransientLockError(error)) {
+              scheduleBackgroundLeaseRelease(profileDir, leaseId, options.logger);
+            }
+            throw error;
+          }
         },
         update: async (patch) => {
           if (released) return;
@@ -286,6 +339,33 @@ export async function releaseBrowserTabLease(
   logger?.(`[browser] Released ChatGPT browser slot ${leaseId.slice(0, 8)}.`);
 }
 
+/**
+ * Retries removing a lease record whose release hit a transient lock failure. It never runs
+ * the release callback, so it cannot make a shared-Chrome termination decision late.
+ */
+function scheduleBackgroundLeaseRelease(
+  profileDir: string,
+  leaseId: string,
+  logger?: BrowserLogger,
+): void {
+  void (async () => {
+    let wait = 1_000;
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      await backgroundDelay(wait);
+      try {
+        await releaseBrowserTabLease(profileDir, leaseId);
+        logger?.(
+          `[browser] Released ChatGPT browser slot ${leaseId.slice(0, 8)} after a retried registry unlock.`,
+        );
+        return;
+      } catch (error) {
+        if (!isTransientLockError(error)) return;
+      }
+      wait = Math.min(BACKGROUND_RETRY_MAX_DELAY_MS, wait * 2);
+    }
+  })();
+}
+
 function formatRemainingLeaseSessions(leases: readonly BrowserTabLeaseRecord[]): string {
   if (leases.length === 0) return "none";
   return leases
@@ -308,14 +388,15 @@ export async function hasOtherActiveBrowserTabLeases(
 ): Promise<boolean> {
   const now = options.now ?? Date.now;
   const staleMs = Math.max(60_000, options.staleMs ?? DEFAULT_STALE_MS);
+  const probes = await probeStaleLeases(profileDir, {
+    nowMs: now(),
+    staleMs,
+    isProcessAlive: options.isProcessAlive ?? isProcessAlive,
+    readProcessStartTimeMs: options.readProcessStartTimeMs ?? readProcessStartTimeMs,
+  });
   return withRegistryLock(profileDir, async () => {
     const registry = await readRegistry(profileDir);
-    const active = await pruneStaleLeases(registry.leases, {
-      nowMs: now(),
-      staleMs,
-      isProcessAlive: options.isProcessAlive ?? isProcessAlive,
-      readProcessStartTimeMs: options.readProcessStartTimeMs ?? readProcessStartTimeMs,
-    });
+    const active = pruneStaleLeases(registry.leases, { nowMs: now(), staleMs, probes });
     if (active.length !== registry.leases.length) {
       await writeRegistry(profileDir, { version: 1, leases: active });
     }
@@ -356,6 +437,8 @@ async function withRegistryLock<T>(
   const lockId = randomUUID();
   const processStartedAtMs = await readProcessStartTimeMs(process.pid);
   const startedAt = Date.now();
+  const ownerProbes = new Map<string, { alive: boolean; at: number }>();
+  let acquiredIdentity: RegistryLockIdentity | null = null;
   for (;;) {
     signal?.throwIfAborted();
     try {
@@ -368,26 +451,29 @@ async function withRegistryLock<T>(
         throw error;
       }
       const owner = await readRegistryLockOwner(lockDir);
-      if (owner && !(await isRegistryLockOwnerAlive(owner))) {
+      if (owner && !(await isWaitedLockOwnerAlive(owner, startedAt, ownerProbes))) {
         await recoverDeadRegistryLock(profileDir, lockDir, owner);
         continue;
       }
       if (!owner && (await isRegistryOwnerFileMissing(lockDir))) {
         const identity = await readRegistryLockIdentity(lockDir);
-        if (identity && Date.now() - identity.mtimeMs >= LEGACY_OWNERLESS_LOCK_STALE_MS) {
-          await recoverOwnerlessRegistryLock(profileDir, lockDir, identity);
+        const staleMs = (await isRegistryLockDirectoryEmpty(lockDir))
+          ? EMPTY_OWNERLESS_LOCK_STALE_MS
+          : LEGACY_OWNERLESS_LOCK_STALE_MS;
+        if (identity && Date.now() - identity.mtimeMs >= staleMs) {
+          await recoverOwnerlessRegistryLock(profileDir, lockDir, identity, staleMs);
           continue;
         }
       }
       if (Date.now() - startedAt > REGISTRY_LOCK_TIMEOUT_MS) {
-        throw new Error(
+        throw new RegistryLockTimeoutError(
           `Timed out waiting for Oracle tab lease registry lock ${lockDir}; preserving the existing lock to avoid split-brain cleanup.`,
         );
       }
       await delay(50, signal);
       continue;
     }
-    const acquiredIdentity = await readRegistryLockIdentity(lockDir);
+    acquiredIdentity = await readRegistryLockIdentity(lockDir);
     const temporaryOwner = path.join(lockDir, `${lockId}.tmp`);
     try {
       // Publish only complete ownership evidence. A crash before rename leaves
@@ -402,6 +488,16 @@ async function withRegistryLock<T>(
         })}\n`,
         { encoding: "utf8", flag: "wx" },
       );
+      // If this controller stalled after mkdir long enough for the empty directory to be
+      // reclaimed and re-created, the directory now belongs to someone else.
+      if (
+        !acquiredIdentity ||
+        !sameRegistryLockDirectory(await readRegistryLockIdentity(lockDir), acquiredIdentity) ||
+        !(await isRegistryOwnerFileMissing(lockDir))
+      ) {
+        await rm(temporaryOwner, { force: true }).catch(() => undefined);
+        continue;
+      }
       await renameRegistryFileWithRetry(
         temporaryOwner,
         path.join(lockDir, REGISTRY_LOCK_OWNER_FILENAME),
@@ -423,7 +519,83 @@ async function withRegistryLock<T>(
   try {
     return await callback();
   } finally {
-    await removeRegistryLockIfOwned(lockDir, lockId, { requireOwned: true });
+    await unlockRegistry(lockDir, lockId, acquiredIdentity);
+  }
+}
+
+/**
+ * Releases the registry lock. Ownership problems still throw; a directory that only failed
+ * to disappear (Windows delete-pending files) is ours and is removed in the background, so a
+ * finished operation is not reported as failed.
+ */
+async function unlockRegistry(
+  lockDir: string,
+  lockId: string,
+  ownedIdentity: RegistryLockIdentity | null,
+): Promise<void> {
+  try {
+    await removeRegistryLockIfOwned(lockDir, lockId, { requireOwned: true, ownedIdentity });
+  } catch (error) {
+    if (!isTransientLockError(error)) throw error;
+    scheduleBackgroundLockRemoval(lockDir, lockId, ownedIdentity);
+  }
+}
+
+function scheduleBackgroundLockRemoval(
+  lockDir: string,
+  lockId: string,
+  ownedIdentity: RegistryLockIdentity | null,
+): void {
+  void (async () => {
+    let wait = 250;
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      await backgroundDelay(wait);
+      try {
+        const identity = await readRegistryLockIdentity(lockDir);
+        if (!identity) return;
+        if (ownedIdentity && !sameRegistryLockDirectory(identity, ownedIdentity)) return;
+        const owner = await readRegistryLockOwner(lockDir);
+        if (owner && owner.id !== lockId) return;
+        if (!owner && !ownedIdentity) return;
+        if (owner) await rm(lockDir, { recursive: true, force: true });
+        else if (await isRegistryOwnerFileMissing(lockDir)) await rmdir(lockDir);
+        else await rm(lockDir, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        if (!isTransientLockError(error)) return;
+      }
+      wait = Math.min(BACKGROUND_RETRY_MAX_DELAY_MS, wait * 2);
+    }
+  })();
+}
+
+/**
+ * Liveness of the controller holding the lock we wait for. The cheap PID check answers while a
+ * wait is short; after that the identity probe (which catches a reused PID) runs, cached
+ * briefly so a long wait does not spawn a probe per poll.
+ */
+async function isWaitedLockOwnerAlive(
+  owner: RegistryLockOwner,
+  waitStartedAt: number,
+  cache: Map<string, { alive: boolean; at: number }>,
+): Promise<boolean> {
+  if (Date.now() - waitStartedAt < LOCK_OWNER_PROBE_AFTER_MS && isProcessAlive(owner.pid)) {
+    return true;
+  }
+  const key = `${owner.id}|${owner.pid}`;
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.at < LOCK_OWNER_PROBE_TTL_MS) return cached.alive;
+  const alive = await isRegistryLockOwnerAlive(owner);
+  cache.set(key, { alive, at: Date.now() });
+  return alive;
+}
+
+async function isRegistryLockDirectoryEmpty(lockDir: string): Promise<boolean> {
+  try {
+    return (await readdir(lockDir)).length === 0;
+  } catch {
+    return false;
   }
 }
 
@@ -538,6 +710,8 @@ async function removeRegistryLockIfOwned(
     requireOwned?: boolean;
     readFileImpl?: RegistryOwnerReadFile;
     removeImpl?: RegistryLockRemove;
+    /** Directory identity seen right after this owner's mkdir. */
+    ownedIdentity?: RegistryLockIdentity | null;
   } = {},
 ): Promise<boolean> {
   const owner = await readRegistryLockOwnerWithRetry(lockDir, options.readFileImpl);
@@ -558,7 +732,7 @@ async function removeRegistryLockIfOwned(
     }
     return false;
   }
-  await removeRegistryLockDirectoryWithRetry(lockDir, options.removeImpl);
+  await removeRegistryLockDirectoryWithRetry(lockDir, options.removeImpl, options.ownedIdentity);
   return true;
 }
 
@@ -578,16 +752,28 @@ async function readRegistryLockOwnerWithRetry(
 async function removeRegistryLockDirectoryWithRetry(
   lockDir: string,
   removeImpl: RegistryLockRemove = rm,
+  ownedIdentity?: RegistryLockIdentity | null,
 ): Promise<void> {
+  let ownerRecordGone = false;
   for (let attempt = 0; ; attempt += 1) {
     try {
-      await removeImpl(lockDir, { recursive: true, force: true });
+      // With our owner record already deleted only an empty directory is left, and a
+      // non-recursive rmdir cannot sweep away a lock another controller has just published.
+      if (ownerRecordGone) await rmdir(lockDir);
+      else await removeImpl(lockDir, { recursive: true, force: true });
       return;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      const transient = code === "EPERM" || code === "EBUSY" || code === "EACCES";
-      if (!transient || attempt + 1 >= REGISTRY_RENAME_RETRY_ATTEMPTS) throw error;
-      await delay(50 * (attempt + 1));
+      if (ownerRecordGone && code === "ENOENT") return;
+      const transient = typeof code === "string" && TRANSIENT_FS_CODES.has(code);
+      if (!transient || attempt + 1 >= REGISTRY_LOCK_REMOVE_ATTEMPTS) throw error;
+      await delay(Math.min(REGISTRY_LOCK_REMOVE_MAX_DELAY_MS, 50 * 2 ** attempt));
+      if (ownedIdentity) {
+        // Once our emptied directory is gone or replaced, nothing of ours is left to remove.
+        const current = await readRegistryLockIdentity(lockDir);
+        if (!current || !sameRegistryLockDirectory(current, ownedIdentity)) return;
+      }
+      ownerRecordGone = await isRegistryOwnerFileMissing(lockDir);
     }
   }
 }
@@ -626,6 +812,7 @@ async function recoverOwnerlessRegistryLock(
   profileDir: string,
   lockDir: string,
   observedIdentity: RegistryLockIdentity,
+  staleMs: number,
 ): Promise<void> {
   await withRegistryRecoveryLock(profileDir, async () => {
     if ((await readRegistryLockOwner(lockDir)) || !(await isRegistryOwnerFileMissing(lockDir)))
@@ -633,8 +820,13 @@ async function recoverOwnerlessRegistryLock(
     const currentIdentity = await readRegistryLockIdentity(lockDir);
     if (
       !sameRegistryLockIdentity(currentIdentity, observedIdentity) ||
-      Date.now() - observedIdentity.mtimeMs < LEGACY_OWNERLESS_LOCK_STALE_MS
+      Date.now() - observedIdentity.mtimeMs < staleMs
     ) {
+      return;
+    }
+    if (staleMs < LEGACY_OWNERLESS_LOCK_STALE_MS) {
+      // Reclaimed early only because it is empty: rmdir fails if anything appeared since.
+      await rmdir(lockDir).catch(() => undefined);
       return;
     }
     await rm(lockDir, { recursive: true, force: true });
@@ -774,29 +966,50 @@ function registryPath(profileDir: string): string {
   return path.join(profileDir, REGISTRY_FILENAME);
 }
 
-async function pruneStaleLeases(
-  leases: BrowserTabLeaseRecord[],
+const staleLeaseProbeKey = (lease: BrowserTabLeaseRecord) =>
+  `${lease.id}|${lease.pid}|${lease.processStartedAtMs ?? ""}|${lease.updatedAt}`;
+
+function isLeaseStale(lease: BrowserTabLeaseRecord, nowMs: number, staleMs: number): boolean {
+  const updatedAt = Date.parse(lease.updatedAt);
+  // One cross-process liveness probe is not trustworthy enough to delete a
+  // fresh foreign lease. Active controllers refresh updatedAt every 15s; only
+  // a missed heartbeat beyond the grace period permits identity verification.
+  // Invalid timestamps fail closed.
+  return Number.isFinite(updatedAt) && nowMs - updatedAt > staleMs;
+}
+
+/**
+ * Probes the identity of leases that missed their heartbeat, outside the registry lock.
+ * A read failure probes nothing: the locked read reports a corrupt registry itself.
+ */
+async function probeStaleLeases(
+  profileDir: string,
   options: {
     nowMs: number;
     staleMs: number;
     isProcessAlive: (pid: number) => boolean;
     readProcessStartTimeMs: (pid: number) => Promise<number | null>;
   },
-): Promise<BrowserTabLeaseRecord[]> {
-  const active: BrowserTabLeaseRecord[] = [];
-  for (const lease of leases) {
-    const updatedAt = Date.parse(lease.updatedAt);
-    // One cross-process liveness probe is not trustworthy enough to delete a
-    // fresh foreign lease. Active controllers refresh updatedAt every 15s; only
-    // a missed heartbeat beyond the grace period permits identity verification.
-    // Invalid timestamps fail closed.
-    if (!Number.isFinite(updatedAt) || options.nowMs - updatedAt <= options.staleMs) {
-      active.push(lease);
-      continue;
-    }
-    if (await isRegistryLockOwnerAlive(lease, options)) active.push(lease);
+): Promise<Map<string, boolean>> {
+  const probes = new Map<string, boolean>();
+  const registry = await readRegistry(profileDir).catch(() => null);
+  for (const lease of registry?.leases ?? []) {
+    if (!isLeaseStale(lease, options.nowMs, options.staleMs)) continue;
+    probes.set(staleLeaseProbeKey(lease), await isRegistryLockOwnerAlive(lease, options));
   }
-  return active;
+  return probes;
+}
+
+/** Drops stale leases proven dead by `probes`; a stale lease that was not probed stays. */
+function pruneStaleLeases(
+  leases: BrowserTabLeaseRecord[],
+  options: { nowMs: number; staleMs: number; probes: Map<string, boolean> },
+): BrowserTabLeaseRecord[] {
+  return leases.filter(
+    (lease) =>
+      !isLeaseStale(lease, options.nowMs, options.staleMs) ||
+      options.probes.get(staleLeaseProbeKey(lease)) !== false,
+  );
 }
 
 function isLeaseRecord(value: unknown): value is BrowserTabLeaseRecord {

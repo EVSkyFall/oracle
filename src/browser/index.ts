@@ -747,7 +747,7 @@ async function releaseLocalBrowserTabLease(options: {
     releaseError = error instanceof Error ? error : new Error(String(error));
     if (!terminationHandled) keepBrowserOpen = true;
     options.logger(
-      `[browser] Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run: ${releaseError.message}`,
+      `[browser] Failed to release the ChatGPT browser slot registry lock (a busy lock is retried in the background; restart Oracle/Codex MCP if later runs keep waiting for a slot): ${releaseError.message}`,
     );
   }
 
@@ -1140,6 +1140,7 @@ async function runBrowserModeInternal(
   let answerMessageId: string | undefined;
   let answerHtml = "";
   let runStatus: "attempted" | "complete" | "cancelled" = "attempted";
+  let completedResult: BrowserRunResult | undefined;
   let connectionClosedUnexpectedly = false;
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
@@ -1871,7 +1872,7 @@ async function runBrowserModeInternal(
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
-      return {
+      return (completedResult = {
         answerText: researchResult.text,
         answerMarkdown: researchResult.text,
         answerHtml: researchResult.html,
@@ -1896,7 +1897,7 @@ async function runBrowserModeInternal(
         controllerPid: process.pid,
         researchPlan,
         ...(appApprovals.length > 0 ? { appApprovals } : {}),
-      };
+      });
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
@@ -2316,7 +2317,7 @@ async function runBrowserModeInternal(
     const durationMs = Date.now() - startedAt;
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
-    return {
+    return (completedResult = {
       answerText,
       answerMarkdown,
       answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
@@ -2344,7 +2345,7 @@ async function runBrowserModeInternal(
       ownedRecoveryTarget,
       controllerPid: process.pid,
       ...(appApprovals.length > 0 ? { appApprovals } : {}),
-    };
+    });
   } catch (error) {
     if (options.signal?.aborted || error instanceof BrowserRunCancelledError) {
       runStatus = "cancelled";
@@ -2637,14 +2638,31 @@ async function runBrowserModeInternal(
         await handle.release().catch(() => undefined);
       }
       if (tabLeaseReleaseError) {
-        // oxlint-disable-next-line eslint/no-unsafe-finally -- This cleanup failure must override a successful browser result or a live MCP owner can remain locked.
-        throw new Error(
-          "Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run.",
-          { cause: tabLeaseReleaseError },
-        );
+        // The answer is already captured (or the run already failed for its own reason), so a
+        // slot bookkeeping problem is reported but never turns the run into a failure.
+        recordBrowserSlotReleaseWarning(completedResult, tabLeaseReleaseError, logger);
       }
     });
   }
+}
+
+function recordBrowserSlotReleaseWarning(
+  result: BrowserRunResult | undefined,
+  cause: Error,
+  logger: BrowserLogger,
+): void {
+  const message = `ChatGPT browser slot release failed after the run (${cause.message}); a busy registry lock is retried in the background and a stale slot is reclaimed by a later run.`;
+  logger(`[browser] Warning: ${message}`);
+  if (!result) return;
+  result.warnings = [
+    ...(result.warnings ?? []),
+    {
+      code: "browser-slot-release-failed",
+      severity: "warning",
+      message,
+      details: { cause: cause.message },
+    },
+  ];
 }
 
 const DEFAULT_DEBUG_PORT = 9222;
@@ -3934,6 +3952,7 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 export const __test__ = {
   assertManualLoginProfileReadyForRun,
   closeRemoteConnectionAfterRun,
+  recordBrowserSlotReleaseWarning,
   classifyChatGptUiWarningText,
   collectChatGptUiWarnings,
   createAssistantTimeoutError,

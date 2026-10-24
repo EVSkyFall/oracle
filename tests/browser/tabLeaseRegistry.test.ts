@@ -7,6 +7,7 @@ import {
   canonicalProfileIdentityForTest,
   hasOtherActiveBrowserTabLeases,
   normalizeMaxConcurrentTabs,
+  REGISTRY_LOCK_REMOVE_ATTEMPTS,
   removeRegistryLockIfOwnedForTest,
   type BrowserTabLeaseReleaseContext,
   type BrowserTabLease,
@@ -371,7 +372,7 @@ describe("tabLeaseRegistry", { timeout: process.platform === "win32" ? 30_000 : 
           },
         }),
       ).rejects.toThrow(/still locked/i);
-      expect(removeAttempts).toBe(6);
+      expect(removeAttempts).toBe(REGISTRY_LOCK_REMOVE_ATTEMPTS);
       await expect(readFile(path.join(lockDir, "owner.json"), "utf8")).resolves.toContain(
         "exhausted-owner",
       );

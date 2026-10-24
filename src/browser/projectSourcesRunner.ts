@@ -102,7 +102,7 @@ async function releaseProjectSourcesBrowserTabLease(options: {
     releaseError = error instanceof Error ? error : new Error(String(error));
     if (!terminationHandled) keepBrowserOpen = true;
     options.logger(
-      `[browser] Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run: ${releaseError.message}`,
+      `[browser] Failed to release the ChatGPT browser slot registry lock (a busy lock is retried in the background; restart Oracle/Codex MCP if later runs keep waiting for a slot): ${releaseError.message}`,
     );
   }
   if (!decisionObserved) {
@@ -446,10 +446,9 @@ export async function runBrowserProjectSources(
       await cleanupProfileLock.release().catch(() => undefined);
     }
     if (tabLeaseReleaseError) {
-      // oxlint-disable-next-line eslint/no-unsafe-finally -- This cleanup failure must override a successful Project Sources result or a live MCP owner can remain locked.
-      throw new Error(
-        "Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run.",
-        { cause: tabLeaseReleaseError },
+      // The sources work is done; a slot bookkeeping problem must not fail it.
+      logger(
+        `[browser] Warning: ChatGPT browser slot release failed after the Project Sources run (${tabLeaseReleaseError.message}); a busy registry lock is retried in the background and a stale slot is reclaimed by a later run.`,
       );
     }
   }
