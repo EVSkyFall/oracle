@@ -29,6 +29,20 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     window.log.push('menuitem:act');
     event.currentTarget.remove();
   });
+  // Like a row that re-renders on hover: the trusted move before the press replaces the node.
+  const swapOnHover = (event) => {
+    if (!event.isTrusted || !window.swapOnHover) return;
+    window.swapOnHover = false;
+    const fresh = document.createElement('button');
+    fresh.id = 'plain';
+    fresh.textContent = 'plain (re-rendered)';
+    for (const type of ['pointerdown', 'click']) {
+      fresh.addEventListener(type, (e) => { if (e.isTrusted) window.log.push('fresh:' + type); });
+    }
+    event.currentTarget.replaceWith(fresh);
+  };
+  document.getElementById('plain').addEventListener('pointermove', swapOnHover);
+  document.getElementById('plain').addEventListener('mousemove', swapOnHover);
 </script></body></html>`;
 
 describe.runIf(enabled)("guarded trusted click in real Chrome", () => {
@@ -113,5 +127,33 @@ describe.runIf(enabled)("guarded trusted click in real Chrome", () => {
       await client.Input.dispatchMouseEvent({ type, ...point, button: "left", clickCount: 1 });
     }
     expect(await log()).toEqual(["plain:click", "other:click"]);
+  }, 30_000);
+
+  test("a target that changes on the trusted move just before the press is not clicked, and the guard is gone afterwards", async () => {
+    await load();
+    await client.Input.dispatchMouseEvent({ type: "mouseMoved", x: 5, y: 380 });
+    await client.Runtime.evaluate({ expression: "window.swapOnHover = true" });
+    await expect(
+      guardedTrustedClick(client.Runtime, client.Input, {
+        locate: byId("plain"),
+        stage: "fixture",
+        target: "plain button",
+      }),
+    ).rejects.toMatchObject({ details: { code: "trusted-click-cancelled" } });
+    expect(
+      (await client.Runtime.evaluate({ expression: "window.swapOnHover", returnByValue: true }))
+        .result.value,
+    ).toBe(false);
+    expect(await log()).toEqual([]);
+    const point = (
+      await client.Runtime.evaluate({
+        expression: `(() => { const r = document.getElementById('other').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+        returnByValue: true,
+      })
+    ).result.value as { x: number; y: number };
+    for (const type of ["mousePressed", "mouseReleased"] as const) {
+      await client.Input.dispatchMouseEvent({ type, ...point, button: "left", clickCount: 1 });
+    }
+    expect(await log()).toEqual(["other:click"]);
   }, 30_000);
 });
