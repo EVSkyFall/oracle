@@ -69,7 +69,7 @@ import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
-import { readModelPickerEvidence } from "./actions/modelPickerState.js";
+import { formatModelPickerEvidence, readModelPickerEvidence } from "./actions/modelPickerState.js";
 import { runSelectOnlyCheck } from "./selectOnly.js";
 import {
   isGeneratedImageAssistantAnswer,
@@ -1624,6 +1624,13 @@ async function runBrowserModeInternal(
         ),
       );
       thinkingCapChecks.push(check);
+      if (check.status === "lowered" && check.after) {
+        // The picker evidence is what the run now sends with, not the tier before lowering.
+        modelPickerRecord = check.after;
+        logger(
+          `[browser] Model picker evidence: ${formatModelPickerEvidence(check.after)} (after lowering to the maximum).`,
+        );
+      }
       await emitRuntimeHint();
       if (check.status === "lowered") {
         await raceWithDisconnect(ensurePromptReady(runtime, config.inputTimeoutMs, logger));
@@ -3315,6 +3322,13 @@ async function runRemoteBrowserMode(
         logger,
       );
       thinkingCapChecks.push(check);
+      if (check.status === "lowered" && check.after) {
+        // The picker evidence is what the run now sends with, not the tier before lowering.
+        modelPickerRecord = check.after;
+        logger(
+          `[browser] Model picker evidence: ${formatModelPickerEvidence(check.after)} (after lowering to the maximum).`,
+        );
+      }
       await emitRuntimeHint();
       if (check.status === "lowered") {
         await ensurePromptReady(runtime, config.inputTimeoutMs, logger);

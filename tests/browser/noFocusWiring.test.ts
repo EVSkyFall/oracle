@@ -395,6 +395,39 @@ describe("runBrowserMode no-focus wiring", () => {
   );
 
   test.each(["local", "remote"])(
+    "a %s run that lowered the tier records the lowered picker reading as its evidence",
+    async (mode) => {
+      const after = { ...pickerRead, tierLabel: "Extra High", sliderValue: 3 };
+      enforceCap.mockImplementation(async (maxLevel: string) => ({
+        maxLevel,
+        status: "lowered",
+        before: { ...pickerRead, tierLabel: "Pro", sliderValue: 4 },
+        after,
+        capturedAt: "now",
+      }));
+      const hints: unknown[] = [];
+      const log = vi.fn<(message: string) => void>();
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "lowered",
+          config: runConfig(mode, { maxThinkingTime: "extra-high" }),
+          log,
+          runtimeHintCb: (_hint, _model, picker) => {
+            hints.push(picker);
+          },
+        }),
+      ).rejects.toBe(SUBMIT_REACHED);
+      expect(hints.at(-1)).toMatchObject({
+        modelPicker: { tierLabel: "Extra High", sliderValue: 3 },
+      });
+      expect(log).toHaveBeenCalledWith(
+        '[browser] Model picker evidence: model "GPT-6", tier "Extra High", slider 3 (after lowering to the maximum).',
+      );
+    },
+  );
+
+  test.each(["local", "remote"])(
     "a %s run refused by the maximum thinking time never reaches the send",
     async (mode) => {
       enforceCap.mockImplementation(async () => {
