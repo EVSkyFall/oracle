@@ -493,6 +493,33 @@ describe("app approval role cards", () => {
     expect(cards[0]).toMatchObject({ app: null, title: "Allow Gmail to send an email?" });
   });
 
+  test.each([
+    [
+      "today's user turn",
+      () =>
+        new DomNode("div", { class: "group/user-message flex" }, [
+          new DomNode("div", { class: "MarkdownRoot-rZKhxa rich-text-user-turn" }, ["Use it"]),
+        ]),
+    ],
+    [
+      "an assistant turn",
+      () => new DomNode("div", { "data-message-author-role": "assistant" }, ["Sure."]),
+    ],
+    ["an article", () => new DomNode("article", {}, ["Sure."])],
+  ])("a chat frame without an editor but with %s is never a card", (_what, turn) => {
+    const cards = scan([
+      new DomNode("section", { role: "dialog", "aria-label": "CODEXish smoke test" }, [
+        turn(),
+        new DomNode("div", { class: "card" }, [
+          new DomNode("p", {}, ["Allow Gmail to send an email?"]),
+          new DomNode("div", {}, [button("Always allow")]),
+        ]),
+      ]),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ app: null, title: "Allow Gmail to send an email?" });
+  });
+
   test("an alert holding several prompts gives each prompt its own card", () => {
     const cards = scan([
       new DomNode("main", {}, [

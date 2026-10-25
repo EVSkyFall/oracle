@@ -260,12 +260,15 @@ export function scanAppApprovalCards(
     return normalize(parts.join(" "));
   };
   /**
-   * The nearest alert or dialog around the button, unless it holds an editor: that is a chat
-   * surface (a floating chat frame), not a card.
+   * An alert or dialog that holds an editor, conversation turns or a user message is a chat
+   * surface (the floating chat frame, with or without its composer mounted), never a card.
    */
+  const chatSurface = (role: Element): boolean =>
+    Boolean(role.querySelector(`${EDITABLE}, ${TURN}, ${USER}`));
+  /** The nearest alert or dialog around the button, unless it is a chat surface. */
   const roleCardOf = (button: Element): Element | null => {
     const role = button.closest(ROLE_CARD);
-    return role && !role.querySelector(EDITABLE) ? role : null;
+    return role && !chatSurface(role) ? role : null;
   };
   /**
    * Where the button sits. A role card is its own region wherever it is (docked in the composer
@@ -519,7 +522,7 @@ export function scanAppApprovalCards(
     candidates.filter((entry) => entry.role).map((entry) => entry.region),
   );
   for (const role of Array.from(doc.querySelectorAll(ROLE_CARD))) {
-    if (takenRegions.has(role) || !visible(role) || role.querySelector(EDITABLE)) continue;
+    if (takenRegions.has(role) || !visible(role) || chatSurface(role)) continue;
     let placeable = true;
     for (let node: Element | null = role; node; node = node.parentElement) {
       if (node.matches(USER) || node.matches(EDITABLE)) placeable = false;
