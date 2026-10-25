@@ -528,7 +528,8 @@ export function scanAppApprovalCards(
     const own = Array.from(role.querySelectorAll(BUTTON)).filter(
       (button) => button.closest(ROLE_CARD) === role && visible(button) && enabled(button),
     );
-    if (own.length === 0) continue;
+    // An allowed app's prompt with no enabled button at all is reported too: its controls may be
+    // links or plain elements now, and the diagnostic shows which.
     const labels = own.map((button) => label(button));
     const title = titlesOf(role, role)[0] ?? "";
     const app = names(title);
@@ -682,6 +683,9 @@ export function describeAppApprovalSkip(skip: AppApprovalSkip): string {
   }
   if (skip.reason === "no-card") {
     return `[browser] App approval left for the user: ${quote(skip.labels)} has no card around it.`;
+  }
+  if (skip.labels.length === 0) {
+    return `[browser] App approval left for the user: "${skip.title.slice(0, 160)}" shows no enabled button Oracle can click.`;
   }
   return `[browser] App approval left for the user: no known allow label among ${quote(skip.labels)}${card}.`;
 }

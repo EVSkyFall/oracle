@@ -3,6 +3,7 @@ import {
   APP_APPROVAL_VOCABULARY,
   buildAppApprovalInPageClickExpression,
   buildAppApprovalLocate,
+  describeAppApprovalSkip,
   scanAppApprovalCards,
   startAppApprovalMonitor,
 } from "../../src/browser/actions/appApprovals.js";
@@ -540,6 +541,26 @@ describe("app approval skips", () => {
         app: "CODEXish",
       }),
     ]);
+  });
+
+  test("an allowed app's alert with no enabled button is reported, another app's is not", () => {
+    const { cards, skipped } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", { role: "alert" }, [
+          new DomNode("p", {}, ["Allow CODEXish to use Fs Read?"]),
+          new DomNode("a", { href: "#" }, ["Always allow"]),
+          new DomNode("button", { disabled: "" }, ["Allow once"]),
+        ]),
+        new DomNode("div", { role: "alert" }, [new DomNode("p", {}, ["Gmail is offline"])]),
+      ]),
+    ]);
+    expect(cards).toEqual([]);
+    expect(skipped).toEqual([
+      expect.objectContaining({ reason: "label", labels: [], app: "CODEXish" }),
+    ]);
+    expect(describeAppApprovalSkip(skipped[0]!)).toBe(
+      '[browser] App approval left for the user: "Allow CODEXish to use Fs Read?" shows no enabled button Oracle can click.',
+    );
   });
 
   test("another app's alert without allow-looking buttons is not reported", () => {
