@@ -1231,7 +1231,9 @@ describe("waitForDeepResearchCompletion", () => {
 
   // Today (2026-10) the research runs in an MCP app frame whose URL is the generic app runtime;
   // only the page's iframe title ("Deep research") names it.
-  const skybridgeClient = (pageFrameHosts: string[]) => {
+  // `ownerTitle`: the title of the iframe element that hosts the app frame (undefined = the
+  // element cannot be read).
+  const skybridgeClient = (pageFrameHosts: string[], ownerTitle?: string | null) => {
     const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
     return {
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
@@ -1239,6 +1241,17 @@ describe("waitForDeepResearchCompletion", () => {
       }),
       removeListener: vi.fn(),
       send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (ownerTitle !== undefined && sessionId === undefined) {
+          if (method === "DOM.getFrameOwner") {
+            return (params as { frameId?: string })?.frameId === "app-frame"
+              ? { backendNodeId: 9 }
+              : {};
+          }
+          if (method === "DOM.resolveNode") return { object: { objectId: "owner-9" } };
+          if (method === "Runtime.callFunctionOn") {
+            return { result: { value: { oracleFrameOwner: true, title: ownerTitle, name: "" } } };
+          }
+        }
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "app-session",
@@ -1303,6 +1316,46 @@ describe("waitForDeepResearchCompletion", () => {
       skybridgeClient(["mcp-app-79f7.web-sandbox.oaiusercontent.com"]) as never,
     );
     expect(result.text).toBe("Node.js v24 Krypton is the Active LTS line; end-of-life 2028-04-30.");
+  });
+
+  it.each([["Deep research"], ["심층 리서치"], [null]])(
+    "reads the app frame on a research host whose iframe is titled %j",
+    async (title) => {
+      mockRuntime.evaluate.mockResolvedValue({
+        result: { value: { finished: false, stopVisible: false, textLength: 0, hasIframe: true } },
+      });
+      const result = await waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        1_000,
+        undefined,
+        undefined,
+        skybridgeClient(["mcp-app-79f7.web-sandbox.oaiusercontent.com"], title) as never,
+      );
+      expect(result.text).toContain("Krypton");
+    },
+  );
+
+  it("never reads another app's titled frame on a known research host", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: { value: { finished: false, stopVisible: false, textLength: 0, hasIframe: true } },
+    });
+    const client = skybridgeClient(["mcp-app-79f7.web-sandbox.oaiusercontent.com"], "Gmail");
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        30,
+        undefined,
+        undefined,
+        client as never,
+      ),
+    ).rejects.toThrow(/did not complete/);
+    expect(client.send).toHaveBeenCalledWith(
+      "DOM.getFrameOwner",
+      { frameId: "app-frame" },
+      undefined,
+    );
   });
 
   it("does not read an MCP app frame the page does not title Deep research", async () => {
@@ -2910,11 +2963,15 @@ describe("waitForDeepResearchCompletion", () => {
             extra.progress && selector.includes("progressbar") ? {} : null,
           querySelectorAll: (selector: string) => {
             const nodes = (count: number | undefined, textContent = "") =>
-              Array.from({ length: count ?? 0 }, () => ({ textContent, closest: () => null }));
+              Array.from({ length: count ?? 0 }, (_, index) => ({
+                textContent: textContent.replace("#", String(index + 1)),
+                closest: () => null,
+              }));
             if (selector === 'a[href^="http"]') return nodes(extra.links);
             if (selector === "h1, h2, h3, h4") return nodes(extra.headings);
             if (selector === "p, li, blockquote, td") {
-              return nodes(extra.prose, "A paragraph of the report with enough words.");
+              // Each block its own text: blocks with the same text count once.
+              return nodes(extra.prose, "Paragraph # of the report, with enough words.");
             }
             return [];
           },

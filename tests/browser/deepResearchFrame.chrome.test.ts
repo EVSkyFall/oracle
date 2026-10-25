@@ -75,6 +75,24 @@ describe.runIf(enabled)("Deep Research frame status in real Chrome", () => {
     ).resolves.toMatchObject({ completed: false, structuralComplete: false });
   }, 60_000);
 
+  test("one sentence wrapped in li > p (or any block wrapper) counts once", async () => {
+    const sentence =
+      "Looking at the Node.js release schedule and the official changelog pages now.";
+    await expect(
+      status(`<h3>Searching the web</h3><ul><li><p>${sentence}</p></li></ul>`),
+    ).resolves.toMatchObject({ completed: false, structuralComplete: false });
+    await expect(
+      status(
+        `<h3>Searching the web</h3><blockquote><p>${sentence}</p></blockquote><p>${sentence}</p>`,
+      ),
+    ).resolves.toMatchObject({ completed: false, structuralComplete: false });
+    // A real report in list form still counts.
+    const unknownBanner = await status(
+      `<div>Araştırma 2 dakikada tamamlandı</div><h3>Summary</h3><ul>${REPORT.replaceAll("<p>", "<li><p>").replaceAll("</p>", "</p></li>")}</ul>`,
+    );
+    expect(unknownBanner).toMatchObject({ completed: false, structuralComplete: true });
+  }, 60_000);
+
   test("active progress overrides a completion phrase and report-shaped text", async () => {
     await expect(
       status(`<p class="loading-shimmer">Research completed for 3 of 5 steps</p>${REPORT}`),

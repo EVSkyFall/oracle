@@ -941,6 +941,7 @@ async function readDeepResearchTargetResult(
         sessionId,
         target.url,
         appFrameHosts,
+        pageSessionId,
       );
       if (!sessionResult.confirmed) {
         continue;
@@ -1130,6 +1131,64 @@ async function readDeepResearchTargetOwnerTurnIndex(
   }
 }
 
+/** The `title` and `name` of the iframe element that hosts `frameId`, or null when unreadable. */
+async function readDeepResearchFrameOwnerIdentity(
+  rawClient: {
+    send: (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+    ) => Promise<unknown>;
+  },
+  frameId: string,
+  pageSessionId?: string,
+): Promise<{ title: string | null; name: string | null } | null> {
+  const frameOwner = () =>
+    rawClient.send("DOM.getFrameOwner", { frameId }, pageSessionId).catch(() => null) as Promise<{
+      backendNodeId?: number;
+    } | null>;
+  let owner = await frameOwner();
+  if (typeof owner?.backendNodeId !== "number") {
+    // The DOM domain may not be enabled on this page session yet.
+    await rawClient.send("DOM.enable", {}, pageSessionId).catch(() => undefined);
+    owner = await frameOwner();
+  }
+  if (typeof owner?.backendNodeId !== "number") return null;
+  const resolved = (await rawClient
+    .send("DOM.resolveNode", { backendNodeId: owner.backendNodeId }, pageSessionId)
+    .catch(() => null)) as { object?: { objectId?: string } } | null;
+  const objectId = resolved?.object?.objectId;
+  if (!objectId) return null;
+  try {
+    const response = (await rawClient
+      .send(
+        "Runtime.callFunctionOn",
+        {
+          objectId,
+          functionDeclaration: `function() {
+            const read = (name) => typeof this.getAttribute === 'function' ? this.getAttribute(name) : null;
+            return { oracleFrameOwner: true, title: read('title'), name: read('name') };
+          }`,
+          returnByValue: true,
+        },
+        pageSessionId,
+      )
+      .catch(() => null)) as { result?: { value?: unknown } } | null;
+    const value = response?.result?.value as
+      | { oracleFrameOwner?: boolean; title?: unknown; name?: unknown }
+      | undefined;
+    if (value?.oracleFrameOwner !== true) return null;
+    return {
+      title: typeof value.title === "string" ? value.title : null,
+      name: typeof value.name === "string" ? value.name : null,
+    };
+  } finally {
+    await rawClient
+      .send("Runtime.releaseObject", { objectId }, pageSessionId)
+      .catch(() => undefined);
+  }
+}
+
 async function readDeepResearchTargetSession(
   rawClient: {
     send: (
@@ -1141,6 +1200,7 @@ async function readDeepResearchTargetSession(
   sessionId: string,
   targetUrl: string,
   appFrameHosts: ReadonlySet<string> = new Set(),
+  pageSessionId?: string,
 ): Promise<DeepResearchTargetSessionResult> {
   await rawClient.send("Runtime.enable", {}, sessionId).catch(() => undefined);
   await rawClient.send("Page.enable", {}, sessionId).catch(() => undefined);
@@ -1149,11 +1209,25 @@ async function readDeepResearchTargetSession(
     .send("Page.getFrameTree", {}, sessionId)
     .catch(() => null)) as { frameTree?: DeepResearchFrameTree } | null;
   const ownerFrameId = frameTree?.frameTree?.frame?.id;
-  if (
-    !isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree) &&
-    !appFrameHosts.has(hostOf(targetUrl))
-  ) {
-    return { confirmed: false, read: null };
+  if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
+    if (!appFrameHosts.has(hostOf(targetUrl))) return { confirmed: false, read: null };
+    // A known host alone is the generic app runtime: the same rule as the page's iframe check
+    // applies, with the iframe element's title and name and the target's own URL. When the
+    // element cannot be read, the host decides as before.
+    const owner = ownerFrameId
+      ? await readDeepResearchFrameOwnerIdentity(rawClient, ownerFrameId, pageSessionId)
+      : null;
+    const attributes: Record<string, string | null> = {
+      title: owner?.title ?? null,
+      name: owner?.name ?? null,
+      src: targetUrl,
+    };
+    const element = {
+      getAttribute: (attribute: string) => attributes[attribute] ?? null,
+    } as unknown as Element;
+    if (!isDeepResearchFrameElement(element, DEEP_RESEARCH_FRAME_TITLES, [...appFrameHosts])) {
+      return { confirmed: false, read: null };
+    }
   }
   const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
   let best: DeepResearchFrameStatus | null = null;
@@ -1398,7 +1472,19 @@ function buildDeepResearchFrameStatusExpression(): string {
     const inReport = (node) => !(planSection && planSection.contains?.(node)) &&
       !(typeof node.closest === 'function' && node.closest(progressUi));
     const inRegion = (selector) => Array.from(document.querySelectorAll?.(selector) ?? []).filter(inReport);
-    const proseBlocks = inRegion('p, li, blockquote, td').filter((node) => cleanText(node.textContent).length >= 20).length;
+    // Leaf blocks only, each text once: one sentence wrapped in li > p (or any other block
+    // wrapper) is one block.
+    const blockSelector = 'p, li, blockquote, td';
+    const blockNodes = inRegion(blockSelector).filter((node) => cleanText(node.textContent).length >= 20);
+    const wrappers = new Set();
+    for (const node of blockNodes) {
+      for (let parent = node.parentElement?.closest?.(blockSelector); parent; parent = parent.parentElement?.closest?.(blockSelector)) {
+        wrappers.add(parent);
+      }
+    }
+    const proseBlocks = new Set(
+      blockNodes.filter((node) => !wrappers.has(node)).map((node) => cleanText(node.textContent)),
+    ).size;
     const citations = inRegion('a[href^="http"]').length;
     const headings = inRegion('h1, h2, h3, h4').length;
     const reportShape = proseBlocks >= 3 || (proseBlocks >= 2 && (citations > 0 || headings > 0));
