@@ -78,6 +78,50 @@ test.each([
   expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
 });
 
+test("the last check before the attachment Enter can stop it, and the guard is removed", async () => {
+  const steps: string[] = [];
+  const runtime = {
+    evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("const summary = { sawKeyDown")) {
+        steps.push("cleanup");
+        return { result: { value: { sawKeyDown: false, blocked: null } } };
+      }
+      if (expression.includes("currentUrl: location.href")) {
+        steps.push("guard");
+        return {
+          result: {
+            value: {
+              currentUrl: "https://chatgpt.com/",
+              workSelected: false,
+              focused: true,
+              attachmentsReady: true,
+            },
+          },
+        };
+      }
+      return { result: { value: { status: "focused" } } };
+    }),
+  };
+  const input = { dispatchKeyEvent: vi.fn() };
+  const refusal = new Error("composer shows Pro");
+  await expect(
+    composer.activateExactAttachmentSendButton(
+      runtime as never,
+      input as never,
+      undefined,
+      "https://chatgpt.com/",
+      [],
+      async () => {
+        steps.push("check");
+        throw refusal;
+      },
+    ),
+  ).rejects.toBe(refusal);
+  expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+  expect(steps.slice(0, 2)).toEqual(["guard", "check"]);
+  expect(steps).toContain("cleanup");
+});
+
 test("refuses changed context before staging any attachment prompt text", async () => {
   const runtime = {
     evaluate: vi.fn().mockResolvedValue({

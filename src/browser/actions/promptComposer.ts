@@ -406,10 +406,12 @@ export async function submitPrompt(
     })
     .catch(() => undefined);
 
-  // Never Pro: staging after the cap check could still have changed the effort.
-  if (deps.maxThinkingTime) {
-    await assertComposerTierWithinCap(runtime, deps.maxThinkingTime, logger);
-  }
+  // Never Pro: the composer is checked once more right before each actual send (click, the
+  // attachment Enter, the fallback Enter), after every wait, menu close and page activation.
+  const maxThinkingTime = deps.maxThinkingTime;
+  const beforeSend = maxThinkingTime
+    ? () => assertComposerTierWithinCap(runtime, maxThinkingTime, logger)
+    : undefined;
 
   const clicked = await attemptSendButton(
     runtime,
@@ -419,8 +421,10 @@ export async function submitPrompt(
     deps?.attachmentTimeoutMs,
     deps?.activateBeforeTrustedInput === false ? undefined : deps?.page,
     deps?.attachmentNavigationUrl,
+    beforeSend,
   );
   if (!clicked) {
+    await beforeSend?.();
     await dispatchEnterKey(input);
     logger("Submitted prompt via Enter key");
   } else {
@@ -762,6 +766,8 @@ async function attemptSendButton(
   attachmentTimeoutMs?: number | null,
   Page?: ChromeClient["Page"],
   attachmentNavigationUrl?: string,
+  /** Runs right before each actual send action; throwing stops the send. */
+  beforeSend?: () => Promise<void>,
 ): Promise<boolean> {
   const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
   if (needAttachment && !attachmentNavigationUrl) {
@@ -773,8 +779,7 @@ async function attemptSendButton(
       },
     );
   }
-  const script = `(() => {
-    ${buildClickDispatcher()}
+  const findButton = `
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
     const isVisible = (node) => {
       if (!(node instanceof HTMLElement)) return false;
@@ -799,7 +804,9 @@ async function attemptSendButton(
     for (const selector of selectors) {
       candidates.push(...Array.from(document.querySelectorAll(selector)));
     }
-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
+    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;`;
+  const script = `(() => {
+    ${findButton}
     if (!button) return { status: 'missing' };
     const rect = button.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
@@ -815,9 +822,16 @@ async function attemptSendButton(
       if (!hit || !button.contains(hit)) return { status: 'settling' };
       return { status: 'point', x, y };
     }
-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
+    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect;
+    // the caller clicks it synthetically after its last check.
+    return { status: 'synthetic' };
+  })()`;
+  const syntheticClick = `(() => {
+    ${buildClickDispatcher()}
+    ${findButton}
+    if (!button) return { syntheticClicked: false };
     dispatchClickSequence(button);
-    return { status: 'clicked' };
+    return { syntheticClicked: true };
   })()`;
 
   // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
@@ -857,6 +871,7 @@ async function attemptSendButton(
           logger,
           attachmentNavigationUrl,
           attachmentNames,
+          beforeSend,
         )
       ) {
         return true;
@@ -873,11 +888,11 @@ async function attemptSendButton(
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "clicked" | "missing" | "point" | "settling"; x?: number; y?: number }
+      | { status?: "missing" | "point" | "settling" | "synthetic"; x?: number; y?: number }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
-    if (status === "point" || status === "settling") foundButton = true;
+    if (status === "point" || status === "settling" || status === "synthetic") foundButton = true;
     if (
       status === "point" &&
       typeof value === "object" &&
@@ -893,11 +908,17 @@ async function attemptSendButton(
         await delay(150);
         continue;
       }
+      await beforeSend?.();
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }
-    if (status === "clicked") {
-      return true;
+    if (status === "synthetic") {
+      await beforeSend?.();
+      const clicked = await Runtime.evaluate({ expression: syntheticClick, returnByValue: true });
+      if (clicked?.result?.value?.syntheticClicked === true) return true;
+      previousPoint = undefined;
+      await delay(100);
+      continue;
     }
     if (status === "missing") {
       break;
@@ -933,6 +954,7 @@ async function activateExactAttachmentSendButton(
   logger?: BrowserLogger,
   attachmentNavigationUrl?: string,
   attachmentNames: AttachmentReadyInput[] = [],
+  beforeSend?: () => Promise<void>,
 ): Promise<boolean> {
   const exactSendSelectors = [
     'button[data-testid="send-button"]',
@@ -1054,6 +1076,7 @@ async function activateExactAttachmentSendButton(
       | undefined;
     assertComposerNavigationSnapshot(attachmentNavigationUrl, snapshot);
     if (snapshot?.focused !== true || snapshot.attachmentsReady !== true) return false;
+    await beforeSend?.();
     await Input.dispatchKeyEvent({
       type: "keyDown",
       ...ENTER_KEY_EVENT,

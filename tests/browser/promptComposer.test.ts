@@ -877,8 +877,11 @@ describe("promptComposer", () => {
         if (expression.includes("chatListUnavailable")) {
           return { result: { value: true } };
         }
+        if (expression.includes("syntheticClicked: true")) {
+          return { result: { value: { syntheticClicked: true } } };
+        }
         if (expression.includes("button.scrollIntoView")) {
-          return { result: { value: { status: "clicked" } } };
+          return { result: { value: { status: "synthetic" } } };
         }
         return {
           result: {
@@ -921,10 +924,22 @@ describe("promptComposer", () => {
 
   describe("maximum thinking time at the send click", () => {
     const SEND_REACHED = new Error("send step reached");
-    const run = (buttonText: string | null, maxThinkingTime?: "extra-high") => {
+    /**
+     * `buttonText` gives the composer button's text for each read; `measure` is what the send
+     * button measurement reports. The text can change between reads, as it would while the
+     * button settles.
+     */
+    const run = (
+      buttonText: (reads: number, steps: string[]) => string | null,
+      maxThinkingTime?: "extra-high",
+      measure: { status: string; x?: number; y?: number } = { status: "point", x: 10, y: 20 },
+    ) => {
       const steps: string[] = [];
+      let reads = 0;
       const runtime = {
         evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          // Every page script must at least parse.
+          new Function(`return ${expression}`);
           if (expression.includes("document.readyState")) {
             return { result: { value: { ready: true, composer: true, fileInput: false } } };
           }
@@ -938,19 +953,29 @@ describe("promptComposer", () => {
           }
           if (expression.includes("return button ? String(button.innerText")) {
             steps.push("button");
-            return { result: { value: buttonText } };
+            return { result: { value: buttonText(reads++, steps) } };
           }
-          if (expression.includes("send-button")) {
-            steps.push("send");
+          if (expression.includes("syntheticClicked: true")) {
+            steps.push("synthetic-click");
             throw SEND_REACHED;
+          }
+          if (expression.includes("button.scrollIntoView")) {
+            steps.push("measure");
+            return { result: { value: measure } };
           }
           throw new Error(`unexpected expression: ${expression.slice(0, 80)}`);
         }),
       };
       const input = {
         insertText: vi.fn(),
-        dispatchKeyEvent: vi.fn(),
-        dispatchMouseEvent: vi.fn(),
+        dispatchKeyEvent: vi.fn(async () => {
+          steps.push("enter");
+          throw SEND_REACHED;
+        }),
+        dispatchMouseEvent: vi.fn(async () => {
+          steps.push("click");
+          throw SEND_REACHED;
+        }),
       };
       const onPromptSubmitted = vi.fn();
       const logger = Object.assign(vi.fn(), { verbose: false });
@@ -967,38 +992,79 @@ describe("promptComposer", () => {
       ).catch((error: unknown) => error);
       return { outcome, steps, input, onPromptSubmitted, logger };
     };
+    const refusal = {
+      details: {
+        code: "thinking-time-above-max",
+        maxThinkingTime: "extra-high",
+        composerButton: "Thinking effort Pro",
+      },
+    };
 
     test("a composer button that names Pro stops the send before the click", async () => {
       const { outcome, steps, input, onPromptSubmitted } = run(
-        "Thinking effort\nPro",
+        () => "Thinking effort\nPro",
         "extra-high",
       );
-      await expect(outcome).resolves.toMatchObject({
-        details: {
-          code: "thinking-time-above-max",
-          maxThinkingTime: "extra-high",
-          composerButton: "Thinking effort Pro",
-        },
-      });
-      expect(steps).toEqual(["button"]);
+      await expect(outcome).resolves.toMatchObject(refusal);
+      expect(steps).toEqual(["measure", "measure", "button"]);
       expect(onPromptSubmitted).not.toHaveBeenCalled();
       expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
       expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
     });
 
+    test("the check runs after the button settled, so Pro chosen while it settled is caught", async () => {
+      const { outcome, steps, input } = run(
+        (_reads, seen) =>
+          seen.filter((step) => step === "measure").length >= 2
+            ? "Thinking effort\nPro"
+            : "Thinking effort\nExtra High",
+        "extra-high",
+      );
+      await expect(outcome).resolves.toMatchObject(refusal);
+      expect(steps.at(-1)).toBe("button");
+      expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
+    });
+
+    test("the fallback Enter is checked right before it is pressed", async () => {
+      const { outcome, steps, input } = run(
+        (_reads, seen) => (seen.includes("measure") ? "Thinking effort\nPro" : "Thinking effort"),
+        "extra-high",
+        { status: "missing" },
+      );
+      await expect(outcome).resolves.toMatchObject(refusal);
+      expect(steps.at(-1)).toBe("button");
+      expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+    });
+
+    test("the last-resort synthetic click is checked right before it fires", async () => {
+      const { outcome, steps } = run(() => "Thinking effort\nPro", "extra-high", {
+        status: "synthetic",
+      });
+      await expect(outcome).resolves.toMatchObject(refusal);
+      expect(steps).toEqual(["measure", "button"]);
+    });
+
     test.each([["Thinking effort\nExtra High"], ["Thinking effort"], [null]])(
       "a composer button reading %j goes on to the send",
       async (text) => {
-        const { outcome, steps } = run(text, "extra-high");
-        await outcome;
-        expect(steps.slice(0, 2)).toEqual(["button", "send"]);
+        const { outcome, steps } = run(() => text, "extra-high");
+        await expect(outcome).resolves.toBe(SEND_REACHED);
+        expect(steps).toEqual(["measure", "measure", "button", "click"]);
       },
     );
 
+    test("a composer button within the cap lets the fallback Enter through", async () => {
+      const { outcome, steps } = run(() => "Thinking effort\nMedium", "extra-high", {
+        status: "missing",
+      });
+      await expect(outcome).resolves.toBe(SEND_REACHED);
+      expect(steps).toEqual(["measure", "button", "enter"]);
+    });
+
     test("without a maximum the button is not read", async () => {
-      const { outcome, steps } = run("Thinking effort\nPro");
-      await outcome;
-      expect(steps[0]).toBe("send");
+      const { outcome, steps } = run(() => "Thinking effort\nPro");
+      await expect(outcome).resolves.toBe(SEND_REACHED);
+      expect(steps).toEqual(["measure", "measure", "click"]);
     });
   });
 
