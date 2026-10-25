@@ -29,9 +29,49 @@ import {
 } from "./composerTools.js";
 
 const DEEP_RESEARCH_STAGE = "deep-research-activate";
+// Polls (5 s apart) a frame report without a known completion banner must stay unchanged.
+const DEEP_RESEARCH_STRUCTURAL_STABLE_POLLS = 3;
 const DEEP_RESEARCH_ROW_TITLES = [DEEP_RESEARCH_DROPDOWN_ITEM_TEXT, "深度研究"];
-/** Titles of the iframe that hosts the research (today an MCP app frame), lower-case. */
-const DEEP_RESEARCH_FRAME_TITLES = DEEP_RESEARCH_ROW_TITLES.map((title) => title.toLowerCase());
+/**
+ * Titles of the iframe that hosts the research (today an MCP app frame), lower-case. The app name
+ * follows the UI language; besides this list any title with "deep research" wording counts.
+ */
+const DEEP_RESEARCH_FRAME_TITLES = [
+  ...DEEP_RESEARCH_ROW_TITLES,
+  "심층 리서치",
+  "딥 리서치",
+  "심층 연구",
+  "ディープリサーチ",
+  "詳細なリサーチ",
+  "recherche approfondie",
+  "investigación profunda",
+].map((title) => title.toLowerCase());
+
+/**
+ * Page function: whether an iframe hosts Deep Research: its title names it, its URL names the
+ * connector, or its host is one already seen hosting it (the URL itself is the generic app
+ * runtime, so it is only a hint).
+ */
+export function isDeepResearchFrameElement(
+  frame: Element,
+  titles: readonly string[],
+  knownHosts: readonly string[],
+): boolean {
+  const title = String(frame.getAttribute("title") ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (title && (titles.includes(title) || /deep\s*-?\s*research/.test(title))) return true;
+  const src = String(frame.getAttribute("src") ?? "");
+  const name = String(frame.getAttribute("name") ?? "");
+  if (/connector_openai_deep_research|deep-research/i.test(`${src} ${name}`)) return true;
+  if (knownHosts.length === 0 || !src) return false;
+  try {
+    return knownHosts.includes(new URL(src, frame.ownerDocument?.location?.href).host);
+  } catch {
+    return false;
+  }
+}
 const DEEP_RESEARCH_ROW_DESCRIPTIONS = ["Get a detailed report", "获取详细报告"];
 
 /**
@@ -343,12 +383,16 @@ export async function waitForDeepResearchCompletion(
   // what follows it decides.
   let firstReply: { identity: string; textLength: number; text: string } | null = null;
   let sawResearchFrame = false;
+  // Hosts seen hosting the research frame; the iframe title may not be readable on every poll.
+  const knownFrameHosts = new Set<string>();
+  // A frame report without a known completion banner counts once it stops changing.
+  let structural = null as { digest: string; polls: number } | null;
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
   while (Date.now() - start < timeoutMs) {
     const { result } = await Runtime.evaluate({
-      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
+      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral, [...knownFrameHosts]),
       returnByValue: true,
     });
 
@@ -366,6 +410,9 @@ export async function waitForDeepResearchCompletion(
           turnCount?: number;
           replyText?: string;
           deepResearchFrameInScope?: boolean;
+          firstTurnKey?: string;
+          firstTurnLength?: number;
+          firstTurnText?: string;
         }
       | undefined;
 
@@ -394,6 +441,8 @@ export async function waitForDeepResearchCompletion(
               // be read. -1 would skip the owner filter and accept any finished
               // iframe, including a report from another run.
               rejectCompletedWhenOwnerUnknown: requireScopedTargetOwner && minTurnLiteral < 0,
+              frameScopeTurnIndex: minTurnLiteral,
+              knownFrameHosts,
             },
           ).catch(() => null)
         )?.read ?? null)
@@ -429,17 +478,30 @@ export async function waitForDeepResearchCompletion(
     observedResearchEvidence ||= Boolean(
       frameSeen || val?.researchActivity || val?.hasActiveScopedResearch,
     );
-    const turnIdentity = `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
+    // Scoped to this prompt, the last turn's own key identifies it; unscoped, the turn count
+    // tells a newer turn from the same one.
+    const turnIdentity = scopedToNewTurns
+      ? (val?.turnKey ?? "")
+      : `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
     // Scoped to this prompt's turns, a second assistant turn means something followed the first
     // reply (a reattach can arrive after the report did).
-    if (!observedResearchEvidence && scopedToNewTurns && (val?.turnCount ?? 0) > 1) {
-      observedResearchEvidence = true;
-    }
+    const laterTurnPresent = scopedToNewTurns && (val?.turnCount ?? 0) > 1;
+    if (!observedResearchEvidence && laterTurnPresent) observedResearchEvidence = true;
     const textLength = val?.textLength ?? 0;
+    // The first reply is the first assistant turn after the prompt: with a later turn already
+    // present (a reattach after the report), that is the acknowledgement, not the last turn.
+    if (!firstReply && val && laterTurnPresent) {
+      firstReply = {
+        identity: val.firstTurnKey ?? "",
+        textLength: val.firstTurnLength ?? 0,
+        text: val.firstTurnText ?? "",
+      };
+    }
     const movedPastFirstReply =
-      !firstReply ||
-      turnIdentity !== firstReply.identity ||
-      (textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200);
+      firstReply !== null &&
+      (laterTurnPresent ||
+        turnIdentity !== firstReply.identity ||
+        (textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200));
     if (firstReply && !observedResearchEvidence && val) {
       if (movedPastFirstReply || val.stopVisible) {
         observedResearchEvidence = true;
@@ -454,9 +516,31 @@ export async function waitForDeepResearchCompletion(
         meta: { turnId: null, messageId: null },
       };
     }
+    // A frame report without a known banner (localized UI, renamed banner) once it is stable.
+    if (read && !read.completed && read.structuralComplete && read.candidateText) {
+      const digest = `${read.candidateText.length}:${read.candidateText.slice(-200)}`;
+      structural =
+        structural?.digest === digest
+          ? { digest, polls: structural.polls + 1 }
+          : { digest, polls: 1 };
+      if (structural.polls >= DEEP_RESEARCH_STRUCTURAL_STABLE_POLLS) {
+        logger(
+          `Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed; report stable in its frame)`,
+        );
+        return {
+          text: read.candidateText,
+          html: read.candidateHtml,
+          meta: { turnId: null, messageId: null },
+        };
+      }
+    } else {
+      structural = null;
+    }
 
-    // Completion detected
-    if (val?.finished) {
+    // The research frame's own state wins: while it reports work in progress, no turn change or
+    // finished assistant status is the final report.
+    const frameWorking = Boolean(read && !read.completed);
+    if (val?.finished && !frameWorking) {
       const extractable =
         observedResearchEvidence &&
         (!sawResearchFrame || (firstReply !== null && movedPastFirstReply));
@@ -464,13 +548,13 @@ export async function waitForDeepResearchCompletion(
         logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
         return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
       }
-      if (!firstReply) {
-        firstReply = { identity: turnIdentity, textLength, text: val.replyText ?? "" };
-        if (!observedResearchEvidence) {
-          logger(
-            "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
-          );
-        }
+    }
+    if (val?.finished && !firstReply) {
+      firstReply = { identity: turnIdentity, textLength, text: val.replyText ?? "" };
+      if (!observedResearchEvidence) {
+        logger(
+          "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
+        );
       }
     }
 
@@ -576,6 +660,10 @@ interface DeepResearchFrameTree {
 interface DeepResearchFrameStatus {
   completed: boolean;
   inProgress: boolean;
+  /** A report without a known completion banner: citations or headings, no progress shown. */
+  structuralComplete?: boolean;
+  candidateText?: string;
+  candidateHtml?: string;
   researchStarted?: boolean;
   planTitle?: string;
   planSteps?: string[];
@@ -728,6 +816,10 @@ async function readDeepResearchTargetResult(
   minTurnIndex = -1,
   options?: {
     rejectCompletedWhenOwnerUnknown?: boolean;
+    /** The prompt's turn: frame hosts are discovered only from iframes after it. */
+    frameScopeTurnIndex?: number;
+    /** Hosts seen hosting Deep Research earlier in this wait; new ones are added. */
+    knownFrameHosts?: Set<string>;
   },
 ): Promise<DeepResearchTargetScanResult | null> {
   const rawClient = client as ChromeClient & {
@@ -817,10 +909,18 @@ async function readDeepResearchTargetResult(
     let completed: DeepResearchFrameStatus | null = null;
     let latestProgress: DeepResearchFrameStatus | null = null;
     const targetKeys: string[] = [];
-    const appFrameHosts =
+    const knownFrameHosts = options?.knownFrameHosts;
+    const discoveredHosts =
       sessions.size > 0
-        ? await readDeepResearchAppFrameHosts(rawClient, pageSessionId)
+        ? await readDeepResearchAppFrameHosts(
+            rawClient,
+            pageSessionId,
+            options?.frameScopeTurnIndex ?? minTurnIndex,
+            [...(knownFrameHosts ?? [])],
+          )
         : new Set<string>();
+    for (const host of discoveredHosts) knownFrameHosts?.add(host);
+    const appFrameHosts = new Set([...discoveredHosts, ...(knownFrameHosts ?? [])]);
     for (const [sessionId, target] of sessions) {
       const sessionResult = await readDeepResearchTargetSession(
         rawClient,
@@ -891,9 +991,10 @@ async function readDeepResearchTargetResult(
 }
 
 /**
- * Hosts of the page's iframes titled "Deep research". Today the research runs in an MCP app frame
- * whose URL is the generic app runtime (`mcp-app-<hash>.web-sandbox.oaiusercontent.com/?app=skybridge`);
- * only the iframe element's title names it, and the host is specific to the app.
+ * Hosts of the page's Deep Research iframes after the prompt's turn (`scopeTurnIndex`, when
+ * known). Today the research runs in an MCP app frame whose URL is the generic app runtime
+ * (`mcp-app-<hash>.web-sandbox.oaiusercontent.com/?app=skybridge`); the iframe element's title
+ * names it, and the host is specific to the app.
  */
 async function readDeepResearchAppFrameHosts(
   rawClient: {
@@ -904,19 +1005,14 @@ async function readDeepResearchAppFrameHosts(
     ) => Promise<unknown>;
   },
   pageSessionId?: string,
+  scopeTurnIndex = -1,
+  knownHosts: readonly string[] = [],
 ): Promise<Set<string>> {
   const response = (await rawClient
     .send(
       "Runtime.evaluate",
       {
-        expression: `(() => {
-          const titles = ${JSON.stringify(DEEP_RESEARCH_FRAME_TITLES)};
-          return Array.from(document.querySelectorAll('iframe')).flatMap((frame) => {
-            const title = String(frame.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            if (!titles.includes(title)) return [];
-            try { return [new URL(frame.getAttribute('src') || '', location.href).host]; } catch { return []; }
-          });
-        })()`,
+        expression: buildDeepResearchAppFrameHostsExpression(scopeTurnIndex, knownHosts),
         returnByValue: true,
       },
       pageSessionId,
@@ -926,6 +1022,34 @@ async function readDeepResearchAppFrameHosts(
   return new Set(
     Array.isArray(value) ? value.filter((host) => typeof host === "string" && host) : [],
   );
+}
+
+function buildDeepResearchAppFrameHostsExpression(
+  scopeTurnIndex: number,
+  knownHosts: readonly string[],
+): string {
+  return `(() => {
+    const titles = ${JSON.stringify(DEEP_RESEARCH_FRAME_TITLES)};
+    const known = ${JSON.stringify(knownHosts)};
+    const isFrame = ${isDeepResearchFrameElement.toString()};
+    const scope = ${Math.floor(scopeTurnIndex)};
+    const turns = ${buildConversationTurnListExpression()};
+    const scopeStart = scope >= 0 ? turns[scope] || null : null;
+    if (scope >= 0 && !scopeStart) return [];
+    return Array.from(document.querySelectorAll('iframe')).flatMap((frame) => {
+      if (!isFrame(frame, titles, known)) return [];
+      if (scopeStart && !(scopeStart === frame || scopeStart.contains(frame) ||
+        (scopeStart.compareDocumentPosition(frame) & 4))) return [];
+      try { return [new URL(frame.getAttribute('src') || '', location.href).host]; } catch { return []; }
+    });
+  })()`;
+}
+
+export function buildDeepResearchAppFrameHostsExpressionForTest(
+  scopeTurnIndex: number,
+  knownHosts: readonly string[] = [],
+): string {
+  return buildDeepResearchAppFrameHostsExpression(scopeTurnIndex, knownHosts);
 }
 
 export async function captureDeepResearchTargetKeys(client: ChromeClient): Promise<string[]> {
@@ -1194,8 +1318,9 @@ function buildDeepResearchFrameStatusExpression(): string {
       );
     const researchStarted = planSteps.length > 0 && (hasResearchShimmer || hasStopResearchControl);
     const isPlaceholder = (line) => /^(called tool|used tool|użyto narzędzia|narzędzie wywołane)$/i.test(line);
-    const isCompletionLine = (line) =>
-      /^(research completed|badanie ukończone)\\b/i.test(line);
+    // The completion banner follows the UI language.
+    const completionPattern = /research completed|badanie ukończone|리서치 완료|연구 완료|조사 완료|研究完成|研究已完成|调研完成|リサーチ完了|調査完了|recherche abgeschlossen|recherche terminée|investigación completada|pesquisa concluída/i;
+    const isCompletionLine = (line) => completionPattern.test(line) && line.length <= 120;
     const isCounterLine = (line) =>
       /^(\\d+\\s+)?(citation|citations|source|sources|search|searches|cytat|cytaty|cytatów|źródło|źródła|wyszukiwanie|wyszukiwania|wyszukiwań)\\b/i.test(line);
     const normalizeReport = (text) => {
@@ -1227,9 +1352,20 @@ function buildDeepResearchFrameStatusExpression(): string {
       return reportLines.join('\\n').trim();
     };
     const reportText = normalizeReport(rawText);
-    const completed = /research completed|badanie ukończone/i.test(rawText) &&
+    const completed = completionPattern.test(rawText) &&
       reportText.length >= 40 &&
       !isPlaceholder(reportText);
+    // Structural evidence for a banner Oracle does not know: a report with citations or headings,
+    // no plan panel and no progress indicator. Oracle accepts it once it stays the same over
+    // several polls.
+    const progressIndicator = Boolean(document.querySelector?.('p.loading-shimmer, [role="progressbar"], [aria-busy="true"]')) ||
+      Array.from(document.querySelectorAll?.('button') ?? []).some((button) =>
+        /stop research|停止研究|리서치 중지|연구 중지|リサーチを停止/i.test(cleanText(button.getAttribute?.('aria-label') || button.textContent))
+      );
+    const citations = document.querySelectorAll?.('a[href^="http"]')?.length ?? 0;
+    const headings = document.querySelectorAll?.('h1, h2, h3, h4')?.length ?? 0;
+    const structuralComplete = !completed && !planSection && !progressIndicator &&
+      reportText.length >= 40 && !isPlaceholder(reportText) && (citations > 0 || headings > 0);
     const inProgress = /researching|badanie|searching|searches|wyszukiwa|citation|cytat|source|źród|reading|completed|ukończone/i.test(rawText);
     return {
       completed,
@@ -1241,6 +1377,9 @@ function buildDeepResearchFrameStatusExpression(): string {
       textLength: reportText.length || rawText.trim().length,
       text: completed ? reportText : undefined,
       html: completed ? html : undefined,
+      structuralComplete,
+      candidateText: structuralComplete ? reportText : undefined,
+      candidateHtml: structuralComplete ? html : undefined,
     };
   })()`;
 }
@@ -1331,7 +1470,10 @@ function buildDeepResearchStatusExpression(): string {
   })()`;
 }
 
-function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string {
+function buildDeepResearchCompletionPollExpression(
+  minTurnIndex: number,
+  knownHosts: readonly string[] = [],
+): string {
   const finishedSelector = JSON.stringify(FINISHED_ACTIONS_SELECTOR);
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
   return `(() => {
@@ -1397,23 +1539,32 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
       (textLength < 40 || isToolStub || tailIsPlanningPanel || /chatgpt\\s+said:?$/i.test(text));
     // Today's Deep Research runs in an MCP app iframe titled "Deep research" next to the
     // acknowledgement, outside the assistant unit; it counts when it sits after this prompt.
+    const isDeepResearchFrame = ${isDeepResearchFrameElement.toString()};
     const deepResearchTitles = ${JSON.stringify(DEEP_RESEARCH_FRAME_TITLES)};
+    const knownHosts = ${JSON.stringify(knownHosts)};
     const scopeStart = scopedToNewTurns ? conversationTurns[MIN_TURN_INDEX] || null : null;
     const deepResearchFrameInScope = Boolean(scopeStart) && Array.from(document.querySelectorAll('iframe')).some(f => {
       const rect = f.getBoundingClientRect();
       if (!(rect.width > 0 && rect.height > 0)) return false;
-      const title = String(f.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-      const descriptor = String(f.getAttribute('src') || '') + ' ' + String(f.getAttribute('name') || '');
-      if (!deepResearchTitles.includes(title) && !/connector_openai_deep_research|deep-research/i.test(descriptor)) return false;
+      if (!isDeepResearchFrame(f, deepResearchTitles, knownHosts)) return false;
       return scopeStart === f || Boolean(scopeStart.contains?.(f)) ||
         Boolean((scopeStart.compareDocumentPosition?.(f) ?? 0) & 4);
     });
     // Which assistant turn this is, so a later turn (the report after an acknowledgement) is seen.
     const attrOf = (node, name) => (node && typeof node.getAttribute === 'function' ? node.getAttribute(name) : null);
-    const messageNode = attrOf(lastTurn, 'data-message-id') !== null ? lastTurn : lastTurn?.querySelector?.('[data-message-id]');
-    const turnKey = String(attrOf(messageNode, 'data-message-id') || attrOf(lastTurn, 'data-testid') || '');
+    const keyOf = (turn) => {
+      const messageNode = attrOf(turn, 'data-message-id') !== null ? turn : turn?.querySelector?.('[data-message-id]');
+      return String(attrOf(messageNode, 'data-message-id') || attrOf(turn, 'data-testid') ||
+        attrOf(turn, 'data-content-search-unit-key') || attrOf(turn, 'data-chatgpt-search-unit-key') || '');
+    };
+    const turnKey = keyOf(lastTurn);
     const turnCount = (scopedToNewTurns ? scopedTurns : allAssistantTurns).length;
-    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, turnKey, turnCount, replyText: text.slice(0, 2000), deepResearchFrameInScope };
+    // The first assistant turn after the prompt: the acknowledgement that a reattach may find
+    // already followed by the report.
+    const firstTurn = scopedToNewTurns ? scopedTurns[0] || null : lastTurn;
+    const firstText = (firstTurn?.textContent || '').trim();
+    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, turnKey, turnCount, replyText: text.slice(0, 2000), deepResearchFrameInScope,
+      firstTurnKey: keyOf(firstTurn), firstTurnLength: firstText.length, firstTurnText: firstText.slice(0, 2000) };
   })()`;
 }
 
@@ -1421,6 +1572,9 @@ export function buildDeepResearchStatusExpressionForTest(): string {
   return buildDeepResearchStatusExpression();
 }
 
-export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = -1): string {
-  return buildDeepResearchCompletionPollExpression(minTurnIndex);
+export function buildDeepResearchCompletionPollExpressionForTest(
+  minTurnIndex = -1,
+  knownHosts: readonly string[] = [],
+): string {
+  return buildDeepResearchCompletionPollExpression(minTurnIndex, knownHosts);
 }

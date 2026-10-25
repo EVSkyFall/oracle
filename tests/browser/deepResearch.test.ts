@@ -24,8 +24,10 @@ import {
   activateDeepResearch,
   buildDeepResearchMentionExpression,
   findDeepResearchPanelRow,
+  buildDeepResearchAppFrameHostsExpressionForTest,
   buildDeepResearchCompletionPollExpressionForTest,
   buildDeepResearchFrameStatusExpressionForTest,
+  isDeepResearchFrameElement,
   buildDeepResearchStatusExpressionForTest,
   captureDeepResearchTargetKeys,
   filterIncompleteDeepResearchReadForTest,
@@ -1415,6 +1417,127 @@ describe("waitForDeepResearchCompletion", () => {
     expect(result.text).toBe("FRAME_REPORT done");
   });
 
+  // A page client whose Deep Research frame reports `reads` in order (the last one repeats).
+  const frameClient = (reads: Array<Record<string, unknown>>) => {
+    let index = 0;
+    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    return {
+      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+        listeners.set(event, listener);
+      }),
+      removeListener: vi.fn(),
+      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "deep-session",
+            targetInfo: {
+              type: "iframe",
+              url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+            },
+          });
+          return {};
+        }
+        if (method === "Page.getFrameTree" && sessionId === "deep-session") {
+          return { frameTree: { frame: { id: "sandbox", name: "root", url: "about:blank" } } };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          sessionId === "deep-session" &&
+          typeof (params as { contextId?: number }).contextId !== "number"
+        ) {
+          const read = reads[Math.min(index, reads.length - 1)];
+          index += 1;
+          return { result: { value: read } };
+        }
+        return {};
+      }),
+    };
+  };
+
+  it("a finished status turn is not the report while the frame still reports research", async () => {
+    let polls = 0;
+    mockRuntime.evaluate.mockImplementation(async () => {
+      polls += 1;
+      // The acknowledgement, then a second finished turn: an interim status message.
+      return {
+        result: {
+          value:
+            polls === 1
+              ? { ...ack, hasIframe: true }
+              : {
+                  ...ack,
+                  hasIframe: true,
+                  turnCount: 2,
+                  turnKey: "status",
+                  textLength: 300,
+                  replyText: "아직 자료를 수집 중이에요.",
+                },
+        },
+      };
+    });
+    const client = frameClient([
+      { completed: false, inProgress: true, textLength: 40 },
+      { completed: false, inProgress: true, textLength: 80 },
+      { completed: false, inProgress: true, textLength: 120 },
+      { completed: true, inProgress: false, textLength: 900, text: "FRAME_REPORT final" },
+    ]);
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      60_000,
+      0,
+      undefined,
+      client as never,
+      { targetBaselineCaptured: true },
+    );
+    expect(result.text).toBe("FRAME_REPORT final");
+  });
+
+  it("a frame report without a known completion banner counts once it is stable", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: { value: { ...ack, hasIframe: true, deepResearchFrameInScope: true } },
+    });
+    const report = {
+      completed: false,
+      inProgress: true,
+      textLength: 420,
+      structuralComplete: true,
+      candidateText: "Node.js 24 (Krypton) is the Active LTS line until 2028-04-30.",
+    };
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      1_000,
+      0,
+      undefined,
+      frameClient([{ completed: false, inProgress: true, textLength: 30 }, report]) as never,
+      { targetBaselineCaptured: true },
+    );
+    expect(result.text).toBe(report.candidateText);
+  });
+
+  it("a reattach that finds the acknowledgement and the report extracts at once, with the frame still there", async () => {
+    // Already finished: two assistant turns after the prompt, the frame mounted but unreadable.
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          ...ack,
+          hasIframe: true,
+          deepResearchFrameInScope: true,
+          turnCount: 2,
+          turnKey: "report",
+          textLength: 5000,
+          firstTurnKey: "ack",
+          firstTurnLength: 120,
+          firstTurnText: ack.replyText,
+        },
+      },
+    });
+    queueReportExtraction();
+    const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 1_000, 3);
+    expect(result.text).toBe("Research report content");
+  });
+
   it("a research frame that never completes ends in the Deep Research timeout, not 'not started'", async () => {
     mockRuntime.evaluate.mockResolvedValue({
       result: {
@@ -2593,6 +2716,113 @@ describe("waitForDeepResearchCompletion", () => {
     const afterStop = run(false);
     expect(afterStop.stopVisible).toBe(false);
     expect(afterStop.finished).toBe(true);
+  });
+
+  it("identifies the research frame by a localized title, any deep research wording, or a known host", () => {
+    const frame = (attrs: Record<string, string>) =>
+      new FakeElement("iframe", attrs) as unknown as Element;
+    const titles = ["deep research", "심층 리서치"];
+    expect(isDeepResearchFrameElement(frame({ title: "심층 리서치" }), titles, [])).toBe(true);
+    expect(isDeepResearchFrameElement(frame({ title: "Deep Research (beta)" }), titles, [])).toBe(
+      true,
+    );
+    // Neither skybridge nor web-sandbox is required; an untitled frame on a known host counts.
+    expect(
+      isDeepResearchFrameElement(
+        frame({ src: "https://app-7f.example-sandbox.net/runner" }),
+        titles,
+        ["app-7f.example-sandbox.net"],
+      ),
+    ).toBe(true);
+    expect(
+      isDeepResearchFrameElement(
+        frame({
+          title: "Gmail",
+          src: "https://mcp-app-1.web-sandbox.oaiusercontent.com/?app=skybridge",
+        }),
+        titles,
+        [],
+      ),
+    ).toBe(false);
+  });
+
+  it("completes a frame on a localized banner, or structurally without one", () => {
+    const expression = buildDeepResearchFrameStatusExpressionForTest();
+    const run = (
+      innerText: string,
+      extra: { headings?: number; links?: number; progress?: boolean } = {},
+    ) =>
+      new vm.Script(expression).runInNewContext({
+        document: {
+          body: { innerText, innerHTML: "<div />" },
+          querySelector: (selector: string) =>
+            extra.progress && selector.includes("progressbar") ? {} : null,
+          querySelectorAll: (selector: string) => {
+            if (selector === 'a[href^="http"]')
+              return Array.from({ length: extra.links ?? 0 }, () => ({}));
+            if (selector === "h1, h2, h3, h4")
+              return Array.from({ length: extra.headings ?? 0 }, () => ({}));
+            return [];
+          },
+        },
+      }) as {
+        completed: boolean;
+        structuralComplete?: boolean;
+        text?: string;
+        candidateText?: string;
+      };
+    const body = "Node.js 24 Krypton is the Active LTS line and reaches end-of-life on 2028-04-30.";
+    expect(
+      run(`리서치 완료 · 3 citations
+${body}`),
+    ).toMatchObject({ completed: true, text: body });
+    expect(run(body, { headings: 1, links: 3 })).toMatchObject({
+      completed: false,
+      structuralComplete: true,
+      candidateText: body,
+    });
+    expect(run(body, { headings: 1, links: 3, progress: true }).structuralComplete).toBe(false);
+    expect(run(body).structuralComplete).toBe(false);
+  });
+
+  it("discovers research frame hosts only after this prompt's turn", () => {
+    const at = (position: number) => ({
+      compareDocumentPosition: () => position,
+      contains: () => false,
+    });
+    const prompt = {
+      ...at(0),
+      getAttribute: () => null,
+      parentElement: null,
+    };
+    const frame = (title: string, host: string, followsPrompt: boolean) => ({
+      getAttribute: (name: string) =>
+        name === "title" ? title : name === "src" ? `https://${host}/?app=skybridge` : null,
+      followsPrompt,
+    });
+    const frames = [
+      frame("Deep research", "old-app.example", false),
+      frame("Deep research", "new-app.example", true),
+    ];
+    const scopeStart = {
+      ...prompt,
+      compareDocumentPosition: (other: { followsPrompt?: boolean }) =>
+        other.followsPrompt ? 4 : 2,
+    };
+    const hosts = new vm.Script(buildDeepResearchAppFrameHostsExpressionForTest(0)).runInNewContext(
+      {
+        URL,
+        location: { href: "https://chatgpt.com/c/abc" },
+        document: {
+          querySelectorAll: (selector: string) => {
+            if (selector === "iframe") return frames;
+            if (selector.includes("data-turn-key")) return [scopeStart];
+            return [];
+          },
+        },
+      },
+    ) as string[];
+    expect(hosts).toEqual(["new-app.example"]);
   });
 
   it("sees the Deep research app frame only when it sits after this prompt", () => {

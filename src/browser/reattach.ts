@@ -268,7 +268,12 @@ async function resumeBrowserSessionInternal(
     );
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
-      (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+      (config?.researchMode === "deep"
+        ? ((await readLastUserTurnIndex(Runtime)) ??
+          (await readConversationTurnIndex(Runtime, logger)))
+        : deps.promptPreview
+          ? null
+          : await readConversationTurnIndex(Runtime, logger));
     const approvalMonitor = {
       allowApps: normalizeBrowserAllowApps(config?.allowApps),
       logger,
@@ -554,7 +559,12 @@ async function resumeBrowserSessionViaNewChrome(
     const timeoutMs = resolved.timeoutMs ?? 120_000;
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
-      (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+      (resolved.researchMode === "deep"
+        ? ((await readLastUserTurnIndex(Runtime)) ??
+          (await readConversationTurnIndex(Runtime, logger)))
+        : deps.promptPreview
+          ? null
+          : await readConversationTurnIndex(Runtime, logger));
     const approvalMonitor = {
       allowApps: resolved.allowApps,
       logger,
@@ -595,6 +605,28 @@ async function resumeBrowserSessionViaNewChrome(
   }
 }
 
+/**
+ * The last user turn's index. Deep Research reattach scopes to it when the prompt preview does
+ * not match a user turn (a bundled or reformatted prompt), instead of going unscoped, where an
+ * earlier report in the same conversation would count.
+ */
+async function readLastUserTurnIndex(Runtime: ChromeClient["Runtime"]): Promise<number | null> {
+  const { result } = await Runtime.evaluate({
+    expression: `(() => {
+      const turns = ${buildConversationTurnListExpression()};
+      let last = null;
+      for (const [index, node] of turns.entries()) {
+        const attr = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+        const isUser = attr === 'user' || Boolean(node.querySelector(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])'));
+        if (isUser) last = index;
+      }
+      return last;
+    })()`,
+    returnByValue: true,
+  });
+  return typeof result?.value === "number" ? result.value : null;
+}
+
 async function readPromptPreviewTurnIndex(
   Runtime: ChromeClient["Runtime"],
   promptPreview?: string | null,
@@ -627,6 +659,7 @@ async function readPromptPreviewTurnIndex(
 }
 
 export const __test__ = {
+  readLastUserTurnIndex,
   pickTarget,
   extractConversationIdFromUrl,
   buildConversationUrl,

@@ -379,6 +379,63 @@ describe("resumeBrowserSession", () => {
     expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
   });
 
+  test("a Deep Research reattach whose prompt preview matches no turn is scoped to the last user turn", async () => {
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/deep",
+    };
+    const listTargets = vi.fn(
+      async () =>
+        [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
+    ) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+      if (expression === "1+1") return { result: { value: 2 } };
+      // The preview (a bundled prompt) matches no user turn.
+      if (expression.includes("const needle")) return { result: { value: null } };
+      if (expression.includes("let last = null")) return { result: { value: 4 } };
+      if (expression.includes("querySelectorAll")) return { result: { value: 7 } };
+      return { result: { value: null } };
+    });
+    const connect = vi.fn(
+      async () =>
+        ({
+          // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+          Runtime: { enable: vi.fn(), evaluate },
+          // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+          DOM: { enable: vi.fn() },
+          // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+          Page: { enable: vi.fn() },
+          close: vi.fn(async () => {}),
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const waitForDeepResearchCompletion = vi.fn(async () => ({
+      text: "Deep report body",
+      meta: { turnId: null, messageId: null },
+    }));
+    const logger = vi.fn() as BrowserLogger;
+    await resumeBrowserSession(runtime, { timeoutMs: 2000, researchMode: "deep" }, logger, {
+      listTargets,
+      connect,
+      waitForAssistantResponse: vi.fn(),
+      captureAssistantMarkdown: vi.fn(),
+      waitForDeepResearchCompletion,
+      waitForConversationHydration: vi.fn(async () => 2),
+      promptPreview: "[bundle] research the attached files",
+    });
+    expect(waitForDeepResearchCompletion).toHaveBeenCalledWith(
+      expect.anything(),
+      logger,
+      2000,
+      4,
+      expect.any(Object),
+      expect.any(Object),
+      { requireScopedTargetOwner: true },
+    );
+  });
+
   test("uses Deep Research completion path when reattaching research sessions", async () => {
     const runtime = {
       chromePort: 51559,
@@ -399,6 +456,10 @@ describe("resumeBrowserSession", () => {
       }
       if (expression === "1+1") {
         return { result: { value: 2 } };
+      }
+      // The last user turn (Deep Research scopes to it), then the turn count.
+      if (expression.includes("let last = null")) {
+        return { result: { value: 1 } };
       }
       if (expression.includes("querySelectorAll")) {
         return { result: { value: 3 } };
@@ -446,7 +507,7 @@ describe("resumeBrowserSession", () => {
       expect.objectContaining({ evaluate }),
       logger,
       2000,
-      2,
+      1,
       expect.any(Object),
       expect.any(Object),
       {
