@@ -38,6 +38,8 @@ import {
 } from "./composerTools.js";
 import { hasDeepResearchMention } from "./deepResearch.js";
 import { assertAppMentionsPresent, insertAppMentions } from "./appMentions.js";
+import { assertComposerTierWithinCap } from "./thinkingTimeCap.js";
+import type { ThinkingTimeLevel } from "../../oracle/types.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -139,6 +141,8 @@ export async function submitPrompt(
     deepResearch?: boolean;
     /** Apps to mention ahead of the prompt text. */
     apps?: readonly BrowserAppMention[];
+    /** --browser-max-thinking-time: the composer button is checked once more before the click. */
+    maxThinkingTime?: ThinkingTimeLevel;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -401,6 +405,11 @@ export async function submitPrompt(
       returnByValue: true,
     })
     .catch(() => undefined);
+
+  // Never Pro: staging after the cap check could still have changed the effort.
+  if (deps.maxThinkingTime) {
+    await assertComposerTierWithinCap(runtime, deps.maxThinkingTime, logger);
+  }
 
   const clicked = await attemptSendButton(
     runtime,

@@ -389,6 +389,8 @@ describe("runBrowserMode no-focus wiring", () => {
         }),
       ).rejects.toBe(SUBMIT_REACHED);
       expect(steps.order).toEqual(["picker", "cap:extra-high", "submit"]);
+      // The send itself checks the composer once more (submitPrompt's last look).
+      expect(submissions[0]?.maxThinkingTime).toBe("extra-high");
     },
   );
 

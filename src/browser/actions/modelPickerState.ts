@@ -184,6 +184,33 @@ async function evaluate<T>(runtime: ChromeClient["Runtime"], body: string): Prom
   return result?.value as T | undefined;
 }
 
+/**
+ * The composer model button's text, read without touching it (no click, the picker stays as it
+ * is). On chatgpt.com (2026-10-25) it reads "Thinking effort\nExtra High". Null without a button.
+ */
+export async function readModelButtonText(
+  runtime: ChromeClient["Runtime"],
+): Promise<string | null> {
+  return (
+    (await evaluate<string | null>(
+      runtime,
+      "const button = __findPickerButton(); return button ? String(button.innerText ?? button.textContent ?? '') : null;",
+    )) ?? null
+  );
+}
+
+/** The highest known tier any line of the button text names; null when no line names one. */
+export function highestTierInButtonText(text: string | null | undefined): ThinkingTimeLevel | null {
+  let highest: ThinkingTimeLevel | null = null;
+  for (const line of String(text ?? "").split(/\n+/)) {
+    const level = thinkingLevelFromTierLabel(line);
+    if (level && (highest === null || (LEVEL_RANK[level] ?? -1) > (LEVEL_RANK[highest] ?? -1))) {
+      highest = level;
+    }
+  }
+  return highest;
+}
+
 async function isPickerMenuOpen(runtime: ChromeClient["Runtime"]): Promise<boolean> {
   return (await evaluate<boolean>(runtime, "return Boolean(__findPickerMenu());")) === true;
 }

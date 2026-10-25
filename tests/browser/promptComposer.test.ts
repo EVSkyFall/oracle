@@ -919,6 +919,89 @@ describe("promptComposer", () => {
     );
   });
 
+  describe("maximum thinking time at the send click", () => {
+    const SEND_REACHED = new Error("send step reached");
+    const run = (buttonText: string | null, maxThinkingTime?: "extra-high") => {
+      const steps: string[] = [];
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("document.readyState")) {
+            return { result: { value: { ready: true, composer: true, fileInput: false } } };
+          }
+          if (expression.includes("focused: true")) {
+            return { result: { value: { focused: true } } };
+          }
+          if (expression.includes("editorText")) {
+            return {
+              result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
+            };
+          }
+          if (expression.includes("return button ? String(button.innerText")) {
+            steps.push("button");
+            return { result: { value: buttonText } };
+          }
+          if (expression.includes("send-button")) {
+            steps.push("send");
+            throw SEND_REACHED;
+          }
+          throw new Error(`unexpected expression: ${expression.slice(0, 80)}`);
+        }),
+      };
+      const input = {
+        insertText: vi.fn(),
+        dispatchKeyEvent: vi.fn(),
+        dispatchMouseEvent: vi.fn(),
+      };
+      const onPromptSubmitted = vi.fn();
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      const outcome = submitPrompt(
+        {
+          runtime: runtime as never,
+          input: input as never,
+          baselineTurns: 0,
+          onPromptSubmitted,
+          maxThinkingTime,
+        },
+        "hello",
+        logger as never,
+      ).catch((error: unknown) => error);
+      return { outcome, steps, input, onPromptSubmitted, logger };
+    };
+
+    test("a composer button that names Pro stops the send before the click", async () => {
+      const { outcome, steps, input, onPromptSubmitted } = run(
+        "Thinking effort\nPro",
+        "extra-high",
+      );
+      await expect(outcome).resolves.toMatchObject({
+        details: {
+          code: "thinking-time-above-max",
+          maxThinkingTime: "extra-high",
+          composerButton: "Thinking effort Pro",
+        },
+      });
+      expect(steps).toEqual(["button"]);
+      expect(onPromptSubmitted).not.toHaveBeenCalled();
+      expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+      expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
+    });
+
+    test.each([["Thinking effort\nExtra High"], ["Thinking effort"], [null]])(
+      "a composer button reading %j goes on to the send",
+      async (text) => {
+        const { outcome, steps } = run(text, "extra-high");
+        await outcome;
+        expect(steps.slice(0, 2)).toEqual(["button", "send"]);
+      },
+    );
+
+    test("without a maximum the button is not read", async () => {
+      const { outcome, steps } = run("Thinking effort\nPro");
+      await outcome;
+      expect(steps[0]).toBe("send");
+    });
+  });
+
   test("refuses to send when the Deep research mention left the composer", async () => {
     const onPromptSubmitted = vi.fn();
     const runtime = {

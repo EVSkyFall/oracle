@@ -1796,6 +1796,7 @@ async function runBrowserModeInternal(
         webSearch: config.researchMode === "search",
         deepResearch,
         apps: config.apps,
+        maxThinkingTime: config.maxThinkingTime,
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -3448,6 +3449,7 @@ async function runRemoteBrowserMode(
         webSearch: config.researchMode === "search",
         deepResearch,
         apps: config.apps,
+        maxThinkingTime: config.maxThinkingTime,
       };
       const deepResearchTargetBaseline =
         deepResearch && client

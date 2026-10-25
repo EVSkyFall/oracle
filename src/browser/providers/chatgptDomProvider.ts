@@ -3,6 +3,7 @@ import type { ProviderDomAdapter, ProviderDomFlowContext } from "../providerDomF
 import { ensurePromptReady } from "../actions/navigation.js";
 import { submitPrompt, type AttachmentReadyExpectation } from "../actions/promptComposer.js";
 import { waitForAssistantResponse } from "../actions/assistantResponse.js";
+import type { ThinkingTimeLevel } from "../../oracle/types.js";
 
 interface ChatgptDomProviderState {
   runtime: ChromeClient["Runtime"];
@@ -21,6 +22,7 @@ interface ChatgptDomProviderState {
   webSearch?: boolean;
   deepResearch?: boolean;
   apps?: BrowserAppMention[];
+  maxThinkingTime?: ThinkingTimeLevel;
 }
 
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
@@ -57,6 +59,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       webSearch: state.webSearch,
       deepResearch: state.deepResearch,
       apps: state.apps,
+      maxThinkingTime: state.maxThinkingTime,
     },
     ctx.prompt,
     state.logger,

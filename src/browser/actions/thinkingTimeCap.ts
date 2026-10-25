@@ -6,8 +6,10 @@ import { delay } from "../utils.js";
 import { ensureThinkingTime } from "./thinkingTime.js";
 import {
   highestCurrentTierLevel,
+  highestTierInButtonText,
   formatModelPickerState,
   lowerModelPickerTier,
+  readModelButtonText,
   modelPickerEvidence,
   readModelPickerState,
   thinkingLevelRank,
@@ -57,6 +59,46 @@ const LOG_PREFIX = "[browser] Thinking-time cap";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The last look right before the send click: what the composer's model button names, read
+ * passively (the picker is not opened). Staging after the cap check (attachments, mentions, Deep
+ * Research, typing) could still change it. A known tier above the cap stops the send with
+ * `thinking-time-above-max`; a button that names no known tier is no evidence, so it is sent.
+ */
+export async function assertComposerTierWithinCap(
+  runtime: ChromeClient["Runtime"],
+  maxLevel: ThinkingTimeLevel,
+  logger: BrowserLogger,
+): Promise<void> {
+  let text: string | null = null;
+  try {
+    text = await readModelButtonText(runtime);
+  } catch (error) {
+    if (error instanceof BrowserRunCancelledError) throw error;
+    logger(
+      `${LOG_PREFIX} (${maxLevel}): the composer button could not be read at the send (${errorText(error)}); sending.`,
+    );
+    return;
+  }
+  const shown = (text ?? "").replace(/\s+/g, " ").trim();
+  const level = highestTierInButtonText(text);
+  if (isAboveThinkingCap(level, maxLevel) === true) {
+    const message = `Thinking time: right before the send the composer shows "${shown}", above the maximum "${maxLevel}"; nothing was sent.`;
+    logger(`${LOG_PREFIX} (${maxLevel}): ${message}`);
+    throw new BrowserAutomationError(message, {
+      stage: "thinking-time-cap",
+      code: "thinking-time-above-max",
+      maxThinkingTime: maxLevel,
+      composerButton: shown,
+    });
+  }
+  logger(
+    level
+      ? `${LOG_PREFIX} (${maxLevel}): at the send the composer shows "${shown}", within the cap.`
+      : `${LOG_PREFIX} (${maxLevel}): at the send the composer button names no known tier ("${shown}"); sending.`,
+  );
 }
 
 /**
