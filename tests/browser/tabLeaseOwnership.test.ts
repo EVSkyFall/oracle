@@ -1,4 +1,15 @@
-import { mkdtemp, readFile, rm, writeFile, link, rename, rmdir, utimes } from "node:fs/promises";
+import {
+  copyFile,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+  link,
+  rename,
+  rmdir,
+  stat,
+  utimes,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
@@ -12,6 +23,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     rmdir: vi.fn(actual.rmdir),
     link: vi.fn(actual.link),
     rename: vi.fn(actual.rename),
+    copyFile: vi.fn(actual.copyFile),
   };
 });
 
@@ -24,6 +36,7 @@ afterEach(() => {
   vi.mocked(rmdir).mockImplementation(actual.rmdir);
   vi.mocked(link).mockImplementation(actual.link);
   vi.mocked(rename).mockImplementation(actual.rename);
+  vi.mocked(copyFile).mockImplementation(actual.copyFile);
 });
 
 // Another controller that is alive (this very process), as far as the registry can tell.
@@ -92,6 +105,33 @@ test("without hard links the owner is still published, exclusively", async () =>
     const again = await acquireBrowserTabLease(dir, { maxConcurrentTabs: 2, timeoutMs: 5_000 });
     await again.release();
   } finally {
+    await actual.rm(dir, { recursive: true, force: true, maxRetries: 5 });
+  }
+}, 60_000);
+
+test("a publish that fails outright still removes its own temporary, so no lock is left", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-lock-copyfail-"));
+  const lockDir = path.join(dir, LOCK);
+  vi.mocked(link).mockRejectedValue(Object.assign(new Error("link EXDEV"), { code: "EXDEV" }));
+  vi.mocked(copyFile).mockRejectedValue(
+    Object.assign(new Error("no space left"), { code: "ENOSPC" }),
+  );
+  // Windows keeps our temporary busy for a moment.
+  let busy = 2;
+  vi.mocked(rm).mockImplementation(async (target, options) => {
+    if (busy > 0 && String(target).startsWith(lockDir) && String(target).endsWith(".tmp")) {
+      busy -= 1;
+      throw Object.assign(new Error("busy"), { code: "EBUSY" });
+    }
+    return actual.rm(target, options);
+  });
+  try {
+    await expect(
+      acquireBrowserTabLease(dir, { maxConcurrentTabs: 2, timeoutMs: 5_000 }),
+    ).rejects.toThrow(/no space left/);
+    await expect(stat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    vi.mocked(rm).mockImplementation(actual.rm);
     await actual.rm(dir, { recursive: true, force: true, maxRetries: 5 });
   }
 }, 60_000);

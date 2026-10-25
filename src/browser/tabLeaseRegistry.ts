@@ -895,8 +895,10 @@ async function publishRegistryLockOwner(temporary: string, owner: string): Promi
     } else {
       published = false;
     }
+  } finally {
+    // Also when the copy fails for another reason: our own temporary never stays behind.
+    await removeOwnTemporary(temporary);
   }
-  await removeOwnTemporary(temporary);
   return published;
 }
 
