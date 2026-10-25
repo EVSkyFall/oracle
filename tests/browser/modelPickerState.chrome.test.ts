@@ -18,6 +18,7 @@ function fixture(
   rtl: boolean,
   layered: boolean,
   sliderDelayMs = 0,
+  variant: "default" | "localized-header" | "no-effort" = "default",
 ): string {
   // Layered mirrors chatgpt.com (2026-10-25): the model radios sit under the effort panel and
   // its "Select model" header brings them to the front.
@@ -34,9 +35,18 @@ function fixture(
     <div role="menuitemradio" data-model="GPT-6" aria-checked="true">GPT-6</div>
     <div role="menuitemradio" data-model="GPT-5.6 Sol" aria-checked="false">GPT-5.6 Sol</div>
   </div>
-  <div id="effort">
-    <div role="menuitem" id="tier" aria-label="Select model">Medium</div>
-    <div role="menuitem" aria-label="Power"><span id="slider" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="4" aria-valuenow="1"></span></div>
+  <div id="effort">${
+    variant === "no-effort"
+      ? ""
+      : variant === "localized-header"
+        ? `<div role="menuitem" id="temp">임시 채팅</div>
+    <div role="menuitem" id="tier" aria-label="모델 선택" aria-haspopup="menu">Medium</div>`
+        : `<div role="menuitem" id="tier" aria-label="Select model">Medium</div>`
+  }${
+    variant === "no-effort"
+      ? ""
+      : `<div role="menuitem" aria-label="Power"><span id="slider" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="4" aria-valuenow="1"></span></div>`
+  }
   </div>
 </div>
 <div aria-live="polite" id="live"></div>
@@ -50,17 +60,19 @@ function fixture(
     $('picker').setAttribute('aria-expanded', String(state.open));
     $('menu').style.display = state.open ? 'block' : 'none';
     $('models').style.zIndex = state.view === 'models' ? '3' : '1';
-    $('tier').textContent = tiers[state.value];
-    $('slider').setAttribute('aria-valuenow', String(state.value));
+    if ($('tier')) $('tier').textContent = tiers[state.value];
+    $('slider')?.setAttribute('aria-valuenow', String(state.value));
     for (const radio of document.querySelectorAll('[role="menuitemradio"]')) radio.setAttribute('aria-checked', String(radio.dataset.model === state.model));
+    // no-effort: the live region keeps an old announcement.
+    if (${variant === "no-effort"} && $('live').textContent) return;
     $('live').textContent = tiers[state.value] + ', ' + (state.value + 1) + ' of 5.';
   };
   window.setPicker = (model, value) => { state.model = model; state.value = value; render(); };
   window.pickerState = () => ({ open: state.open, model: state.model, value: state.value });
   // The slider mounts a beat after the menu opens, as on chatgpt.com.
-  const mountSlider = () => { $('slider').style.display = 'none'; setTimeout(() => { $('slider').style.display = ''; }, ${sliderDelayMs}); };
+  const mountSlider = () => { if (!$('slider')) return; $('slider').style.display = 'none'; setTimeout(() => { $('slider').style.display = ''; }, ${sliderDelayMs}); };
   $('picker').addEventListener('pointerdown', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.open = !state.open; state.view = 'effort'; render(); if (state.open) mountSlider(); });
-  $('tier').addEventListener('click', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.view = 'models'; render(); });
+  $('tier')?.addEventListener('click', (event) => { if (!event.isTrusted) { window.untrusted++; return; } state.view = 'models'; render(); });
   for (const radio of document.querySelectorAll('[role="menuitemradio"]')) radio.addEventListener('click', (event) => {
     if (!event.isTrusted) { window.untrusted++; return; }
     state.model = radio.dataset.model; state.open = false; state.view = 'effort'; render();
@@ -68,7 +80,7 @@ function fixture(
   const KEYS = ${JSON.stringify(keys)} === 'horizontal'
     ? { ArrowRight: ${rtl ? -1 : 1}, ArrowLeft: ${rtl ? 1 : -1} }
     : { ArrowUp: 1, ArrowDown: -1 };
-  $('slider').addEventListener('keydown', (event) => {
+  $('slider')?.addEventListener('keydown', (event) => {
     if (!event.isTrusted) { window.untrusted++; return; }
     if (state.view !== 'effort') return;
     const delta = KEYS[event.key];
@@ -136,6 +148,106 @@ describe.runIf(enabled)("model picker snapshot and restore in real Chrome", () =
     },
     60_000,
   );
+
+  async function withPicker(
+    html: string,
+    run: (client: Awaited<ReturnType<typeof CDP>>) => Promise<void>,
+  ): Promise<void> {
+    const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-picker-fixture-"));
+    const chrome = await chromeLauncher.launch({
+      chromeFlags: ["--headless=new", "--window-size=900,700", "--no-first-run"],
+      userDataDir,
+    });
+    let client: Awaited<ReturnType<typeof CDP>> | undefined;
+    try {
+      client = await CDP({ port: chrome.port });
+      await Promise.all([client.Page.enable(), client.Runtime.enable()]);
+      await client.Page.navigate({
+        url: `data:text/html;base64,${Buffer.from(html).toString("base64")}`,
+      });
+      await client.Page.loadEventFired();
+      await run(client);
+    } finally {
+      await client?.close().catch(() => undefined);
+      chrome.kill();
+      await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+  const pickerState = async (client: Awaited<ReturnType<typeof CDP>>) =>
+    (
+      await client.Runtime.evaluate({
+        expression: "({ ...window.pickerState(), untrusted: window.untrusted })",
+        returnByValue: true,
+      })
+    ).result.value as { open: boolean; model: string; value: number; untrusted: number };
+  const labelOnly = (tierLabel: string) => ({
+    pickerLabel: null,
+    modelLabel: "GPT-6",
+    modelOptions: [],
+    tierLabel,
+    sliderValue: null,
+    sliderMin: null,
+    sliderMax: null,
+    announcement: null,
+    tierSource: "header" as const,
+  });
+
+  test("a snapshot known only by its tier label is restored to that tier (from Pro)", async () => {
+    await withPicker(fixture("horizontal", false, true), async (client) => {
+      await client.Runtime.evaluate({ expression: "window.setPicker('GPT-6', 4)" });
+      const restore = await restoreModelPickerState(
+        client.Runtime,
+        client.Input,
+        labelOnly("Medium"),
+        Object.assign(vi.fn(), { verbose: false }),
+      );
+      expect(restore).toMatchObject({
+        restored: true,
+        state: { tierLabel: "Medium", sliderValue: 1 },
+      });
+      expect(await pickerState(client)).toEqual({
+        open: false,
+        model: "GPT-6",
+        value: 1,
+        untrusted: 0,
+      });
+    });
+  }, 60_000);
+
+  test("a stale announcement never counts as the restored tier", async () => {
+    await withPicker(fixture("horizontal", false, false, 0, "no-effort"), async (client) => {
+      // The live region still says "Medium, 2 of 5." while the account is on Pro.
+      await client.Runtime.evaluate({ expression: "window.setPicker('GPT-6', 4)" });
+      const restore = await restoreModelPickerState(
+        client.Runtime,
+        client.Input,
+        labelOnly("Medium"),
+        Object.assign(vi.fn(), { verbose: false }),
+      );
+      expect(restore.restored).toBe(false);
+      expect((await pickerState(client)).value).toBe(4);
+    });
+  }, 60_000);
+
+  test("a localized model-list header is found by structure", async () => {
+    await withPicker(fixture("horizontal", false, true, 0, "localized-header"), async (client) => {
+      const before = await readModelPickerState(client.Runtime, client.Input);
+      await client.Runtime.evaluate({ expression: "window.setPicker('GPT-5.6 Sol', 4)" });
+      const restore = await restoreModelPickerState(
+        client.Runtime,
+        client.Input,
+        before!,
+        Object.assign(vi.fn(), { verbose: false }),
+      );
+      expect(restore.restored).toBe(true);
+      expect(await pickerState(client)).toEqual({
+        open: false,
+        model: "GPT-6",
+        value: 1,
+        untrusted: 0,
+      });
+    });
+  }, 60_000);
 
   test("a restore target without its effort is never reported as restored", async () => {
     const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-picker-fixture-"));

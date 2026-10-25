@@ -16,7 +16,7 @@ import {
   isCompletePickerState,
   readModelPickerState,
   restoreModelPickerState,
-  thinkingLevelFromTierLabel,
+  currentTierLevel,
   type ModelPickerRestoreResult,
 } from "./actions/modelPickerState.js";
 
@@ -89,8 +89,10 @@ function trackPageWork(runtime: ChromeClient["Runtime"]): {
 
 function sameSelection(a: BrowserModelPickerState, b: BrowserModelPickerState): boolean {
   if (a.modelLabel !== b.modelLabel) return false;
-  if (a.sliderValue !== null || b.sliderValue !== null) return a.sliderValue === b.sliderValue;
-  return thinkingLevelFromTierLabel(a.tierLabel) === thinkingLevelFromTierLabel(b.tierLabel);
+  if (a.sliderValue !== null && b.sliderValue !== null) return a.sliderValue === b.sliderValue;
+  // One side has only a tier label: compare the tiers both pickers show now.
+  const level = currentTierLevel(a);
+  return level !== null && level === currentTierLevel(b);
 }
 
 /**
@@ -152,7 +154,7 @@ export async function runSelectOnlyCheck(
       if (!thinking?.verified) {
         problems.push(`thinking time "${options.requestedThinkingTime}" was not verified`);
       }
-      const shown = thinkingLevelFromTierLabel(selected?.tierLabel);
+      const shown = currentTierLevel(selected);
       if (selected && shown !== options.requestedThinkingTime) {
         problems.push(
           `the picker shows tier "${selected.tierLabel ?? "unknown"}" instead of "${options.requestedThinkingTime}"`,

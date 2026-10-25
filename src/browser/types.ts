@@ -193,6 +193,13 @@ export interface BrowserModelPickerState {
   sliderMax: number | null;
   /** Latest live-region announcement, e.g. "Medium, 2 of 5." */
   announcement: string | null;
+  /**
+   * Where `tierLabel` was read: the tier header, the slider's aria-valuetext, or only a live
+   * announcement (which can be stale, so it never counts as the current tier).
+   */
+  tierSource?: "header" | "valuetext" | "announcement" | null;
+  /** Whether the menu has an effort slider at all (mounted or not). */
+  sliderPresent?: boolean;
 }
 
 /** Outcome of a select-only check. */

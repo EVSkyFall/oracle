@@ -106,14 +106,28 @@ export function readModelPickerMenuState(
     (list, text) => [...list, { text, label: text.split(/[,，、]/)[0]!.trim() }],
     [],
   );
+  type Source = "header" | "valuetext" | "announcement";
   const candidates = [
-    ...headerLines.map((label) => ({ label, text: null as string | null })),
-    ...(valueText ? [{ label: valueText, text: null as string | null }] : []),
-    ...spoken,
+    ...headerLines.map((label) => ({
+      label,
+      text: null as string | null,
+      source: "header" as Source,
+    })),
+    ...(valueText
+      ? [{ label: valueText, text: null as string | null, source: "valuetext" as Source }]
+      : []),
+    ...spoken.map((entry) => ({ ...entry, source: "announcement" as Source })),
   ];
   const known = candidates.find((candidate) => candidate.label && levelOf(candidate.label));
   const announcement = known?.text ?? announcements.at(-1) ?? null;
-  const tierLabel = known?.label ?? headerLines[0] ?? valueText ?? (spoken[0]?.label || null);
+  const fallback = headerLines[0]
+    ? { label: headerLines[0], source: "header" as Source }
+    : valueText
+      ? { label: valueText, source: "valuetext" as Source }
+      : spoken[0]?.label
+        ? { label: spoken[0].label, source: "announcement" as Source }
+        : null;
+  const tierLabel = known?.label ?? fallback?.label ?? null;
   return {
     pickerLabel: flatText(button),
     modelLabel: firstLine(checked),
@@ -125,6 +139,8 @@ export function readModelPickerMenuState(
     sliderMin: numberAttr(slider, "aria-valuemin"),
     sliderMax: numberAttr(slider, "aria-valuemax"),
     announcement,
+    tierSource: known?.source ?? fallback?.source ?? null,
+    sliderPresent: Boolean(menu?.querySelector('[role="slider"]')),
   };
 }
 
@@ -216,13 +232,23 @@ export async function closeModelPicker(
 // The tier header and the effort slider render a beat after the menu itself.
 const SLIDER_MOUNT_WAIT_MS = 3_000;
 
+/**
+ * The effort level the picker shows now: from the tier header or the slider's aria-valuetext,
+ * never from a live announcement alone (it can be left over from an earlier change).
+ */
+export function currentTierLevel(
+  state: BrowserModelPickerState | null | undefined,
+): ThinkingTimeLevel | null {
+  if (!state || state.tierSource === "announcement") return null;
+  return thinkingLevelFromTierLabel(state.tierLabel);
+}
+
 /** Whether a picker reading has both the model and the effort it shows. */
 export function isCompletePickerState(
   state: BrowserModelPickerState | null | undefined,
 ): state is BrowserModelPickerState {
   return Boolean(
-    state?.modelLabel &&
-    (state.sliderValue !== null || thinkingLevelFromTierLabel(state.tierLabel) !== null),
+    state?.modelLabel && (state.sliderValue !== null || currentTierLevel(state) !== null),
   );
 }
 
@@ -232,10 +258,25 @@ async function readOpenStateWhenMounted(
   let state: BrowserModelPickerState | null = null;
   await waitFor(async () => {
     state = await readOpenState(runtime);
-    return Boolean(state?.modelLabel && state.sliderValue !== null);
+    if (!state?.modelLabel) return false;
+    // A picker with a slider is read once the slider has mounted; one without it, by its tier.
+    return (
+      state.sliderValue !== null ||
+      (state.sliderPresent === false && currentTierLevel(state) !== null)
+    );
   }, SLIDER_MOUNT_WAIT_MS);
   return state;
 }
+
+// Direction only: which way the slider moves from one effort level toward another.
+const LEVEL_RANK: Partial<Record<ThinkingTimeLevel, number>> = {
+  light: 0,
+  standard: 1,
+  extended: 2,
+  "extra-high": 3,
+  heavy: 3.5,
+  pro: 4,
+};
 
 /**
  * Opens the picker, reads what it shows (waiting for the slider to mount) and closes it again.
@@ -287,7 +328,15 @@ async function chooseModelRadio(
       const menu = __findPickerMenu();
       if (!menu) return null;
       const items = Array.from(menu.querySelectorAll('[role="menuitem"]')).filter(node => node.getBoundingClientRect().width > 0 && !node.querySelector('[role="slider"]'));
-      return items.find(node => /model/i.test(node.getAttribute('aria-label') ?? '')) ?? items.find(node => (node.innerText ?? '').trim()) ?? null;
+      // The English label first, then structure, so a localized picker still restores: the item
+      // that opens a sub-list, then the item right before the slider.
+      const slider = menu.querySelector('[role="slider"]');
+      const beforeSlider = slider ? items.filter(node => node.compareDocumentPosition(slider) & 4).at(-1) : undefined;
+      return items.find(node => /select model/i.test(node.getAttribute('aria-label') ?? '')) ??
+        items.find(node => /model/i.test(node.getAttribute('aria-label') ?? '')) ??
+        items.find(node => node.hasAttribute('aria-haspopup')) ??
+        beforeSlider ??
+        items.find(node => (node.innerText ?? '').trim()) ?? null;
     }`,
     stage: STAGE,
     target: "The model list header",
@@ -377,7 +426,56 @@ async function moveSlider(
 }
 
 /**
+ * Moves the open picker's slider one step at a time until its tier header (or aria-valuetext)
+ * names `level`. Returns the slider value that shows it, for a target known only by its label.
+ */
+async function moveSliderToLevel(
+  runtime: ChromeClient["Runtime"],
+  input: ChromeClient["Input"] | undefined,
+  level: ThinkingTimeLevel,
+): Promise<{ value: number | null; matched: boolean; detail?: string }> {
+  const wanted = LEVEL_RANK[level];
+  const seen = new Set<number>();
+  for (;;) {
+    const state = await readOpenStateWhenMounted(runtime);
+    const value = state?.sliderValue ?? null;
+    if (value === null)
+      return { value, matched: false, detail: "the effort slider is not mounted" };
+    const shown = currentTierLevel(state);
+    if (shown === level) return { value, matched: true };
+    const rank = shown ? LEVEL_RANK[shown] : undefined;
+    if (rank === undefined || wanted === undefined) {
+      return {
+        value,
+        matched: false,
+        detail: `tier "${state?.tierLabel ?? "unknown"}" cannot be placed`,
+      };
+    }
+    if (seen.has(value)) return { value, matched: false, detail: `no slider step shows ${level}` };
+    seen.add(value);
+    const next = value + (rank < wanted ? 1 : -1);
+    if (
+      (state?.sliderMin !== null && state?.sliderMin !== undefined && next < state.sliderMin) ||
+      (state?.sliderMax !== null && state?.sliderMax !== undefined && next > state.sliderMax)
+    ) {
+      return { value, matched: false, detail: `no slider step shows ${level}` };
+    }
+    const reached = await moveSlider(runtime, input, next);
+    if (reached !== next) {
+      return {
+        value: reached,
+        matched: false,
+        detail: `effort slider stopped at ${reached ?? "unknown"}`,
+      };
+    }
+  }
+}
+
+/**
  * Puts the picker back to `target` (model radio first, then the effort slider) and reads it back.
+ * A target known only by its tier label is restored by stepping the slider until it shows that
+ * tier. The final read must show the slider at the target value (or, in a picker without a
+ * slider, the target tier from its header); a stale announcement never counts.
  */
 export async function restoreModelPickerState(
   runtime: ChromeClient["Runtime"],
@@ -412,22 +510,34 @@ export async function restoreModelPickerState(
     // A model switch remounts the effort slider; wait for it before moving it.
     state = await readOpenStateWhenMounted(runtime);
   }
-  if (target.sliderValue !== null && state?.sliderValue !== target.sliderValue) {
-    const reached = await moveSlider(runtime, input, target.sliderValue);
-    if (reached !== target.sliderValue) {
-      problems.push(`effort slider stopped at ${reached ?? "unknown"}`);
+  const targetLevel = currentTierLevel(target);
+  let targetValue = target.sliderValue;
+  if (state?.sliderValue !== null && state?.sliderValue !== undefined) {
+    if (targetValue !== null) {
+      if (state.sliderValue !== targetValue) {
+        const reached = await moveSlider(runtime, input, targetValue);
+        if (reached !== targetValue)
+          problems.push(`effort slider stopped at ${reached ?? "unknown"}`);
+      }
+    } else if (targetLevel) {
+      // Known only by its label: the slider value that shows that tier is the target.
+      const moved = await moveSliderToLevel(runtime, input, targetLevel);
+      if (moved.matched) targetValue = moved.value;
+      else problems.push(moved.detail ?? `tier "${target.tierLabel}" not reached`);
     }
+  } else if (state?.sliderPresent !== false) {
+    problems.push("the effort slider did not mount");
   }
   await closeModelPicker(runtime, input);
   const finalState = await readModelPickerState(runtime, input);
   // Every field must read back equal; a field that cannot be read is not a restore.
   const modelOk = finalState?.modelLabel === target.modelLabel;
+  const finalLevel = currentTierLevel(finalState);
+  const sameTier = !finalLevel || !targetLevel || finalLevel === targetLevel;
   const tierOk =
-    target.sliderValue !== null
-      ? finalState?.sliderValue === target.sliderValue
-      : finalState?.sliderValue === null &&
-        thinkingLevelFromTierLabel(finalState.tierLabel) ===
-          thinkingLevelFromTierLabel(target.tierLabel);
+    finalState?.sliderValue !== null && finalState?.sliderValue !== undefined
+      ? targetValue !== null && finalState.sliderValue === targetValue && sameTier
+      : finalState?.sliderPresent === false && finalLevel !== null && finalLevel === targetLevel;
   const restored = Boolean(finalState) && modelOk && tierOk;
   if (!restored && problems.length === 0) {
     problems.push(finalState ? "the picker shows a different selection" : "picker unreadable");

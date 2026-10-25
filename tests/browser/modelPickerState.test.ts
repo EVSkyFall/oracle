@@ -81,6 +81,8 @@ describe("model picker state", () => {
       sliderMin: 0,
       sliderMax: 4,
       announcement: "Medium, 2 of 5.",
+      tierSource: "header",
+      sliderPresent: true,
     });
     expect(formatModelPickerState(state)).toBe('model "GPT-6", tier "Medium", slider 1 (0-4)');
   });

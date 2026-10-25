@@ -166,6 +166,10 @@ describe("select-only check", () => {
       "a picker whose effort slider never mounted",
       { ...MEDIUM, sliderValue: null, tierLabel: null },
     ],
+    [
+      "a picker whose tier is only named by an announcement",
+      { ...MEDIUM, sliderValue: null, tierSource: "announcement" as const },
+    ],
   ])("changes nothing when the starting point is incomplete (%s)", async (_case, before) => {
     picker.readModelPickerState.mockResolvedValueOnce(before);
     const applySelection = vi.fn(async () => undefined);
