@@ -16,6 +16,27 @@ export const APP_APPROVAL_ALLOW_LABELS: ReadonlyArray<{ label: string; rank: num
   { label: "허용", rank: 2 },
 ];
 
+export interface AppApprovalVocabulary {
+  /** Whole labels and their rank (lower wins). */
+  exact: ReadonlyArray<{ label: string; rank: number }>;
+  /** Label beginnings that make an allow button when the label ends there or goes on with a non-letter. */
+  prefixes: ReadonlyArray<{ prefix: string; rank: number }>;
+  /** A label (or aria-label) containing any of these is never an allow button. */
+  deny: readonly string[];
+}
+
+/** What counts as an allow button, compared case-folded with whitespace collapsed. */
+export const APP_APPROVAL_VOCABULARY: AppApprovalVocabulary = {
+  exact: APP_APPROVAL_ALLOW_LABELS,
+  // Longest first, so "Always allow for this chat" ranks as Always allow.
+  prefixes: [
+    { prefix: "always allow", rank: 0 },
+    { prefix: "allow", rank: 2 },
+    { prefix: "허용", rank: 2 },
+  ],
+  deny: ["don't", "do not", "deny", "not now", "cancel", "거부", "허용 안", "허용하지", "취소"],
+};
+
 export interface AppApprovalCard {
   /** Stable text key for "log once" bookkeeping. */
   key: string;
@@ -35,12 +56,15 @@ export interface AppApprovalCard {
  * message or assistant prose. Its card is the nearest ancestor with text of its own, and the
  * allowed app must be named in the card's title (heading, aria-labelledby/aria-label text, or
  * else its first line), so tool arguments shown in another app's card that mention an allowed
- * app cannot approve that card. Injected into the page with Function.prototype.toString.
+ * app cannot approve that card. A button's label is its rendered text without shortcut hints
+ * (kbd, trailing key glyphs or key names), icons and hidden parts, or else its aria-label; it is
+ * an allow button by a whole known label or a known beginning, never when it holds a deny word.
+ * Injected into the page with Function.prototype.toString.
  */
 export function scanAppApprovalCards(
   doc: Document,
   allowApps: readonly string[],
-  labels: ReadonlyArray<{ label: string; rank: number }>,
+  vocabulary: AppApprovalVocabulary,
 ): { cards: AppApprovalCard[]; buttons: Element[] } {
   const normalize = (value: unknown): string =>
     String(value ?? "")
@@ -61,12 +85,78 @@ export function scanAppApprovalCards(
   const OFF_LIMITS = `${PROSE}, ${USER}, form, [contenteditable="true"], [role="textbox"], [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
   const PAGE_CHROME = 'nav, aside, header, [data-testid*="sidebar" i]';
   const ARGUMENTS = "code, pre, samp, kbd";
-  // textContent avoids a layout pass per button on every poll.
-  const label = (button: Element): string =>
-    normalize(button.textContent) || normalize(button.getAttribute("aria-label"));
-  const rankOf = (button: Element): number => {
-    const text = label(button).toLowerCase();
-    return labels.find((entry) => entry.label === text)?.rank ?? -1;
+  // Buttons whose text and aria-label hold no allow word are skipped before any layout query.
+  const hints = [
+    ...vocabulary.exact.map((entry) => entry.label),
+    ...vocabulary.prefixes.map((entry) => entry.prefix),
+  ];
+  const mayAllow = (button: Element): boolean => {
+    const quick = `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""}`;
+    const folded = normalize(quick).toLowerCase();
+    return hints.some((hint) => folded.includes(hint));
+  };
+  // Shortcut hints and icons are not part of a button's name: "Always allow ⌘⏎" is Always allow.
+  const NOT_LABEL = 'kbd, svg, [aria-hidden="true"], [hidden]';
+  const shortcutTails = [
+    /[\s+]*[⌘⌥⇧⌃⏎↵↩⎋⌫⌦⇥⇤␣]+$/,
+    /(?:^|[\s+⌘⌥⇧⌃])(?:ctrl|control|cmd|command|alt|opt|option|shift|meta|enter|return|esc|escape|tab|space|backspace|delete|del)$/i,
+    /(?:[⌘⌥⇧⌃]|(?:^|\s)(?:ctrl|control|cmd|command|alt|opt|option|shift|meta))\s*\+?\s*[a-z0-9]$/i,
+    /\s*\+$/,
+  ];
+  const withoutShortcut = (text: string): string => {
+    let current = text;
+    for (;;) {
+      const next = shortcutTails.reduce((value, tail) => value.replace(tail, ""), current).trim();
+      if (!next || next === current) return current;
+      current = next;
+    }
+  };
+  /** The button's rendered text without hints and icons, or else its aria-label. */
+  const label = (button: Element): string => {
+    const parts: string[] = [];
+    const walk = (node: Node): void => {
+      if (node.nodeType === 3) {
+        parts.push(node.nodeValue ?? "");
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const element = node as Element;
+      if (element !== button) {
+        if (element.matches(NOT_LABEL)) return;
+        const style = doc.defaultView?.getComputedStyle?.(element);
+        if (style?.display === "none" || style?.visibility === "hidden") return;
+      }
+      const children = (element as { childNodes?: ArrayLike<Node> }).childNodes;
+      if (!children) {
+        parts.push(element.textContent ?? "");
+        return;
+      }
+      for (const child of Array.from(children)) walk(child);
+    };
+    walk(button);
+    return (
+      withoutShortcut(normalize(parts.join(""))) || normalize(button.getAttribute("aria-label"))
+    );
+  };
+  const fold = (value: unknown): string =>
+    normalize(value)
+      .toLowerCase()
+      .replace(/[‘’ʼ`´]/g, "'");
+  const denied = (value: unknown): boolean => {
+    const text = fold(value);
+    return vocabulary.deny.some((word) => text.includes(word));
+  };
+  const rankOf = (button: Element, text: string): number => {
+    if (denied(text) || denied(button.getAttribute("aria-label"))) return -1;
+    const folded = fold(text);
+    const exact = vocabulary.exact.find((entry) => entry.label === folded);
+    if (exact) return exact.rank;
+    for (const { prefix, rank } of vocabulary.prefixes) {
+      if (folded.startsWith(prefix) && !/^[\p{L}\p{N}]/u.test(folded.slice(prefix.length))) {
+        return rank;
+      }
+    }
+    return -1;
   };
   const textOf = (root: Element, skip: string): string => {
     const parts: string[] = [];
@@ -211,23 +301,29 @@ export function scanAppApprovalCards(
       new RegExp(`(^|[^A-Za-z0-9_])${escape(app.trim())}($|[^A-Za-z0-9_])`, "i").test(text),
     ) ?? null;
 
-  const byCard = new Map<Element, { region: Element; best: Element; rank: number }>();
+  const byCard = new Map<
+    Element,
+    { region: Element; best: Element; rank: number; label: string }
+  >();
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
-    if (!visible(button)) continue;
+    if (!mayAllow(button) || !visible(button)) continue;
     if (button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true")
       continue;
-    const rank = rankOf(button);
+    const text = label(button);
+    const rank = rankOf(button, text);
     if (rank < 0) continue;
     const region = regionOf(button);
     if (!region) continue;
     const card = cardOf(button, region);
     if (!card) continue;
     const current = byCard.get(card);
-    if (!current || rank < current.rank) byCard.set(card, { region, best: button, rank });
+    if (!current || rank < current.rank) {
+      byCard.set(card, { region, best: button, rank, label: text });
+    }
   }
   const cards: AppApprovalCard[] = [];
   const buttons: Element[] = [];
-  for (const [card, { region, best, rank }] of byCard.entries()) {
+  for (const [card, { region, best, rank, label: bestLabel }] of byCard.entries()) {
     // The title is the first candidate present; a later line naming the app does not count.
     const title = titlesOf(card, region)[0] ?? "";
     const text = textOf(card, `${BUTTON}, ${PROSE}, ${USER}`);
@@ -237,7 +333,7 @@ export function scanAppApprovalCards(
       app: names(title),
       title: title.slice(0, 200),
       toolText: text.slice(0, 500),
-      button: { label: label(best), rank, index: buttons.length - 1 },
+      button: { label: bestLabel, rank, index: buttons.length - 1 },
     });
   }
   return { cards, buttons };
@@ -249,7 +345,7 @@ export function buildAppApprovalScanExpression(
 ): string {
   return `(() => {
     const scan = ${scanAppApprovalCards.toString()};
-    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_ALLOW_LABELS)});
+    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
     window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons };
     return cards;
   })()`;
@@ -268,7 +364,7 @@ export function buildAppApprovalLocate(
     const stored = window.__oracleApprovalButtons?.token === ${JSON.stringify(token)} ? window.__oracleApprovalButtons.nodes[${card.button.index}] ?? null : null;
     if (!stored || !stored.isConnected) return null;
     const scan = ${scanAppApprovalCards.toString()};
-    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_ALLOW_LABELS)});
+    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
     const now = cards[buttons.indexOf(stored)];
     return now && now.app === ${JSON.stringify(card.app)} && now.button.label === ${JSON.stringify(card.button.label)} ? stored : null;
   }`;

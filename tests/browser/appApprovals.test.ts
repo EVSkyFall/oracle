@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import {
-  APP_APPROVAL_ALLOW_LABELS,
+  APP_APPROVAL_VOCABULARY,
   buildAppApprovalLocate,
   scanAppApprovalCards,
   startAppApprovalMonitor,
@@ -12,8 +12,95 @@ const scan = (children: DomNode[], allowApps = ["CODEXish"]) =>
   scanAppApprovalCards(
     new FakeDocument(children) as unknown as Document,
     allowApps,
-    APP_APPROVAL_ALLOW_LABELS,
+    APP_APPROVAL_VOCABULARY,
   ).cards;
+
+describe("app approval button labels", () => {
+  const cardWith = (...buttons: DomNode[]) => [
+    new DomNode("div", { role: "dialog" }, [
+      new DomNode("p", {}, ["Allow CODEXish to run echo?"]),
+      new DomNode("div", {}, buttons),
+    ]),
+  ];
+  const chosen = (...buttons: DomNode[]) => scan(cardWith(...buttons))[0]?.button ?? null;
+
+  test("shortcut hints, icons and hidden parts are not part of the label", () => {
+    expect(
+      chosen(new DomNode("button", {}, ["항상 허용", new DomNode("kbd", {}, ["⌘⏎"])])),
+    ).toMatchObject({ label: "항상 허용", rank: 0 });
+    expect(
+      chosen(
+        new DomNode("button", {}, [
+          new DomNode("svg", {}, [new DomNode("title", {}, ["check"])]),
+          "Always allow",
+        ]),
+      ),
+    ).toMatchObject({ label: "Always allow", rank: 0 });
+    expect(
+      chosen(
+        new DomNode("button", {}, [
+          new DomNode("span", { "aria-hidden": "true" }, ["✓ "]),
+          "Allow once",
+          new DomNode("span", { hidden: "" }, [" (Enter)"]),
+        ]),
+      ),
+    ).toMatchObject({ label: "Allow once", rank: 1 });
+  });
+
+  test.each([
+    ["Allow once ⌘↵", "Allow once", 1],
+    ["Always allow Ctrl+Enter", "Always allow", 0],
+    ["한 번만 허용 Enter", "한 번만 허용", 1],
+    ["Allow ⌘1", "Allow", 2],
+    ["Allow for this chat", "Allow for this chat", 2],
+    ["Always allow for this chat", "Always allow for this chat", 0],
+    ["허용 (이 채팅)", "허용 (이 채팅)", 2],
+    ["  ALWAYS   ALLOW ", "ALWAYS ALLOW", 0],
+  ])("accepts %j as %j at rank %i", (text, label, rank) => {
+    expect(chosen(button(text))).toEqual({ label, rank, index: 0 });
+  });
+
+  test("an icon-only button is named by its aria-label", () => {
+    expect(
+      chosen(new DomNode("button", { "aria-label": "Always allow" }, [new DomNode("svg")])),
+    ).toMatchObject({ label: "Always allow", rank: 0 });
+  });
+
+  test.each([
+    "Allowed",
+    "Allowance",
+    "허용됨",
+    "Don't allow",
+    "Don’t allow",
+    "Do not allow",
+    "Allow, don't ask again",
+    "Deny",
+    "Not now",
+    "Cancel",
+    "거부 Esc",
+    "허용 안 함",
+    "허용하지 않음",
+    "취소",
+    "Approve",
+    "Continue",
+  ])("never accepts %j", (text) => {
+    expect(chosen(button(text))).toBeNull();
+  });
+
+  test("a deny aria-label wins over an allow-looking text", () => {
+    expect(chosen(new DomNode("button", { "aria-label": "Don't allow" }, ["Allow"]))).toBeNull();
+  });
+
+  test("keeps the strongest acceptable button of the card", () => {
+    expect(
+      chosen(
+        button("Deny"),
+        button("Allow for this chat"),
+        new DomNode("button", {}, ["Allow once", new DomNode("kbd", {}, ["⏎"])]),
+      ),
+    ).toMatchObject({ label: "Allow once", rank: 1 });
+  });
+});
 
 describe("app approval cards", () => {
   test("approves a Korean CODEXish prompt with its strongest allow button", () => {
