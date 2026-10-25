@@ -1516,6 +1516,138 @@ describe("waitForDeepResearchCompletion", () => {
     expect(result.text).toBe(report.candidateText);
   });
 
+  describe("structural completion never counts progress", () => {
+    const report = {
+      completed: false,
+      inProgress: true,
+      textLength: 420,
+      structuralComplete: true,
+      candidateText: "Node.js 24 (Krypton) is the Active LTS line until 2028-04-30.",
+    };
+
+    it("a stable report-shaped frame waits while the page still shows its stop button", async () => {
+      let polls = 0;
+      mockRuntime.evaluate.mockImplementation(async () => {
+        polls += 1;
+        return {
+          result: {
+            value: {
+              ...ack,
+              hasIframe: true,
+              deepResearchFrameInScope: true,
+              stopVisible: polls <= 6,
+            },
+          },
+        };
+      });
+      const result = await waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        1_000,
+        0,
+        undefined,
+        frameClient([report]) as never,
+        { targetBaselineCaptured: true },
+      );
+      expect(result.text).toBe(report.candidateText);
+      // Three stable polls after the stop button went away, never before.
+      expect(polls).toBeGreaterThanOrEqual(9);
+    });
+
+    it("a frame that shows progress never completes structurally", async () => {
+      mockRuntime.evaluate.mockResolvedValue({
+        result: { value: { ...ack, hasIframe: true, deepResearchFrameInScope: true } },
+      });
+      await expect(
+        waitForDeepResearchCompletion(
+          mockRuntime as never,
+          mockLogger,
+          1_000,
+          0,
+          undefined,
+          frameClient([{ ...report, progressActive: true }]) as never,
+          { targetBaselineCaptured: true },
+        ),
+      ).rejects.toMatchObject({ details: { code: "deep-research-timeout" } });
+    });
+
+    // A research target with two frames: the report in "root" (isolated world) and the outer
+    // frame (no context id).
+    const twoFrameClient = (outer: Record<string, unknown>) => {
+      const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+      return {
+        on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+          listeners.set(event, listener);
+        }),
+        removeListener: vi.fn(),
+        send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+          if (
+            method === "Target.setAutoAttach" &&
+            (params as { autoAttach?: boolean })?.autoAttach
+          ) {
+            listeners.get("Target.attachedToTarget")?.({
+              sessionId: "deep-session",
+              targetInfo: {
+                type: "iframe",
+                url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+              },
+            });
+            return {};
+          }
+          if (method === "Page.getFrameTree" && sessionId === "deep-session") {
+            return { frameTree: { frame: { id: "root-frame", name: "root", url: "about:blank" } } };
+          }
+          if (method === "Page.createIsolatedWorld" && sessionId === "deep-session") {
+            return { executionContextId: 7 };
+          }
+          if (method === "Runtime.evaluate" && sessionId === "deep-session") {
+            const inRoot = (params as { contextId?: number }).contextId === 7;
+            return { result: { value: inRoot ? report : outer } };
+          }
+          return {};
+        }),
+      };
+    };
+
+    it("a report-shaped root frame is kept over a later progress read of the outer frame", async () => {
+      mockRuntime.evaluate.mockResolvedValue({
+        result: { value: { ...ack, hasIframe: true, deepResearchFrameInScope: true } },
+      });
+      const result = await waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        1_000,
+        0,
+        undefined,
+        twoFrameClient({ completed: false, inProgress: true, textLength: 12 }) as never,
+        { targetBaselineCaptured: true },
+      );
+      expect(result.text).toBe(report.candidateText);
+    });
+
+    it("another frame of the research showing progress keeps the report from counting", async () => {
+      mockRuntime.evaluate.mockResolvedValue({
+        result: { value: { ...ack, hasIframe: true, deepResearchFrameInScope: true } },
+      });
+      await expect(
+        waitForDeepResearchCompletion(
+          mockRuntime as never,
+          mockLogger,
+          1_000,
+          0,
+          undefined,
+          twoFrameClient({
+            completed: false,
+            inProgress: true,
+            textLength: 12,
+            progressActive: true,
+          }) as never,
+          { targetBaselineCaptured: true },
+        ),
+      ).rejects.toMatchObject({ details: { code: "deep-research-timeout" } });
+    });
+  });
+
   it("a reattach that finds the acknowledgement and the report extracts at once, with the frame still there", async () => {
     // Already finished: two assistant turns after the prompt, the frame mounted but unreadable.
     mockRuntime.evaluate.mockResolvedValueOnce({
@@ -2750,7 +2882,7 @@ describe("waitForDeepResearchCompletion", () => {
     const expression = buildDeepResearchFrameStatusExpressionForTest();
     const run = (
       innerText: string,
-      extra: { headings?: number; links?: number; progress?: boolean } = {},
+      extra: { headings?: number; links?: number; prose?: number; progress?: boolean } = {},
     ) =>
       new vm.Script(expression).runInNewContext({
         document: {
@@ -2758,10 +2890,13 @@ describe("waitForDeepResearchCompletion", () => {
           querySelector: (selector: string) =>
             extra.progress && selector.includes("progressbar") ? {} : null,
           querySelectorAll: (selector: string) => {
-            if (selector === 'a[href^="http"]')
-              return Array.from({ length: extra.links ?? 0 }, () => ({}));
-            if (selector === "h1, h2, h3, h4")
-              return Array.from({ length: extra.headings ?? 0 }, () => ({}));
+            const nodes = (count: number | undefined, textContent = "") =>
+              Array.from({ length: count ?? 0 }, () => ({ textContent, closest: () => null }));
+            if (selector === 'a[href^="http"]') return nodes(extra.links);
+            if (selector === "h1, h2, h3, h4") return nodes(extra.headings);
+            if (selector === "p, li, blockquote, td") {
+              return nodes(extra.prose, "A paragraph of the report with enough words.");
+            }
             return [];
           },
         },
@@ -2776,12 +2911,18 @@ describe("waitForDeepResearchCompletion", () => {
       run(`리서치 완료 · 3 citations
 ${body}`),
     ).toMatchObject({ completed: true, text: body });
-    expect(run(body, { headings: 1, links: 3 })).toMatchObject({
+    expect(run(body, { prose: 3 })).toMatchObject({
       completed: false,
       structuralComplete: true,
       candidateText: body,
     });
-    expect(run(body, { headings: 1, links: 3, progress: true }).structuralComplete).toBe(false);
+    expect(run(body, { prose: 2, headings: 1 }).structuralComplete).toBe(true);
+    // One progress sentence with a heading and source links is not a report.
+    expect(run(body, { prose: 1, headings: 1, links: 3 }).structuralComplete).toBe(false);
+    expect(run(body, { prose: 3, progress: true })).toMatchObject({
+      structuralComplete: false,
+      progressActive: true,
+    });
     expect(run(body).structuralComplete).toBe(false);
   });
 

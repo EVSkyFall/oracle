@@ -517,7 +517,18 @@ export async function waitForDeepResearchCompletion(
       };
     }
     // A frame report without a known banner (localized UI, renamed banner) once it is stable.
-    if (read && !read.completed && read.structuralComplete && read.candidateText) {
+    // Stability only counts while nothing shows progress: not the page (its stop button, an
+    // active research in this turn) and not the frame.
+    const progressShown = Boolean(
+      val?.stopVisible || val?.hasActiveScopedResearch || read?.progressActive,
+    );
+    if (
+      read &&
+      !read.completed &&
+      read.structuralComplete &&
+      read.candidateText &&
+      !progressShown
+    ) {
       const digest = `${read.candidateText.length}:${read.candidateText.slice(-200)}`;
       structural =
         structural?.digest === digest
@@ -660,8 +671,10 @@ interface DeepResearchFrameTree {
 interface DeepResearchFrameStatus {
   completed: boolean;
   inProgress: boolean;
-  /** A report without a known completion banner: citations or headings, no progress shown. */
+  /** A report without a known completion banner: report-shaped prose, no progress shown. */
   structuralComplete?: boolean;
+  /** The frame shows active progress (shimmer, progress bar, busy region, stop control). */
+  progressActive?: boolean;
   candidateText?: string;
   candidateHtml?: string;
   researchStarted?: boolean;
@@ -1143,6 +1156,23 @@ async function readDeepResearchTargetSession(
   }
   const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
   let best: DeepResearchFrameStatus | null = null;
+  let progressActive = false;
+  // A report-shaped candidate is kept over a later progress read; any frame of this target that
+  // shows progress keeps it from counting as complete.
+  const consider = (value: DeepResearchFrameStatus | null) => {
+    if (!value) return;
+    progressActive ||= value.progressActive === true;
+    if (value.structuralComplete && !best?.structuralComplete) {
+      best = value;
+    } else if (
+      !best?.structuralComplete &&
+      ((value.textLength ?? 0) > (best?.textLength ?? 0) || value.inProgress)
+    ) {
+      best = value;
+    }
+  };
+  const settled = (): DeepResearchFrameStatus | null =>
+    best && progressActive ? { ...best, structuralComplete: false, progressActive: true } : best;
 
   for (const frameId of frameIds) {
     const world = (await rawClient
@@ -1167,20 +1197,16 @@ async function readDeepResearchTargetSession(
     if (value?.completed) {
       return { confirmed: true, read: value, frameId: ownerFrameId };
     }
-    if ((value?.textLength ?? 0) > (best?.textLength ?? 0) || value?.inProgress) {
-      best = value;
-    }
+    consider(value);
   }
 
   const topFrameValue = await evaluateDeepResearchFrameStatus(rawClient, sessionId);
   if (topFrameValue?.completed) {
     return { confirmed: true, read: topFrameValue, frameId: ownerFrameId };
   }
-  if ((topFrameValue?.textLength ?? 0) > (best?.textLength ?? 0) || topFrameValue?.inProgress) {
-    best = topFrameValue;
-  }
+  consider(topFrameValue);
 
-  return { confirmed: true, read: best, frameId: ownerFrameId };
+  return { confirmed: true, read: settled(), frameId: ownerFrameId };
 }
 
 async function evaluateDeepResearchFrameStatus(
@@ -1280,6 +1306,8 @@ function buildDeepResearchFrameStatusExpression(): string {
     const rawText = document.body?.innerText || '';
     const html = document.body?.innerHTML || '';
     const cleanText = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    // "Stop research" in the UI languages Oracle knows.
+    const stopPattern = /stop research|停止研究|리서치 중지|연구 중지|リサーチを停止|arrêter la recherche|detener la investigación|detener investigación|recherche stoppen|recherche beenden|recherche abbrechen|recherche anhalten|parar pesquisa|parar a pesquisa|interromper pesquisa|interromper a pesquisa/i;
     const sections = typeof document.querySelectorAll === 'function'
       ? Array.from(document.querySelectorAll('section'))
       : [];
@@ -1296,7 +1324,7 @@ function buildDeepResearchFrameStatusExpression(): string {
       );
       const hasResearchStatus = Boolean(section.querySelector('p.loading-shimmer')) ||
         buttons.some((button) =>
-          /stop research|停止研究/i.test(cleanText(button.getAttribute?.('aria-label')))
+          stopPattern.test(cleanText(button.getAttribute?.('aria-label')))
         );
       return hasPlanAction || hasResearchStatus;
     });
@@ -1314,7 +1342,7 @@ function buildDeepResearchFrameStatusExpression(): string {
     const hasResearchShimmer = Boolean(planSection?.querySelector?.('p.loading-shimmer'));
     const hasStopResearchControl = typeof planSection?.querySelectorAll === 'function' &&
       Array.from(planSection.querySelectorAll('button')).some((button) =>
-        /stop research|停止研究/i.test(cleanText(button.getAttribute?.('aria-label')))
+        stopPattern.test(cleanText(button.getAttribute?.('aria-label')))
       );
     const researchStarted = planSteps.length > 0 && (hasResearchShimmer || hasStopResearchControl);
     const isPlaceholder = (line) => /^(called tool|used tool|użyto narzędzia|narzędzie wywołane)$/i.test(line);
@@ -1352,20 +1380,29 @@ function buildDeepResearchFrameStatusExpression(): string {
       return reportLines.join('\\n').trim();
     };
     const reportText = normalizeReport(rawText);
-    const completed = completionPattern.test(rawText) &&
+    // Active progress: a shimmer, a progress bar, a busy region or a "Stop research" control.
+    const progressIndicator = Boolean(document.querySelector?.('p.loading-shimmer, .loading-shimmer, [role="progressbar"], [aria-busy="true"]')) ||
+      Array.from(document.querySelectorAll?.('button') ?? []).some((button) =>
+        stopPattern.test(cleanText(button.getAttribute?.('aria-label') || button.textContent))
+      );
+    // A completion phrase in the text does not count while the frame still shows progress.
+    const completed = !progressIndicator && completionPattern.test(rawText) &&
       reportText.length >= 40 &&
       !isPlaceholder(reportText);
-    // Structural evidence for a banner Oracle does not know: a report with citations or headings,
-    // no plan panel and no progress indicator. Oracle accepts it once it stays the same over
-    // several polls.
-    const progressIndicator = Boolean(document.querySelector?.('p.loading-shimmer, [role="progressbar"], [aria-busy="true"]')) ||
-      Array.from(document.querySelectorAll?.('button') ?? []).some((button) =>
-        /stop research|停止研究|리서치 중지|연구 중지|リサーチを停止/i.test(cleanText(button.getAttribute?.('aria-label') || button.textContent))
-      );
-    const citations = document.querySelectorAll?.('a[href^="http"]')?.length ?? 0;
-    const headings = document.querySelectorAll?.('h1, h2, h3, h4')?.length ?? 0;
+    // Structural evidence for a banner Oracle does not know, measured in the report region only
+    // (outside the plan panel and every progress or status element): prose blocks, the report's
+    // shape, not its length. One progress sentence with a heading or a source link is not a
+    // report. Oracle accepts it once it stays the same over several polls.
+    const progressUi = '.loading-shimmer, [role="progressbar"], [aria-busy="true"], [role="status"], [aria-live], button, nav';
+    const inReport = (node) => !(planSection && planSection.contains?.(node)) &&
+      !(typeof node.closest === 'function' && node.closest(progressUi));
+    const inRegion = (selector) => Array.from(document.querySelectorAll?.(selector) ?? []).filter(inReport);
+    const proseBlocks = inRegion('p, li, blockquote, td').filter((node) => cleanText(node.textContent).length >= 20).length;
+    const citations = inRegion('a[href^="http"]').length;
+    const headings = inRegion('h1, h2, h3, h4').length;
+    const reportShape = proseBlocks >= 3 || (proseBlocks >= 2 && (citations > 0 || headings > 0));
     const structuralComplete = !completed && !planSection && !progressIndicator &&
-      reportText.length >= 40 && !isPlaceholder(reportText) && (citations > 0 || headings > 0);
+      reportText.length >= 40 && !isPlaceholder(reportText) && reportShape;
     const inProgress = /researching|badanie|searching|searches|wyszukiwa|citation|cytat|source|źród|reading|completed|ukończone/i.test(rawText);
     return {
       completed,
@@ -1380,6 +1417,7 @@ function buildDeepResearchFrameStatusExpression(): string {
       structuralComplete,
       candidateText: structuralComplete ? reportText : undefined,
       candidateHtml: structuralComplete ? html : undefined,
+      progressActive: progressIndicator,
     };
   })()`;
 }
