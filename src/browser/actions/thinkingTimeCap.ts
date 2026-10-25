@@ -42,12 +42,12 @@ export function browserThinkingCapSteps(
   logger: BrowserLogger,
 ): ThinkingCapSteps {
   return {
-    read: () => readModelPickerState(runtime, input),
+    read: () => readModelPickerState(runtime, input, logger),
     select: async (level) => {
       await ensureThinkingTime(runtime, level, logger, null);
     },
     stepDown: async (level) => {
-      const result = await lowerModelPickerTier(runtime, input, level);
+      const result = await lowerModelPickerTier(runtime, input, level, logger);
       if (!result.lowered) {
         logger(`${LOG_PREFIX} (${level}): slider steps did not lower it (${result.detail}).`);
       }

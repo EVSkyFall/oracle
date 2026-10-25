@@ -120,7 +120,7 @@ export async function runSelectOnlyCheck(
     requestedThinkingTime: options.requestedThinkingTime,
     ...(options.maxThinkingTime ? { maxThinkingTime: options.maxThinkingTime } : {}),
   });
-  const before = await readModelPickerState(runtime, input).catch(() => null);
+  const before = await readModelPickerState(runtime, input, logger).catch(() => null);
   logger(`[browser] Select-only: before: ${formatModelPickerState(before)}.`);
   if (!isCompletePickerState(before)) {
     // Without the previous model and effort nothing could be restored, so nothing is changed.
@@ -151,7 +151,7 @@ export async function runSelectOnlyCheck(
   return withoutBrowserCancellation(async () => {
     await page.settle();
     // A failed read must not skip the restore below.
-    const selected = await readModelPickerState(runtime, input).catch(() => null);
+    const selected = await readModelPickerState(runtime, input, logger).catch(() => null);
     const { model, thinking, thinkingCap } = options.readEvidence();
     const problems: string[] = [];
     if (selectionError) problems.push(selectionError);

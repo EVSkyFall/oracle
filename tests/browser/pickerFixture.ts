@@ -85,7 +85,8 @@ export function pickerFixture(
     event.preventDefault();
     state.value = Math.max(0, Math.min(4, state.value + delta)); render();
   });
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && event.isTrusted) { state.open = false; state.view = 'effort'; render(); } });
+  // window.ignoreEscape = true: a menu that Escape does not close (its button still toggles it).
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && event.isTrusted && !window.ignoreEscape) { state.open = false; state.view = 'effort'; render(); } });
   render();
 </script></body></html>`;
 }

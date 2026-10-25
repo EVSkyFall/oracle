@@ -206,7 +206,9 @@ describe("picker evidence", () => {
     await expect(
       readModelPickerEvidence(runtime as never, undefined, logger),
     ).resolves.toMatchObject({ readable: false });
+    // The evidence is one line; the attempt to leave no menu open reports its own failure.
     expect(lines).toEqual([
+      "[browser] Model picker: closing the menu failed (Target closed).",
       "[browser] Model picker evidence: picker unreadable (reading it failed: Target closed).",
     ]);
   });

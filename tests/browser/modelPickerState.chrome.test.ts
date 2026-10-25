@@ -170,6 +170,36 @@ describe.runIf(enabled)("model picker snapshot and restore in real Chrome", () =
     });
   }, 60_000);
 
+  test("a read that fails after opening leaves no menu over the composer", async () => {
+    await withPicker(fixture("horizontal", false, true), async (client) => {
+      const runtime = new Proxy(client.Runtime, {
+        get(target, key, receiver) {
+          if (key !== "evaluate") return Reflect.get(target, key, receiver);
+          return (params: { expression: string }) =>
+            params.expression.includes("return __readPickerState();")
+              ? Promise.reject(new Error("transport hiccup"))
+              : target.evaluate(params);
+        },
+      });
+      await expect(readModelPickerState(runtime, client.Input)).rejects.toThrow(/hiccup/);
+      expect((await pickerState(client)).open).toBe(false);
+    });
+  }, 60_000);
+
+  test("a menu that Escape does not close is closed with its own button", async () => {
+    await withPicker(fixture("horizontal", false, true), async (client) => {
+      await client.Runtime.evaluate({ expression: "window.ignoreEscape = true" });
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      await expect(
+        readModelPickerState(client.Runtime, client.Input, logger),
+      ).resolves.toMatchObject({ modelLabel: "GPT-6", tierLabel: "Medium" });
+      expect((await pickerState(client)).open).toBe(false);
+      expect(logger).toHaveBeenCalledWith(
+        "[browser] Model picker: Escape did not close the menu; closed it with its button.",
+      );
+    });
+  }, 60_000);
+
   test("a restore target without its effort is never reported as restored", async () => {
     const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-picker-fixture-"));
     const chrome = await chromeLauncher.launch({
