@@ -118,6 +118,78 @@ describe.runIf(enabled)("thinking-time cap in real Chrome", () => {
     });
   }, 90_000);
 
+  test("a header that trails the slider never hides Pro: the slider text wins and is lowered", async () => {
+    await withPage(
+      pickerFixture("horizontal", false, true, 0, "default", { valueText: true }),
+      async (client) => {
+        await client.Runtime.evaluate({
+          expression:
+            "window.setPicker('GPT-6', 3); window.freezeHeader = true; window.setPicker('GPT-6', 4)",
+        });
+        const logger = quietLogger();
+        const check = await enforceThinkingTimeCap(
+          "extra-high",
+          browserThinkingCapSteps(client.Runtime, client.Input, logger),
+          logger,
+        );
+        expect(check).toMatchObject({
+          status: "lowered",
+          before: {
+            tierLabel: "Extra High",
+            sliderValue: 4,
+            tierReadings: [
+              { label: "Extra High", source: "header" },
+              { label: "Pro", source: "valuetext" },
+            ],
+          },
+          after: { sliderValue: 3 },
+        });
+        expect((await pickerState(client)).value).toBe(3);
+      },
+    );
+  }, 90_000);
+
+  test("a localized tier header on Pro is found by structure and lowered, not read as unreadable", async () => {
+    await withPage(
+      pickerFixture("horizontal", false, true, 0, "localized-header"),
+      async (client) => {
+        await client.Runtime.evaluate({ expression: "window.setPicker('GPT-6', 4)" });
+        const logger = quietLogger();
+        await expect(
+          enforceThinkingTimeCap(
+            "extra-high",
+            browserThinkingCapSteps(client.Runtime, client.Input, logger),
+            logger,
+          ),
+        ).resolves.toMatchObject({
+          status: "lowered",
+          before: { tierLabel: "Pro" },
+          after: { tierLabel: "Extra High", sliderValue: 3 },
+        });
+        expect((await pickerState(client)).value).toBe(3);
+      },
+    );
+  }, 90_000);
+
+  test("a localized header that names no tier leaves the tier to the slider text", async () => {
+    await withPage(
+      pickerFixture("horizontal", false, true, 0, "localized-header", {
+        valueText: true,
+        headerLabel: "모델",
+      }),
+      async (client) => {
+        await client.Runtime.evaluate({ expression: "window.setPicker('GPT-6', 2)" });
+        const logger = quietLogger();
+        await expect(
+          readModelPickerEvidence(client.Runtime, client.Input, logger),
+        ).resolves.toMatchObject({
+          tierReadings: [{ label: "High", source: "valuetext" }],
+          sliderValue: 2,
+        });
+      },
+    );
+  }, 60_000);
+
   test("a page without a readable picker is sent with a warning", async () => {
     await withPage(
       `<!doctype html><html><body><form><div contenteditable="true" role="textbox"></div></form></body></html>`,

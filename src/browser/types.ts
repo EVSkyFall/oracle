@@ -205,8 +205,18 @@ export interface BrowserModelPickerState {
    * announcement (which can be stale, so it never counts as the current tier).
    */
   tierSource?: "header" | "valuetext" | "announcement" | null;
+  /**
+   * Every current source that names a known tier (the tier header, the slider's aria-valuetext).
+   * They can disagree right after a change; the maximum-thinking-time check uses the highest.
+   */
+  currentTiers?: BrowserModelPickerTierReading[];
   /** Whether the menu has an effort slider at all (mounted or not). */
   sliderPresent?: boolean;
+}
+
+export interface BrowserModelPickerTierReading {
+  label: string;
+  source: "header" | "valuetext";
 }
 
 /** Outcome of a select-only check. */

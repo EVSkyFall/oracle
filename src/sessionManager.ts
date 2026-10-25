@@ -204,6 +204,8 @@ export interface BrowserModelPickerEvidence {
   modelLabel: string | null;
   /** From the picker's tier header or slider text; null when only a live announcement named it. */
   tierLabel: string | null;
+  /** Each current source that named a known tier, when it was read (header, slider text). */
+  tierReadings?: Array<{ label: string; source: "header" | "valuetext" }>;
   sliderValue: number | null;
   sliderMin?: number | null;
   sliderMax?: number | null;

@@ -82,6 +82,7 @@ describe("model picker state", () => {
       sliderMax: 4,
       announcement: "Medium, 2 of 5.",
       tierSource: "header",
+      currentTiers: [],
       sliderPresent: true,
     });
     expect(formatModelPickerState(state)).toBe('model "GPT-6", tier "Medium", slider 1 (0-4)');
@@ -208,5 +209,78 @@ describe("picker evidence", () => {
     expect(lines).toEqual([
       "[browser] Model picker evidence: picker unreadable (reading it failed: Target closed).",
     ]);
+  });
+});
+
+describe("tier header and current tier sources", () => {
+  const slider = (attributes: Record<string, string>) =>
+    new FakeElement("div", { role: "menuitem", "aria-label": "Power" }, [
+      new FakeElement("span", {
+        role: "slider",
+        "aria-valuemin": "0",
+        "aria-valuemax": "4",
+        ...attributes,
+      }),
+    ]);
+  const readMenu = (children: FakeElement[], announcement = "") => {
+    const menu = new FakeElement("div", { role: "menu" }, children);
+    const live = new FakeElement("div", { "aria-live": "polite" }, [], announcement);
+    return readModelPickerMenuState(
+      new FakeDocument([menu, live]) as unknown as Document,
+      null,
+      menu as unknown as Element,
+      thinkingLevelFromTierLabel,
+    );
+  };
+
+  test("finds a localized tier header by structure, never an item placed before it", () => {
+    const withPopup = readMenu(
+      [
+        new FakeElement("div", { role: "menuitem" }, [], "임시 채팅"),
+        new FakeElement("div", { role: "menuitem", "aria-haspopup": "menu" }, [], "Pro"),
+        slider({ "aria-valuenow": "4" }),
+      ],
+      "Medium, 2 of 5.",
+    );
+    expect(withPopup).toMatchObject({ tierLabel: "Pro", tierSource: "header" });
+    const beforeSlider = readMenu([
+      new FakeElement("div", { role: "menuitem" }, [], "Temporary chat"),
+      new FakeElement("div", { role: "menuitem" }, [], "Pro"),
+      slider({ "aria-valuenow": "4" }),
+    ]);
+    expect(beforeSlider).toMatchObject({ tierLabel: "Pro", tierSource: "header" });
+  });
+
+  test("a header and slider text that disagree are both kept, and the highest one counts", async () => {
+    const { highestCurrentTierLevel, currentTierLevel } =
+      await import("../../src/browser/actions/modelPickerState.js");
+    const state = readMenu([
+      new FakeElement("div", { role: "menuitem", "aria-label": "Select model" }, [], "Extra High"),
+      slider({ "aria-valuenow": "4", "aria-valuetext": "Pro" }),
+    ]);
+    expect(state.currentTiers).toEqual([
+      { label: "Extra High", source: "header" },
+      { label: "Pro", source: "valuetext" },
+    ]);
+    expect(currentTierLevel(state)).toBe("extra-high");
+    expect(highestCurrentTierLevel(state)).toBe("pro");
+    expect(formatModelPickerState(state)).toBe(
+      'model "unknown", tier "Extra High" (slider text "Pro"), slider 4 (0-4)',
+    );
+  });
+
+  test("a localized header that names no tier leaves the tier to the slider text", async () => {
+    const { highestCurrentTierLevel } =
+      await import("../../src/browser/actions/modelPickerState.js");
+    const state = readMenu(
+      [
+        new FakeElement("div", { role: "menuitem" }, [], "임시 채팅"),
+        new FakeElement("div", { role: "menuitem", "aria-haspopup": "menu" }, [], "모델"),
+        slider({ "aria-valuenow": "4", "aria-valuetext": "Pro" }),
+      ],
+      "Medium, 2 of 5.",
+    );
+    expect(state.currentTiers).toEqual([{ label: "Pro", source: "valuetext" }]);
+    expect(highestCurrentTierLevel(state)).toBe("pro");
   });
 });

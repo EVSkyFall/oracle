@@ -8,6 +8,11 @@ export function pickerFixture(
   layered: boolean,
   sliderDelayMs = 0,
   variant: PickerFixtureVariant = "default",
+  // The slider names its tier in aria-valuetext. window.freezeHeader = true keeps the header on
+  // the tier it shows, so the header can trail the slider as it may right after a change.
+  // headerLabel: the header shows this text instead of the tier (a localized word Oracle does
+  // not know), so only the slider names the tier.
+  options: { valueText?: boolean; headerLabel?: string } = {},
 ): string {
   // Layered mirrors chatgpt.com (2026-10-25): the model radios sit under the effort panel and
   // its "Select model" header brings them to the front.
@@ -49,8 +54,9 @@ export function pickerFixture(
     $('picker').setAttribute('aria-expanded', String(state.open));
     $('menu').style.display = state.open ? 'block' : 'none';
     $('models').style.zIndex = state.view === 'models' ? '3' : '1';
-    if ($('tier')) $('tier').textContent = tiers[state.value];
+    if ($('tier') && !window.freezeHeader) $('tier').textContent = ${JSON.stringify(options.headerLabel ?? null)} ?? tiers[state.value];
     $('slider')?.setAttribute('aria-valuenow', String(state.value));
+    if (${options.valueText === true}) $('slider')?.setAttribute('aria-valuetext', tiers[state.value]);
     for (const radio of document.querySelectorAll('[role="menuitemradio"]')) radio.setAttribute('aria-checked', String(radio.dataset.model === state.model));
     // no-effort: the live region keeps an old announcement.
     if (${variant === "no-effort"} && $('live').textContent) return;

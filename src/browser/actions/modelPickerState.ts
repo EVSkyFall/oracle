@@ -88,11 +88,22 @@ export function readModelPickerMenuState(
   const slider = menu
     ? (Array.from(menu.querySelectorAll('[role="slider"]')).find(visible) ?? null)
     : null;
-  const tierItem = menu
-    ? Array.from(menu.querySelectorAll('[role="menuitem"]')).find(
+  const items = menu
+    ? Array.from(menu.querySelectorAll('[role="menuitem"]')).filter(
         (item) => visible(item) && !item.querySelector('[role="slider"]') && firstLine(item),
       )
-    : undefined;
+    : [];
+  // The tier header, found as the model list opener is: its English label, then structure (the
+  // item that opens a sub-list, the item right before the slider), then the first item.
+  let beforeSlider: Element | undefined;
+  for (const item of items) {
+    if (slider && item.compareDocumentPosition(slider) & 4) beforeSlider = item;
+  }
+  const tierItem =
+    items.find((item) => /select model/i.test(item.getAttribute("aria-label") ?? "")) ??
+    items.find((item) => item.hasAttribute("aria-haspopup")) ??
+    beforeSlider ??
+    items[0];
   const announcements = Array.from(doc.querySelectorAll('[aria-live], [role="status"]'))
     .map((node) => flatText(node))
     .filter((text): text is string => Boolean(text) && (text as string).length <= 120);
@@ -130,6 +141,16 @@ export function readModelPickerMenuState(
         ? { label: spoken[0].label, source: "announcement" as Source }
         : null;
   const tierLabel = known?.label ?? fallback?.label ?? null;
+  // Every current source that names a known tier: the header's first such line and the slider's
+  // text. They can disagree for a moment after a change; callers that must not miss a higher tier
+  // look at all of them.
+  const headerTier = headerLines.find((label) => levelOf(label));
+  const currentTiers = [
+    ...(headerTier ? [{ label: headerTier, source: "header" as const }] : []),
+    ...(valueText && levelOf(valueText)
+      ? [{ label: valueText, source: "valuetext" as const }]
+      : []),
+  ];
   return {
     pickerLabel: flatText(button),
     modelLabel: firstLine(checked),
@@ -142,6 +163,7 @@ export function readModelPickerMenuState(
     sliderMax: numberAttr(slider, "aria-valuemax"),
     announcement,
     tierSource: known?.source ?? fallback?.source ?? null,
+    currentTiers,
     sliderPresent: Boolean(menu?.querySelector('[role="slider"]')),
   };
 }
@@ -245,6 +267,27 @@ export function currentTierLevel(
   return thinkingLevelFromTierLabel(state.tierLabel);
 }
 
+/**
+ * The highest known tier any current source shows (the tier header, the slider's text). A stale
+ * announcement never counts; null when no current source names a known tier.
+ */
+export function highestCurrentTierLevel(
+  state: BrowserModelPickerState | null | undefined,
+): ThinkingTimeLevel | null {
+  if (!state) return null;
+  const levels = [
+    ...(state.currentTiers ?? []).map((reading) => thinkingLevelFromTierLabel(reading.label)),
+    currentTierLevel(state),
+  ].filter((level): level is ThinkingTimeLevel => level !== null);
+  let highest: ThinkingTimeLevel | null = null;
+  for (const level of levels) {
+    if (highest === null || (LEVEL_RANK[level] ?? -1) > (LEVEL_RANK[highest] ?? -1)) {
+      highest = level;
+    }
+  }
+  return highest;
+}
+
 /** Whether a picker reading has both the model and the effort it shows. */
 export function isCompletePickerState(
   state: BrowserModelPickerState | null | undefined,
@@ -298,6 +341,9 @@ export function modelPickerEvidence(
     sliderValue,
     sliderMin: state?.sliderMin ?? null,
     sliderMax: state?.sliderMax ?? null,
+    ...(state?.currentTiers?.length
+      ? { tierReadings: state.currentTiers.map((reading) => ({ ...reading })) }
+      : {}),
     readable: Boolean(state?.modelLabel || tierLabel || sliderValue !== null),
     source: "chatgpt-model-picker",
     capturedAt: new Date().toISOString(),
@@ -520,7 +566,7 @@ export async function lowerModelPickerTier(
       const state = await readOpenStateWhenMounted(runtime);
       const value = state?.sliderValue ?? null;
       if (value === null) return { lowered: false, detail: "the effort slider is not mounted" };
-      const shown = currentTierLevel(state);
+      const shown = highestCurrentTierLevel(state);
       const rank = shown ? LEVEL_RANK[shown] : undefined;
       if (rank === undefined) {
         return {
@@ -546,9 +592,17 @@ export async function lowerModelPickerTier(
       if (reached !== next) {
         return { lowered: false, detail: `effort slider stopped at ${reached ?? "unknown"}` };
       }
-      const afterRank = thinkingLevelRank(
-        currentTierLevel(await readOpenStateWhenMounted(runtime)),
-      );
+      // The header can trail the slider for a moment; let the sources settle so a header that
+      // still names the old tier does not push the slider past the cap.
+      let settled: BrowserModelPickerState | null = null;
+      await waitFor(async () => {
+        settled = await readOpenState(runtime);
+        const levels = new Set(
+          (settled?.currentTiers ?? []).map((reading) => thinkingLevelFromTierLabel(reading.label)),
+        );
+        return levels.size <= 1;
+      }, 1_500);
+      const afterRank = thinkingLevelRank(highestCurrentTierLevel(settled));
       if (afterRank !== undefined && afterRank > rank && !flipped) {
         step = -step;
         flipped = true;
@@ -669,6 +723,7 @@ export function formatModelPickerEvidence(evidence: BrowserModelPickerEvidence):
     sliderMin: evidence.sliderMin ?? null,
     sliderMax: evidence.sliderMax ?? null,
     announcement: null,
+    currentTiers: evidence.tierReadings,
   });
 }
 
@@ -701,5 +756,13 @@ export function formatModelPickerState(state: BrowserModelPickerState | null): s
     state.sliderValue === null
       ? "slider n/a"
       : `slider ${state.sliderValue}${state.sliderMin !== null && state.sliderMax !== null ? ` (${state.sliderMin}-${state.sliderMax})` : ""}`;
-  return `model "${state.modelLabel ?? "unknown"}", tier "${state.tierLabel ?? "unknown"}", ${slider}`;
+  // A current source that names another tier than the header (e.g. the slider right after a move).
+  const others = (state.currentTiers ?? []).filter((reading) => reading.label !== state.tierLabel);
+  const disagreement = others
+    .map(
+      (reading) =>
+        ` (${reading.source === "valuetext" ? "slider text" : "header"} "${reading.label}")`,
+    )
+    .join("");
+  return `model "${state.modelLabel ?? "unknown"}", tier "${state.tierLabel ?? "unknown"}"${disagreement}, ${slider}`;
 }

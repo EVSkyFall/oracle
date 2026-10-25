@@ -203,3 +203,35 @@ describe("thinking-time cap", () => {
     expect(prepareFallbackSubmission).not.toHaveBeenCalled();
   });
 });
+
+describe("thinking-time cap with disagreeing tier sources", () => {
+  const disagreeing = (header: number, valueText: number) =>
+    picker(valueText, {
+      tierLabel: TIERS[header]!,
+      tierSource: "header",
+      currentTiers: [
+        { label: TIERS[header]!, source: "header" },
+        { label: TIERS[valueText]!, source: "valuetext" },
+      ],
+    });
+
+  test("a header showing Extra High never hides a slider that says Pro", async () => {
+    const steps = fakePicker(disagreeing(3, 4), { select: 3 });
+    const check = await enforceThinkingTimeCap("extra-high", steps, logger());
+    expect(check.status).toBe("lowered");
+    expect(check.before.tierReadings).toEqual([
+      { label: "Extra High", source: "header" },
+      { label: "Pro", source: "valuetext" },
+    ]);
+    expect(steps.select).toHaveBeenCalledWith("extra-high");
+  });
+
+  test("a slider that still says Pro after lowering is refused, whatever the header says", async () => {
+    const steps = fakePicker(disagreeing(3, 4), {
+      reads: [disagreeing(3, 4), disagreeing(3, 4), disagreeing(3, 4)],
+    });
+    await expect(enforceThinkingTimeCap("extra-high", steps, logger())).rejects.toMatchObject({
+      details: { code: "thinking-time-above-max" },
+    });
+  });
+});

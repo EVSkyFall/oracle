@@ -18,6 +18,7 @@ import {
   readModelPickerState,
   restoreModelPickerState,
   currentTierLevel,
+  highestCurrentTierLevel,
   type ModelPickerRestoreResult,
 } from "./actions/modelPickerState.js";
 import { isAboveThinkingCap } from "./actions/thinkingTimeCap.js";
@@ -174,7 +175,10 @@ export async function runSelectOnlyCheck(
       if (!thinkingCap && !selectionError) {
         problems.push(`the maximum thinking time "${options.maxThinkingTime}" was not checked`);
       }
-      if (selected && isAboveThinkingCap(currentTierLevel(selected), options.maxThinkingTime)) {
+      if (
+        selected &&
+        isAboveThinkingCap(highestCurrentTierLevel(selected), options.maxThinkingTime)
+      ) {
         problems.push(
           `the picker shows tier "${selected.tierLabel ?? "unknown"}" above the maximum "${options.maxThinkingTime}"`,
         );

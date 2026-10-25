@@ -5,7 +5,7 @@ import { BrowserAutomationError, BrowserRunCancelledError } from "../../oracle/e
 import { delay } from "../utils.js";
 import { ensureThinkingTime } from "./thinkingTime.js";
 import {
-  currentTierLevel,
+  highestCurrentTierLevel,
   formatModelPickerState,
   lowerModelPickerTier,
   modelPickerEvidence,
@@ -92,7 +92,7 @@ export async function enforceThinkingTimeCap(
     capturedAt: new Date().toISOString(),
   });
 
-  const above = isAboveThinkingCap(currentTierLevel(beforeState), maxLevel);
+  const above = isAboveThinkingCap(highestCurrentTierLevel(beforeState), maxLevel);
   if (above === null) {
     logger(
       `${LOG_PREFIX} (${maxLevel}): warning: the picker tier could not be read (${formatModelPickerState(beforeState)}); sending without a confirmed tier.`,
@@ -114,7 +114,7 @@ export async function enforceThinkingTimeCap(
     logger(`${LOG_PREFIX} (${maxLevel}): the regular selection failed (${errorText(error)}).`);
   }
   let afterState = await read();
-  if (isAboveThinkingCap(currentTierLevel(afterState), maxLevel) !== false) {
+  if (isAboveThinkingCap(highestCurrentTierLevel(afterState), maxLevel) !== false) {
     try {
       await steps.stepDown(maxLevel);
     } catch (error) {
@@ -123,12 +123,12 @@ export async function enforceThinkingTimeCap(
     }
     afterState = await read();
   }
-  let stillAbove = isAboveThinkingCap(currentTierLevel(afterState), maxLevel);
+  let stillAbove = isAboveThinkingCap(highestCurrentTierLevel(afterState), maxLevel);
   if (stillAbove === null) {
     // The menu can be mid-render right after a change; read once more before deciding.
     await delay(500);
     afterState = await read();
-    stillAbove = isAboveThinkingCap(currentTierLevel(afterState), maxLevel);
+    stillAbove = isAboveThinkingCap(highestCurrentTierLevel(afterState), maxLevel);
   }
   if (stillAbove !== false) {
     // The last tier that could be read is above the cap: nothing shows it was lowered.
