@@ -359,6 +359,138 @@ describe("app approval scope", () => {
   });
 });
 
+describe("app approval role cards", () => {
+  const alert = (title: string, ...buttons: DomNode[]) =>
+    new DomNode("div", { role: "alert" }, [
+      new DomNode("div", {}, [new DomNode("p", {}, [title])]),
+      new DomNode("div", {}, buttons),
+    ]);
+  const codexish = () => alert("Allow CODEXish to use Fs Read?", button("Always allow"));
+
+  test.each([
+    [
+      "the composer form",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("form", { class: "relative flex flex-col gap-2" }, [
+            new DomNode("div", { class: "ComposerModeSurface-lVLm7j" }, [
+              card,
+              new DomNode("div", { contenteditable: "true", role: "textbox" }),
+            ]),
+          ]),
+        ]),
+    ],
+    [
+      "a floating layer",
+      (card: DomNode) =>
+        new DomNode("div", { "data-composer-overlay-floating-ui": "" }, [
+          new DomNode("div", { "data-testid": "composer-popover" }, [card]),
+        ]),
+    ],
+    ["the page header", (card: DomNode) => new DomNode("header", {}, [card])],
+    [
+      "assistant prose",
+      (card: DomNode) =>
+        new DomNode("main", {}, [new DomNode("div", { class: "markdown prose" }, [card])]),
+    ],
+  ])("an alert card is approved in %s", (_where, wrap) => {
+    const cards = scan([wrap(codexish())]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      app: "CODEXish",
+      title: "Allow CODEXish to use Fs Read?",
+      button: { label: "Always allow", rank: 0 },
+    });
+  });
+
+  test.each([
+    [
+      "a user message (role attribute)",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { "data-message-author-role": "user" }, [card]),
+        ]),
+    ],
+    [
+      "today's user message (group class)",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { class: "group/user-message flex flex-col items-end gap-2" }, [card]),
+        ]),
+    ],
+    [
+      "today's user markdown root",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { class: "MarkdownRoot-rZKhxa rich-text-user-turn" }, [card]),
+        ]),
+    ],
+    [
+      "an editable area",
+      (card: DomNode) =>
+        new DomNode("main", {}, [new DomNode("div", { contenteditable: "true" }, [card])]),
+    ],
+    [
+      "a textbox",
+      (card: DomNode) => new DomNode("main", {}, [new DomNode("div", { role: "textbox" }, [card])]),
+    ],
+  ])("an alert card inside %s is never approved", (_where, wrap) => {
+    expect(scan([wrap(codexish())])).toEqual([]);
+  });
+
+  test("the alert element is the card: its heading names the app above an inner block", () => {
+    const [card] = scan([
+      new DomNode("main", {}, [
+        new DomNode("div", { role: "alert" }, [
+          new DomNode("h3", {}, ["CODEXish"]),
+          new DomNode("div", {}, [
+            new DomNode("p", {}, ["Use Host Capabilities?"]),
+            new DomNode("div", {}, [button("항상 허용"), button("거부")]),
+          ]),
+        ]),
+      ]),
+    ]);
+    expect(card).toMatchObject({ app: "CODEXish", title: "CODEXish" });
+  });
+
+  test("a chat frame dialog (it holds an editor) never lends its label as a card title", () => {
+    const cards = scan([
+      new DomNode("section", { role: "dialog", "aria-label": "CODEXish smoke test" }, [
+        new DomNode("div", {}, [
+          new DomNode("div", { class: "card" }, [
+            new DomNode("p", {}, ["Allow Gmail to send an email?"]),
+            new DomNode("div", {}, [button("Always allow")]),
+          ]),
+        ]),
+        new DomNode("form", {}, [new DomNode("div", { contenteditable: "true" })]),
+      ]),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ app: null, title: "Allow Gmail to send an email?" });
+  });
+
+  test("an alert holding several prompts gives each prompt its own card", () => {
+    const cards = scan([
+      new DomNode("main", {}, [
+        new DomNode("div", { role: "alert", "aria-label": "CODEXish" }, [
+          new DomNode("div", {}, [
+            new DomNode("p", {}, ["Allow CODEXish to use Fs Read?"]),
+            button("Allow once"),
+          ]),
+          new DomNode("div", {}, [
+            new DomNode("p", {}, ["Allow Gmail to send an email?"]),
+            button("Always allow"),
+          ]),
+        ]),
+      ]),
+    ]);
+    expect(cards.map((card) => [card.title, card.app, card.button.label])).toEqual([
+      ["Allow CODEXish to use Fs Read?", "CODEXish", "Allow once"],
+      ["Allow Gmail to send an email?", null, "Always allow"],
+    ]);
+  });
+});
+
 describe("app approval monitor", () => {
   test("approves allowed cards, records them, and logs other cards once", async () => {
     const cards = [

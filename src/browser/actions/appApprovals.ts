@@ -51,15 +51,18 @@ export interface AppApprovalCard {
 }
 
 /**
- * Finds visible approval cards. A candidate is an allow-type button inside a dialog or the
- * conversation thread, and never inside page chrome (nav, aside, header), the composer, a user
- * message or assistant prose. Its card is the nearest ancestor with text of its own, and the
- * allowed app must be named in the card's title (heading, aria-labelledby/aria-label text, or
- * else its first line), so tool arguments shown in another app's card that mention an allowed
- * app cannot approve that card. A button's label is its rendered text without shortcut hints
- * (kbd, trailing key glyphs or key names), icons and hidden parts, or else its aria-label; it is
- * an allow button by a whole known label or a known beginning, never when it holds a deny word.
- * Injected into the page with Function.prototype.toString.
+ * Finds visible approval cards. A candidate is an allow-type button. When its nearest alert or
+ * dialog (one that holds no editor) exists, that element is the card wherever it sits, the
+ * composer and floating layers included, but never inside a user message or an editable area.
+ * Any other button must sit inside a dialog or the conversation thread, and never inside page
+ * chrome (nav, aside, header), the composer, a user message or assistant prose; its card is the
+ * nearest ancestor with text of its own. The allowed app must be named in the card's title
+ * (heading, aria-labelledby/aria-label text, or else its first line), so tool arguments shown in
+ * another app's card that mention an allowed app cannot approve that card. A button's label is
+ * its rendered text without shortcut hints (kbd, trailing key glyphs or key names), icons and
+ * hidden parts, or else its aria-label; it is an allow button by a whole known label or a known
+ * beginning, never when it holds a deny word. Injected into the page with
+ * Function.prototype.toString.
  */
 export function scanAppApprovalCards(
   doc: Document,
@@ -77,12 +80,18 @@ export function scanAppApprovalCards(
   };
   const BUTTON = 'button, [role="button"]';
   const DIALOG = '[role="dialog"], [role="alertdialog"]';
+  // Elements that announce themselves as a prompt; such an element is the card wherever it sits.
+  const ROLE_CARD = '[role="alert"], [role="alertdialog"], [role="dialog"]';
   const TURN =
     '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article';
-  const USER = '[data-message-author-role="user"], [data-turn="user"]';
+  // Today's user turn carries no role attribute, only its markdown root and group classes.
+  const USER =
+    '[data-message-author-role="user"], [data-turn="user"], .rich-text-user-turn, [class~="group/user-message"]';
   const PROSE = '.markdown, [class*="markdown"], [class*="prose"]';
+  const EDITABLE =
+    '[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], [role="textbox"], textarea';
   // Places that never hold a permission card of the current turn.
-  const OFF_LIMITS = `${PROSE}, ${USER}, form, [contenteditable="true"], [role="textbox"], [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
+  const OFF_LIMITS = `${PROSE}, ${USER}, form, ${EDITABLE}, [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
   const PAGE_CHROME = 'nav, aside, header, [data-testid*="sidebar" i]';
   const ARGUMENTS = "code, pre, samp, kbd";
   // Buttons whose text and aria-label hold no allow word are skipped before any layout query.
@@ -173,13 +182,37 @@ export function scanAppApprovalCards(
     walk(root);
     return normalize(parts.join(" "));
   };
-  const regionOf = (button: Element): Element | null => {
-    // The whole ancestry up to the document: an article inside prose or a user message must not
-    // end the check early.
-    for (let node = button.parentElement; node; node = node.parentElement) {
-      if (node.matches(OFF_LIMITS) || node.matches(PAGE_CHROME)) return null;
+  /**
+   * The nearest alert or dialog around the button, unless it holds an editor: that is a chat
+   * surface (a floating chat frame), not a card.
+   */
+  const roleCardOf = (button: Element): Element | null => {
+    const role = button.closest(ROLE_CARD);
+    return role && !role.querySelector(EDITABLE) ? role : null;
+  };
+  /**
+   * Where the button sits. A role card is its own region wherever it is (docked in the composer
+   * form, in a floating layer), except inside a user message or an editable area. Any other
+   * button must sit in a dialog, a turn or main with no excluded place in its whole ancestry: an
+   * article inside prose or a user message must not end the check early.
+   */
+  const placeOf = (button: Element): { region: Element | null; role: boolean } => {
+    const role = roleCardOf(button);
+    if (role) {
+      for (let node: Element | null = role; node; node = node.parentElement) {
+        if (node.matches(USER) || node.matches(EDITABLE)) return { region: null, role: true };
+      }
+      return { region: role, role: true };
     }
-    return button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main");
+    for (let node = button.parentElement; node; node = node.parentElement) {
+      if (node.matches(OFF_LIMITS) || node.matches(PAGE_CHROME)) {
+        return { region: null, role: false };
+      }
+    }
+    return {
+      region: button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main"),
+      role: false,
+    };
   };
   const cardOf = (button: Element, region: Element): Element | null => {
     for (let node = button.parentElement; node; node = node.parentElement) {
@@ -279,18 +312,19 @@ export function scanAppApprovalCards(
   };
   /**
    * Title candidates in order, each a single line and never merged with what follows: the
-   * heading, the aria-labelledby text, the aria-label (card, then dialog), the card's first
-   * rendered line. The card's title is the first one present.
+   * card's heading, its aria-labelledby text, its aria-label, its first rendered line. The card's
+   * title is the first one present. A surrounding dialog's label is never the card's title: a
+   * dialog that is a prompt is the card itself, and one that holds the chat is labelled with the
+   * chat's name.
    */
   const titlesOf = (card: Element, region: Element): string[] => {
     const heading = Array.from(
       card.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6'),
     ).find((node) => !node.closest(PROSE) && !hiddenRoot(node, card));
     const candidates = [firstLineOf(heading ?? null, card)];
-    for (const owner of region.matches(DIALOG) ? [card, region] : [card]) {
-      if (hiddenRoot(owner, owner === card ? region : null)) continue;
-      candidates.push(labelledLine(owner.getAttribute("aria-labelledby")));
-      candidates.push(normalize(owner.getAttribute("aria-label")));
+    if (!hiddenRoot(card, region)) {
+      candidates.push(labelledLine(card.getAttribute("aria-labelledby")));
+      candidates.push(normalize(card.getAttribute("aria-label")));
     }
     candidates.push(firstLineOf(card, region));
     return candidates.filter(Boolean);
@@ -301,10 +335,15 @@ export function scanAppApprovalCards(
       new RegExp(`(^|[^A-Za-z0-9_])${escape(app.trim())}($|[^A-Za-z0-9_])`, "i").test(text),
     ) ?? null;
 
-  const byCard = new Map<
-    Element,
-    { region: Element; best: Element; rank: number; label: string }
-  >();
+  type Candidate = {
+    button: Element;
+    rank: number;
+    label: string;
+    region: Element;
+    role: boolean;
+    textCard: Element;
+  };
+  const candidates: Candidate[] = [];
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
     if (!mayAllow(button) || !visible(button)) continue;
     if (button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true")
@@ -312,10 +351,28 @@ export function scanAppApprovalCards(
     const text = label(button);
     const rank = rankOf(button, text);
     if (rank < 0) continue;
-    const region = regionOf(button);
+    const { region, role } = placeOf(button);
     if (!region) continue;
-    const card = cardOf(button, region);
-    if (!card) continue;
+    // The nearest ancestor with text of its own; a role card counts even with only a label.
+    const textCard = cardOf(button, region) ?? (role ? region : null);
+    if (!textCard) continue;
+    candidates.push({ button, rank, label: text, region, role, textCard });
+  }
+  // A role element holding several prompts (buttons under different text blocks) is a container:
+  // each prompt is its own card there, so one prompt's title never covers another's button.
+  const promptsIn = new Map<Element, Set<Element>>();
+  for (const { region, role, textCard } of candidates) {
+    if (!role || textCard === region) continue;
+    const set = promptsIn.get(region) ?? new Set<Element>();
+    set.add(textCard);
+    promptsIn.set(region, set);
+  }
+  const byCard = new Map<
+    Element,
+    { region: Element; best: Element; rank: number; label: string }
+  >();
+  for (const { button, rank, label: text, region, role, textCard } of candidates) {
+    const card = role && (promptsIn.get(region)?.size ?? 0) < 2 ? region : textCard;
     const current = byCard.get(card);
     if (!current || rank < current.rank) {
       byCard.set(card, { region, best: button, rank, label: text });

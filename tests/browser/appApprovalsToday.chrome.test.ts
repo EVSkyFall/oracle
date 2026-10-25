@@ -110,6 +110,8 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
       done?: (records: BrowserAppApprovalRecord[]) => boolean;
       watchMs?: number;
       monitor?: Partial<AppApprovalMonitorOptions>;
+      /** Expression evaluated before the monitor starts; its value is returned as `setup`. */
+      setup?: string;
     } = {},
   ) {
     const client = await CDP({ port: chrome!.port });
@@ -118,6 +120,9 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
       await Promise.all([Page.enable(), Runtime.enable()]);
       await Page.navigate({ url: `data:text/html;base64,${Buffer.from(html).toString("base64")}` });
       await Page.loadEventFired();
+      const setup = options.setup
+        ? (await Runtime.evaluate({ expression: options.setup, returnByValue: true })).result.value
+        : undefined;
       const records: BrowserAppApprovalRecord[] = [];
       const logger = Object.assign(vi.fn(), { verbose: false });
       const stop = startAppApprovalMonitor(Runtime, Input, {
@@ -146,11 +151,44 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
         returnByValue: true,
       });
       const lines = logger.mock.calls.map(([line]) => String(line));
-      return { picks: result.value as string[], records, lines };
+      return { picks: result.value as string[], records, lines, setup };
     } finally {
       await client.close().catch(() => undefined);
     }
   }
+
+  // Whether the centre of the [data-pick="<id>"] button is covered by something else.
+  const covered = (id: string) => `(() => {
+    const button = document.querySelector('[data-pick="${id}"]');
+    const rect = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return Boolean(hit) && hit !== button && !button.contains(hit);
+  })()`;
+
+  test("(a) an alert card at the bottom of the thread, under the docked composer, is approved", async () => {
+    const { picks, records, setup } = await run(todayPage({ thread: KOREAN_CODEXISH }), {
+      // Scrolled up a little, as after the user read back: the card sits under the composer.
+      setup: `(() => {
+        const viewport = document.getElementById('viewport');
+        viewport.scrollTop = viewport.scrollHeight - viewport.clientHeight - 150;
+        return ${covered("always")};
+      })()`,
+      done: (list) => list.length === 1,
+      watchMs: 1_000,
+    });
+    expect(setup).toBe(true);
+    expect(picks).toEqual(["always"]);
+    expect(records[0]).toMatchObject({ app: "CODEXish", button: "항상 허용" });
+  }, 60_000);
+
+  test("(b) the same card docked inside the composer form is approved", async () => {
+    const { picks, records } = await run(todayPage({ docked: KOREAN_CODEXISH }), {
+      done: (list) => list.length === 1,
+      watchMs: 1_000,
+    });
+    expect(picks).toEqual(["always"]);
+    expect(records[0]).toMatchObject({ app: "CODEXish", button: "항상 허용" });
+  }, 60_000);
 
   test("(c) labels with a shortcut hint or an icon are approved", async () => {
     const card = alertCard(
