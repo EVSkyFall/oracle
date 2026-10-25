@@ -235,3 +235,19 @@ describe("thinking-time cap with disagreeing tier sources", () => {
     });
   });
 });
+
+describe("thinking-time cap and labels that only mention Pro", () => {
+  test("a header or slider text that mentions Pro without naming the tier is no evidence of Pro", async () => {
+    const steps = fakePicker(
+      picker(null, {
+        tierLabel: "ChatGPT Pro",
+        tierSource: "header",
+        currentTiers: [{ label: "ChatGPT Pro", source: "header" }],
+      }),
+    );
+    await expect(enforceThinkingTimeCap("extra-high", steps, logger())).resolves.toMatchObject({
+      status: "unreadable",
+    });
+    expect(steps.select).not.toHaveBeenCalled();
+  });
+});

@@ -150,6 +150,34 @@ describe("model picker state", () => {
     expect(read(new FakeElement("div", { role: "menuitem" }, [], "5.6"), "").tierLabel).toBe("5.6");
   });
 
+  test("a tier label counts only as a whole label, never as part of other text", async () => {
+    const { highestTierInButtonText } =
+      await import("../../src/browser/actions/modelPickerState.js");
+    for (const text of [
+      "ChatGPT Pro",
+      "Pro mode",
+      "프로젝트",
+      "Upgrade to Pro",
+      "Projects (Pro)",
+      "Try GPT-6 Pro",
+      "High priority",
+      "Medium-sized",
+    ]) {
+      expect(thinkingLevelFromTierLabel(text), text).toBeNull();
+    }
+    expect(thinkingLevelFromTierLabel("Pro")).toBe("pro");
+    expect(thinkingLevelFromTierLabel("프로")).toBe("pro");
+    expect(thinkingLevelFromTierLabel("Extra High")).toBe("extra-high");
+    expect(thinkingLevelFromTierLabel("extra-high")).toBe("extra-high");
+    expect(thinkingLevelFromTierLabel("매우 높음")).toBe("extra-high");
+    expect(thinkingLevelFromTierLabel("Medium")).toBe("standard");
+    expect(thinkingLevelFromTierLabel("  Extra High (current) ")).toBe("extra-high");
+    expect(thinkingLevelFromTierLabel("“Pro”.")).toBe("pro");
+    expect(thinkingLevelFromTierLabel("ＰＲＯ".normalize("NFKC"))).toBe("pro");
+    expect(highestTierInButtonText("Thinking effort\nExtra High")).toBe("extra-high");
+    expect(highestTierInButtonText("ChatGPT Pro\nThinking effort")).toBeNull();
+  });
+
   test("maps tier labels to thinking levels and leaves unknown labels alone", () => {
     expect(thinkingLevelFromTierLabel("Instant")).toBe("light");
     expect(thinkingLevelFromTierLabel("Medium")).toBe("standard");

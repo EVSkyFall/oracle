@@ -777,17 +777,29 @@ export async function restoreModelPickerState(
 export function thinkingLevelFromTierLabel(
   label: string | null | undefined,
 ): ThinkingTimeLevel | null {
-  const text = label?.normalize("NFC").trim().toLowerCase() ?? "";
+  // Whole labels only: "ChatGPT Pro", "Pro mode" or "프로젝트" name no tier, so they can never
+  // read as Pro. A trailing state such as "(current)" and surrounding punctuation are not part
+  // of the label. Injected into the page with Function.prototype.toString, so self-contained.
+  const text = String(label ?? "")
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\s*[(（[［][^)）\]］]*[)）\]］]$/u, "")
+    .replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, "")
+    .replace(/[\s-]+/g, " ");
   if (!text) return null;
-  if (/extra[\s-]*high|sehr hoch|非常に高い|極高|极高|매우 높음/.test(text)) return "extra-high";
-  if (/(?:^|[^a-z])pro(?:[^a-z]|$)|프로/.test(text)) return "pro";
-  if (/heavy|schwer|重度|加重/.test(text)) return "heavy";
-  if (/(?:^|[^a-z])(?:high|extended|hoch|erweitert)(?:[^a-z]|$)|高い|扩展|높음/.test(text))
-    return "extended";
-  if (/(?:^|[^a-z])(?:medium|standard|mittel)(?:[^a-z]|$)|中程度|标准|중간/.test(text))
-    return "standard";
-  if (/(?:^|[^a-z])(?:instant|light|sofort|leicht)(?:[^a-z]|$)|最速|极速|즉시/.test(text))
-    return "light";
+  const labels: Array<[ThinkingTimeLevel, string[]]> = [
+    ["extra-high", ["extra high", "sehr hoch", "非常に高い", "極高", "极高", "매우 높음"]],
+    ["pro", ["pro", "프로"]],
+    ["heavy", ["heavy", "schwer", "重度", "加重"]],
+    ["extended", ["high", "extended", "hoch", "erweitert", "高い", "扩展", "높음"]],
+    ["standard", ["medium", "standard", "mittel", "中程度", "标准", "중간"]],
+    ["light", ["instant", "light", "sofort", "leicht", "最速", "极速", "즉시"]],
+  ];
+  for (const [level, names] of labels) {
+    if (names.includes(text)) return level;
+  }
   return null;
 }
 
