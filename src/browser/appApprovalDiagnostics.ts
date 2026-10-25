@@ -30,6 +30,9 @@ export function renderAppApprovalDiagnostic(diagnostic: AppApprovalDiagnostic): 
     `<h1>${escapeHtml(diagnostic.reason)}</h1>`,
     `<p>Captured ${escapeHtml(diagnostic.capturedAt)}${page ? ` on ${escapeHtml(page.url)}` : ""}.</p>`,
     page ? "" : "<p>The card was gone before it could be read.</p>",
+    page?.withheld
+      ? "<p>The element was wider than a card (it held the main area, the composer or the conversation), so its markup was not saved.</p>"
+      : "",
     "<h2>Buttons</h2>",
     `<pre>${escapeHtml(JSON.stringify(page?.buttons ?? [], null, 2))}</pre>`,
     "<h2>Ancestors (the card first, up to body)</h2>",

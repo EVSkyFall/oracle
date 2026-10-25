@@ -88,6 +88,8 @@ export interface AppApprovalDiagnosticPage {
   /** The card and its ancestors up to body. */
   ancestors: Array<{ tag: string; id: string; className: string; role: string; testId: string }>;
   buttons: Array<{ label: string; text: string; ariaLabel: string | null; disabled: boolean }>;
+  /** True when the element was too wide to save (it held the main area or the conversation). */
+  withheld?: boolean;
 }
 
 export interface AppApprovalDiagnostic {
@@ -99,6 +101,9 @@ export interface AppApprovalDiagnostic {
 }
 
 const DIAGNOSTIC_HTML_CHARS = 30_000;
+// Markup a diagnostic never holds: the page's main area, an editor, or a conversation turn.
+const DIAGNOSTIC_WIDE_SELECTOR =
+  'main, [contenteditable="true"], [role="textbox"], textarea, [data-message-author-role], [data-turn], [data-testid^="conversation-turn"], .rich-text-user-turn, [class~="group/user-message"]';
 
 /**
  * Finds visible approval cards. A candidate is an allow-type button. When its nearest alert or
@@ -437,10 +442,30 @@ export function scanAppApprovalCards(
     subjects.push(element);
     return subjects.length - 1;
   };
+  // A diagnostic shows a card, never the thread: a subject holding the page's main area, a chat
+  // surface or (outside a role card) a rendered message is narrowed to the button's parent.
+  const tooWide = (node: Element): boolean =>
+    node.matches("html, body, main") ||
+    Boolean(node.querySelector("main")) ||
+    chatSurface(node) ||
+    (!node.matches(ROLE_CARD) && Boolean(node.querySelector(`${PROSE}, [class*="MarkdownRoot"]`)));
+  const subjectFor = (preferred: Element | null, button: Element): number => {
+    for (const node of [preferred, button.parentElement]) {
+      if (node && !tooWide(node)) return subjectOf(node);
+    }
+    return subjectOf(button);
+  };
+  // The nearest ancestor with text of its own strictly below `boundary`.
+  const cardBelow = (button: Element, boundary: Element): Element | null => {
+    for (let node = button.parentElement; node && node !== boundary; node = node.parentElement) {
+      if (textOf(node, `${BUTTON}, ${PROSE}, ${USER}`)) return node;
+    }
+    return null;
+  };
   const skipped: AppApprovalSkip[] = [];
   // Allow-looking buttons outside any role card whose label is not in the list; reported below
   // unless their card is taken through another button.
-  const unknown: Array<{ label: string; region: Element; textCard: Element }> = [];
+  const unknown: Array<{ button: Element; label: string; region: Element; textCard: Element }> = [];
   const candidates: Candidate[] = [];
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
     if (!mayAllow(button) || !visible(button) || !enabled(button)) continue;
@@ -449,14 +474,15 @@ export function scanAppApprovalCards(
     if (rank < 0 && !allowLike(text)) continue;
     const { region, role, excludedBy } = placeOf(button);
     if (!region) {
-      const around = roleCardOf(button) ?? cardOf(button, doc.body) ?? button;
+      // Never above the excluding ancestor: the role card, else a text card below it.
+      const around = roleCardOf(button) ?? (excludedBy ? cardBelow(button, excludedBy) : null);
       skipped.push({
         reason: excludedBy ? "excluded" : "no-card",
         labels: [text],
         title: "",
         app: null,
         detail: excludedBy ? describe(excludedBy) : "",
-        subject: subjectOf(around),
+        subject: subjectFor(around, button),
       });
       continue;
     }
@@ -469,13 +495,13 @@ export function scanAppApprovalCards(
         title: "",
         app: null,
         detail: "",
-        subject: subjectOf(button.parentElement ?? button),
+        subject: subjectFor(button.parentElement, button),
       });
       continue;
     }
     if (rank < 0) {
       // Role cards are reported whole by the pass over role cards below.
-      if (!role) unknown.push({ label: text, region, textCard });
+      if (!role) unknown.push({ button, label: text, region, textCard });
       continue;
     }
     candidates.push({ button, rank, label: text, region, role, textCard });
@@ -513,7 +539,7 @@ export function scanAppApprovalCards(
       title: title.slice(0, 200),
       toolText: text.slice(0, 500),
       button: { label: bestLabel, rank, index: buttons.length - 1 },
-      subject: subjectOf(card),
+      subject: subjectFor(card, best),
     });
   }
   // Role cards with no allow button: reported when their title names an allowed app (its
@@ -543,10 +569,10 @@ export function scanAppApprovalCards(
       title: title.slice(0, 200),
       app,
       detail: "",
-      subject: subjectOf(role),
+      subject: subjectFor(role, own[0] ?? role),
     });
   }
-  for (const { label: text, region, textCard } of unknown) {
+  for (const { button, label: text, region, textCard } of unknown) {
     if (byCard.has(textCard)) continue;
     const title = titlesOf(textCard, region)[0] ?? "";
     skipped.push({
@@ -555,7 +581,7 @@ export function scanAppApprovalCards(
       title: title.slice(0, 200),
       app: names(title),
       detail: "",
-      subject: subjectOf(textCard),
+      subject: subjectFor(textCard, button),
     });
   }
   return { cards, buttons, skipped, subjects, labelOf: label };
@@ -595,6 +621,10 @@ export function buildAppApprovalDiagnosticExpression(token: string, subject: num
       });
       if (current === document.body) break;
     }
+    // The scan picks card-sized subjects; this is the last guard that a file never holds the
+    // page's main area, the composer or the conversation.
+    const wide = node.matches('html, body, main') || Boolean(node.querySelector(${JSON.stringify(DIAGNOSTIC_WIDE_SELECTOR)}));
+    if (wide) return { url: location.href, html: '', htmlLength: 0, ancestors, buttons: [], withheld: true };
     const buttons = Array.from(node.querySelectorAll('button, [role="button"]')).map((button) => ({
       label: typeof store.labelOf === 'function' ? store.labelOf(button) : '',
       text: String(button.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300),

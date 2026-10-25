@@ -638,6 +638,55 @@ describe("app approval skips", () => {
     ]);
   });
 
+  test("a diagnostic subject never climbs past the excluding ancestor", () => {
+    const subjectOfSkip = (children: DomNode[]) => {
+      const result = skippedOf(children);
+      expect(result.skipped).toHaveLength(1);
+      return result.subjects[result.skipped[0]!.subject] as unknown as DomNode;
+    };
+    // A form holding only the button, next to conversation text: the button's parent, not main.
+    const row = new DomNode("div", { class: "row" }, [button("Always allow")]);
+    expect(
+      subjectOfSkip([
+        new DomNode("main", {}, [
+          new DomNode("p", {}, ["Conversation text"]),
+          new DomNode("form", { class: "relative flex" }, [row]),
+        ]),
+      ]),
+    ).toBe(row);
+    // The sidebar's chat list stays out of it.
+    const navRow = new DomNode("div", {}, [button("Allow")]);
+    expect(
+      subjectOfSkip([
+        new DomNode("nav", {}, [
+          new DomNode("ul", {}, [new DomNode("li", {}, ["Chat A"]), new DomNode("li", {}, ["B"])]),
+          navRow,
+        ]),
+      ]),
+    ).toBe(navRow);
+    // A text card below the excluding ancestor is the subject.
+    const card = new DomNode("div", { class: "card" }, [
+      new DomNode("p", {}, ["Allow CODEXish?"]),
+      button("Always allow"),
+    ]);
+    expect(subjectOfSkip([new DomNode("main", {}, [new DomNode("form", {}, [card])])])).toBe(card);
+  });
+
+  test("a card that holds a rendered message is narrowed to its button", () => {
+    const allow = button("Always allow");
+    const { cards, subjects } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", { class: "message" }, [
+          new DomNode("div", { class: "markdown prose" }, ["A long answer from the model."]),
+          new DomNode("p", {}, ["Allow Gmail to send an email?"]),
+          allow,
+        ]),
+      ]),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(subjects[cards[0]!.subject!]).toBe(allow);
+  });
+
   test("an allow button with nothing around it is reported as having no card", () => {
     const { skipped } = skippedOf([
       new DomNode("main", {}, [new DomNode("div", {}, [button("Allow")])]),

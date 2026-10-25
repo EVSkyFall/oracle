@@ -5,6 +5,7 @@ import path from "node:path";
 import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
 import {
+  buildAppApprovalDiagnosticExpression,
   startAppApprovalMonitor,
   type AppApprovalMonitorOptions,
 } from "../../src/browser/actions/appApprovals.js";
@@ -314,6 +315,47 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     expect(
       lines.some((line) => line.includes('approved ("항상 허용") by in-page click() at')),
     ).toBe(true);
+  }, 60_000);
+
+  test("(j) a diagnostic never holds the conversation or the page's main area", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-approval-diag-home-"));
+    setOracleHomeDirOverrideForTest(home);
+    try {
+      // An allow button docked in the composer form without any card around it.
+      const docked = `<div class="hint">${pick("docked-allow", "Allow", "data-stays")}</div>`;
+      const { picks, lines } = await run(todayPage({ docked }), {
+        watchMs: 2_000,
+        monitor: {
+          saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic("fixture", diagnostic),
+        },
+      });
+      expect(picks).toEqual([]);
+      expect(lines.filter((line) => line.includes("sits inside form.relative"))).toHaveLength(1);
+      const dir = path.join(home, "sessions", "fixture", "artifacts");
+      const html = await fs.readFile(path.join(dir, "app-approval-diag-1.html"), "utf8");
+      expect(html).toContain('data-pick="docked-allow"');
+      expect(html).not.toContain("Answer text that keeps the thread long");
+      expect(html).not.toContain("Question 0");
+      expect(html).not.toContain("&lt;main");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await fs.rm(home, { recursive: true, force: true }).catch(() => undefined);
+    }
+    // The page-side guard: a subject as wide as main is never saved.
+    const client = await CDP({ port: chrome!.port });
+    try {
+      await client.Runtime.enable();
+      const { result } = await client.Runtime.evaluate({
+        expression: `(() => {
+          window.__oracleApprovalButtons = { token: 'wide', nodes: [], subjects: [document.querySelector('main')] };
+          return ${buildAppApprovalDiagnosticExpression("wide", 0)};
+        })()`,
+        returnByValue: true,
+      });
+      expect(result.value).toMatchObject({ html: "", htmlLength: 0, withheld: true, buttons: [] });
+    } finally {
+      await client.close().catch(() => undefined);
+    }
   }, 60_000);
 
   test("(i) deny and don't-allow buttons are never clicked", async () => {
