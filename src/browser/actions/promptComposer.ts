@@ -60,6 +60,64 @@ export interface AttachmentReadyExpectation {
 
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
 
+/**
+ * Splits a prompt into paste chunks of at most `size` UTF-16 units, never inside a surrogate
+ * pair or a CRLF, with line endings normalised to \n. Boundaries fall wherever the size says,
+ * inside lines too. Injected into the page with Function.prototype.toString.
+ */
+export function splitPasteChunks(text: string, size: number): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length;) {
+    let end = Math.min(i + size, text.length);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end--;
+    if (text[end - 1] === "\r" && text[end] === "\n") end--;
+    chunks.push(text.slice(i, end).replace(/\r\n?/g, "\n"));
+    i = end;
+  }
+  return chunks;
+}
+
+/**
+ * Page expression: pastes a multi-line prompt into the contenteditable composer in chunks and
+ * reports whether the staged text matches it exactly.
+ */
+export function buildMultilinePasteExpression(prompt: string): string {
+  return `(() => {
+        const selectors = ${JSON.stringify(INPUT_SELECTORS)};
+        const visible = (node) => { const r = node?.getBoundingClientRect?.(); return Boolean(r && r.width > 0 && r.height > 0); };
+        const editor = selectors.map((s) => document.querySelector(s)).find((n) => n && visible(n));
+        if (editor instanceof HTMLTextAreaElement) return { used: false };
+        if (!editor?.isContentEditable) return { used: true, complete: false };
+        const text = ${JSON.stringify(prompt)};
+        // ChatGPT converts a single large paste (seen above ~10k chars) into a "Pasted text"
+        // file chip and leaves the editor empty, so paste in chunks well under that size.
+        const CHUNK = 4000;
+        const chips = () => document.querySelectorAll('form button[aria-label^="Remove Pasted text"]').length;
+        const chipsBefore = chips();
+        editor.focus();
+        for (const chunk of (${splitPasteChunks.toString()})(text, CHUNK)) {
+          const data = new DataTransfer();
+          data.setData('text/plain', chunk);
+          // Explicit hard breaks preserve blank lines that a plain-text paragraph parser can collapse.
+          const paragraph = document.createElement('p');
+          paragraph.style.whiteSpace = 'pre-wrap';
+          paragraph.textContent = chunk;
+          data.setData('text/html', paragraph.outerHTML.replace(/\\n/g, '<br>'));
+          editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+        }
+        // innerText adds layout spacing between paragraphs. Read actual hard breaks and block
+        // boundaries instead, without mentions/pills staged before the text (a mention leaves
+        // its separating space ahead of the prompt).
+        const staged = (${readComposerPromptText.toString()})(editor, ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)});
+        const normalize = value => value.replace(/\\r\\n?/g, '\\n');
+        const comparable = value => staged.tokens > 0 ? value.replace(/^\\s+/, '') : value;
+        const landed = comparable(normalize(staged.text));
+        const expected = comparable(normalize(text));
+        const convertedToFile = chips() > chipsBefore;
+        return { used: true, length: landed.length, expected: expected.length, complete: landed === expected, convertedToFile };
+      })()`;
+}
+
 export async function submitPrompt(
   deps: {
     runtime: ChromeClient["Runtime"];
@@ -165,45 +223,7 @@ export async function submitPrompt(
     let pastedMultiline = false;
     if (prompt.includes("\n")) {
       const pasteResult = await runtime.evaluate({
-        expression: `(() => {
-        const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-        const visible = (node) => { const r = node?.getBoundingClientRect?.(); return Boolean(r && r.width > 0 && r.height > 0); };
-        const editor = selectors.map((s) => document.querySelector(s)).find((n) => n && visible(n));
-        if (editor instanceof HTMLTextAreaElement) return { used: false };
-        if (!editor?.isContentEditable) return { used: true, complete: false };
-        const text = ${encodedPrompt};
-        // ChatGPT converts a single large paste (seen above ~10k chars) into a "Pasted text"
-        // file chip and leaves the editor empty, so paste in chunks well under that size.
-        const CHUNK = 4000;
-        const chips = () => document.querySelectorAll('form button[aria-label^="Remove Pasted text"]').length;
-        const chipsBefore = chips();
-        editor.focus();
-        for (let i = 0; i < text.length;) {
-          let end = Math.min(i + CHUNK, text.length);
-          if (end < text.length && /[\\uD800-\\uDBFF]/.test(text[end - 1])) end--;
-          if (text[end - 1] === '\\r' && text[end] === '\\n') end--;
-          const data = new DataTransfer();
-          const chunk = text.slice(i, end).replace(/\\r\\n?/g, '\\n');
-          data.setData('text/plain', chunk);
-          // Explicit hard breaks preserve blank lines that a plain-text paragraph parser can collapse.
-          const paragraph = document.createElement('p');
-          paragraph.style.whiteSpace = 'pre-wrap';
-          paragraph.textContent = chunk;
-          data.setData('text/html', paragraph.outerHTML.replace(/\\n/g, '<br>'));
-          editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
-          i = end;
-        }
-        // innerText adds layout spacing between paragraphs. Read actual hard breaks and block
-        // boundaries instead, without mentions/pills staged before the text (a mention leaves
-        // its separating space ahead of the prompt).
-        const staged = (${readComposerPromptText.toString()})(editor, ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)});
-        const normalize = value => value.replace(/\\r\\n?/g, '\\n');
-        const comparable = value => staged.tokens > 0 ? value.replace(/^\\s+/, '') : value;
-        const landed = comparable(normalize(staged.text));
-        const expected = comparable(normalize(text));
-        const convertedToFile = chips() > chipsBefore;
-        return { used: true, length: landed.length, expected: expected.length, complete: landed === expected, convertedToFile };
-      })()`,
+        expression: buildMultilinePasteExpression(prompt),
         returnByValue: true,
       });
       const pasted = pasteResult.result?.value as
