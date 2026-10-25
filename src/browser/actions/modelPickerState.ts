@@ -374,6 +374,38 @@ async function readOpenStateWhenMounted(
   return state;
 }
 
+/** Whether every current source (header, slider text) names the same tier. */
+function tierSourcesAgree(state: BrowserModelPickerState | null): boolean {
+  return (
+    new Set((state?.currentTiers ?? []).map((reading) => thinkingLevelFromTierLabel(reading.label)))
+      .size <= 1
+  );
+}
+
+/** The tier the slider names itself (its aria-valuetext), or null when it names none. */
+function sliderTierLevel(state: BrowserModelPickerState | null): ThinkingTimeLevel | null {
+  const reading = state?.currentTiers?.find((entry) => entry.source === "valuetext");
+  return reading ? thinkingLevelFromTierLabel(reading.label) : null;
+}
+
+// Right after a change the tier header can trail the slider. A read that a verdict rests on gives
+// the sources this long to agree; when they still disagree, the last read stands (and the
+// highest tier counts).
+const TIER_AGREE_WAIT_MS = 5_000;
+
+async function readOpenStateSettled(
+  runtime: ChromeClient["Runtime"],
+): Promise<BrowserModelPickerState | null> {
+  let state = await readOpenStateWhenMounted(runtime);
+  if (tierSourcesAgree(state)) return state;
+  await waitFor(async () => {
+    const next = await readOpenState(runtime);
+    if (next?.modelLabel) state = next;
+    return tierSourcesAgree(state);
+  }, TIER_AGREE_WAIT_MS);
+  return state;
+}
+
 // Order of effort levels: which way the slider moves toward a level, and whether a tier is above
 // a maximum. Not slider values.
 const LEVEL_RANK: Partial<Record<ThinkingTimeLevel, number>> = {
@@ -427,7 +459,7 @@ export async function readModelPickerState(
       opened = await openModelPicker(runtime, input);
     }
     if (!opened) return null;
-    return await readOpenStateWhenMounted(runtime);
+    return await readOpenStateSettled(runtime);
   } finally {
     // Also after a failed read, and after an open that reported failure but opened late.
     await closeModelPickerOrRecover(runtime, input, logger);
@@ -610,8 +642,10 @@ async function moveSliderToLevel(
 
 /**
  * Steps the effort slider down with trusted keys until the picker's tier is at or below
- * `maxLevel`. Which slider direction lowers the tier is learned from the first step. Opens and
- * closes the picker itself; the caller reads the result back.
+ * `maxLevel`. Which slider direction lowers the tier is learned from the first step. Each step
+ * is decided by the slider's own text when it has one (a header that trails it cannot push the
+ * slider past the cap), else by the highest current tier. Opens and closes the picker itself;
+ * the caller reads the result back, and that verdict uses the highest tier.
  */
 export async function lowerModelPickerTier(
   runtime: ChromeClient["Runtime"],
@@ -632,7 +666,7 @@ export async function lowerModelPickerTier(
       const state = await readOpenStateWhenMounted(runtime);
       const value = state?.sliderValue ?? null;
       if (value === null) return { lowered: false, detail: "the effort slider is not mounted" };
-      const shown = highestCurrentTierLevel(state);
+      const shown = sliderTierLevel(state) ?? highestCurrentTierLevel(state);
       const rank = shown ? LEVEL_RANK[shown] : undefined;
       if (rank === undefined) {
         return {
@@ -640,7 +674,16 @@ export async function lowerModelPickerTier(
           detail: `tier "${state?.tierLabel ?? "unknown"}" cannot be placed`,
         };
       }
-      if (rank <= cap) return { lowered: true };
+      if (rank <= cap) {
+        // Let a trailing header catch up before the picker closes and the caller reads it back.
+        if (!tierSourcesAgree(state)) {
+          await waitFor(
+            async () => tierSourcesAgree(await readOpenState(runtime)),
+            TIER_AGREE_WAIT_MS,
+          );
+        }
+        return { lowered: true };
+      }
       if (seen.has(value)) return { lowered: false, detail: "no slider step lowers the tier" };
       seen.add(value);
       const next = value + step;
@@ -658,17 +701,15 @@ export async function lowerModelPickerTier(
       if (reached !== next) {
         return { lowered: false, detail: `effort slider stopped at ${reached ?? "unknown"}` };
       }
-      // The header can trail the slider for a moment; let the sources settle so a header that
-      // still names the old tier does not push the slider past the cap.
+      // The header can trail the slider for a moment; give the sources a moment to settle.
       let settled: BrowserModelPickerState | null = null;
       await waitFor(async () => {
         settled = await readOpenState(runtime);
-        const levels = new Set(
-          (settled?.currentTiers ?? []).map((reading) => thinkingLevelFromTierLabel(reading.label)),
-        );
-        return levels.size <= 1;
+        return tierSourcesAgree(settled);
       }, 1_500);
-      const afterRank = thinkingLevelRank(highestCurrentTierLevel(settled));
+      const afterRank = thinkingLevelRank(
+        sliderTierLevel(settled) ?? highestCurrentTierLevel(settled),
+      );
       if (afterRank !== undefined && afterRank > rank && !flipped) {
         step = -step;
         flipped = true;

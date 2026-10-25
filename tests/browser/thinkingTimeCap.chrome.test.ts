@@ -8,7 +8,10 @@ import {
   browserThinkingCapSteps,
   enforceThinkingTimeCap,
 } from "../../src/browser/actions/thinkingTimeCap.js";
-import { readModelPickerEvidence } from "../../src/browser/actions/modelPickerState.js";
+import {
+  lowerModelPickerTier,
+  readModelPickerEvidence,
+} from "../../src/browser/actions/modelPickerState.js";
 import { pickerFixture } from "./pickerFixture.js";
 
 // Real-Chrome fixture (pickerFixture.ts): the cap runs its real steps, the regular thinking-time
@@ -148,6 +151,34 @@ describe.runIf(enabled)("thinking-time cap in real Chrome", () => {
       },
     );
   }, 90_000);
+
+  test("a header that keeps naming Pro for 3 s while the slider text follows the steps ends on Extra High", async () => {
+    const html = pickerFixture("horizontal", false, true, 0, "default", { valueText: true });
+    const lagging = "window.setPicker('GPT-6', 4); window.headerLagMs = 3000";
+    await withPage(html, async (client) => {
+      await client.Runtime.evaluate({ expression: lagging });
+      await expect(
+        lowerModelPickerTier(client.Runtime, client.Input, "extra-high", quietLogger()),
+      ).resolves.toEqual({ lowered: true });
+      expect((await pickerState(client)).value).toBe(3);
+    });
+    // The whole cap: lowered by slider steps, then the verdict once the sources agree.
+    await withPage(html, async (client) => {
+      await client.Runtime.evaluate({ expression: lagging });
+      const logger = quietLogger();
+      await expect(
+        enforceThinkingTimeCap(
+          "extra-high",
+          browserThinkingCapSteps(client.Runtime, client.Input, logger),
+          logger,
+        ),
+      ).resolves.toMatchObject({
+        status: "lowered",
+        after: { tierLabel: "Extra High", sliderValue: 3 },
+      });
+      expect((await pickerState(client)).value).toBe(3);
+    });
+  }, 120_000);
 
   test("a localized tier header on Pro is found by structure and lowered, not read as unreadable", async () => {
     await withPage(
