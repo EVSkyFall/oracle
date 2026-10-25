@@ -8,7 +8,9 @@ import {
   startAppApprovalMonitor,
   type AppApprovalMonitorOptions,
 } from "../../src/browser/actions/appApprovals.js";
+import { saveAppApprovalDiagnostic } from "../../src/browser/appApprovalDiagnostics.js";
 import type { BrowserAppApprovalRecord } from "../../src/browser/types.js";
+import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 
 // Real-Chrome fixture of ChatGPT's 2026-10-26 conversation page: no turn attributes, the thread
 // under main > workspace wrappers in its own scroll viewport, the composer (a form) docked over the
@@ -236,6 +238,59 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     });
     expect(picks).toEqual(["chat"]);
     expect(records[0]).toMatchObject({ app: "CODEXish", button: "Allow for this chat" });
+  }, 60_000);
+
+  test("(f) another app's alert card next to it is left for the user and logged once", async () => {
+    const gmail = alertCard(
+      "gmail",
+      "Allow Gmail to send an email?",
+      "to: me@example.com body: CODEXish says hi",
+      `${pick("gmail-deny", "Deny", "data-stays")}${pick("gmail-always", "Always allow", "data-stays")}`,
+    );
+    const { picks, records, lines } = await run(
+      todayPage({ thread: `${gmail}${KOREAN_CODEXISH}` }),
+      { done: (list) => list.length === 1, watchMs: 2_000 },
+    );
+    expect(picks).toEqual(["always"]);
+    expect(records).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("Allow Gmail to send an email?"))).toEqual([
+      '[browser] App approval for "Allow Gmail to send an email?" left for the user (its title names no app in --browser-allow-app).',
+    ]);
+  }, 60_000);
+
+  test('(g) an unknown label such as "Continue" is not clicked, logged once, and diagnosed', async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-approval-diag-home-"));
+    setOracleHomeDirOverrideForTest(home);
+    try {
+      const card = alertCard(
+        "codexish",
+        "Allow CODEXish to use Fs Read?",
+        "ChatGPT will call CODEXish's Fs Read tool.",
+        `${pick("cancel", "Cancel", "data-stays")}${pick("continue", "Continue", "data-stays")}`,
+      );
+      const { picks, records, lines } = await run(todayPage({ thread: card }), {
+        watchMs: 3_000,
+        monitor: {
+          saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic("fixture", diagnostic),
+        },
+      });
+      expect(picks).toEqual([]);
+      expect(records).toEqual([]);
+      expect(lines.filter((line) => line.includes('"Continue"'))).toEqual([
+        '[browser] App approval left for the user: no known allow label among "Cancel", "Continue" in "Allow CODEXish to use Fs Read?".',
+      ]);
+      const dir = path.join(home, "sessions", "fixture", "artifacts");
+      expect(await fs.readdir(dir)).toEqual(["app-approval-diag-1.html"]);
+      const html = await fs.readFile(path.join(dir, "app-approval-diag-1.html"), "utf8");
+      expect(html).toContain('&lt;div role="alert" data-card="codexish"&gt;');
+      expect(html).toContain('"label": "Continue"');
+      expect(html).toContain(
+        'main#_R_trcuj8aqn75cched5hlb5_ class="outline-none MainContentSurface-EnuIYE',
+      );
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await fs.rm(home, { recursive: true, force: true }).catch(() => undefined);
+    }
   }, 60_000);
 
   test("(i) deny and don't-allow buttons are never clicked", async () => {

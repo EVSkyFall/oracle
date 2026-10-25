@@ -48,6 +48,7 @@ import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { saveAppApprovalDiagnostic } from "../browser/appApprovalDiagnostics.js";
 import {
   recoveryCaptureFromRuntime,
   retireCancelledBrowserTarget,
@@ -1458,6 +1459,8 @@ async function autoReattachUntilComplete({
           promptPreview: sessionMeta.promptPreview,
           signal,
           onAppApproval: persistApproval,
+          saveAppApprovalDiagnostic: (diagnostic) =>
+            saveAppApprovalDiagnostic(sessionMeta.id, diagnostic),
         }),
         signal,
       );

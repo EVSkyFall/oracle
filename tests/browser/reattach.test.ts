@@ -326,6 +326,82 @@ describe("resumeBrowserSession", () => {
     ]);
   });
 
+  test("saves a diagnostic of a prompt left for the user while reattached", async () => {
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const page = {
+      url: runtime.tabUrl,
+      html: "<div role=alert></div>",
+      htmlLength: 22,
+      ancestors: [],
+      buttons: [],
+    };
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+      if (expression.includes("window.__oracleApprovalButtons = {")) {
+        return {
+          result: {
+            value: {
+              cards: [],
+              skipped: [
+                {
+                  reason: "label",
+                  labels: ["Continue"],
+                  title: "Allow CODEXish?",
+                  app: "CODEXish",
+                  detail: "",
+                  subject: 0,
+                },
+              ],
+            },
+          },
+        };
+      }
+      if (expression.includes("store.subjects")) return { result: { value: page } };
+      return { result: { value: null } };
+    });
+    const connect = vi.fn(async () => ({
+      // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+      Runtime: { enable: vi.fn(), evaluate },
+      // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+      DOM: { enable: vi.fn() },
+      // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+      Input: { dispatchMouseEvent: vi.fn(async () => ({})) },
+      close: vi.fn(async () => {}),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const saveAppApprovalDiagnostic = vi.fn(async () => "C:/s/artifacts/app-approval-diag-1.html");
+    const logger = vi.fn() as BrowserLogger;
+    logger.verbose = true;
+    await resumeBrowserSession(runtime, { timeoutMs: 5_000, allowApps: ["CODEXish"] }, logger, {
+      listTargets: vi.fn(async () => [
+        { targetId: "target-1", type: "page", url: runtime.tabUrl },
+      ]) as never,
+      connect,
+      waitForConversationHydration: vi.fn(async () => 2),
+      waitForAssistantResponse: vi.fn(async () => {
+        await vi.waitFor(() => expect(saveAppApprovalDiagnostic).toHaveBeenCalled(), {
+          timeout: 4_000,
+        });
+        return { text: "done", html: "", meta: { messageId: "m1", turnId: "t1" } };
+      }),
+      captureAssistantMarkdown: vi.fn(async () => "done"),
+      recoverSession: vi.fn(async () => {
+        throw new Error("must not recover");
+      }),
+      saveAppApprovalDiagnostic,
+    });
+    expect(saveAppApprovalDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: expect.stringContaining('no known allow label among "Continue"'),
+        page,
+      }),
+    );
+  });
+
   test("uses prompt preview turn index when reattaching to an already-open answer", async () => {
     const runtime = {
       chromePort: 51559,

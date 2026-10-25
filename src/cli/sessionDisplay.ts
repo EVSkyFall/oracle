@@ -14,6 +14,7 @@ import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
 import { withAppApprovals } from "../browser/appApprovalRecords.js";
+import { saveAppApprovalDiagnostic } from "../browser/appApprovalDiagnostics.js";
 import { retireRecoveredBrowserTarget } from "../browser/recoveryTarget.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
@@ -366,6 +367,8 @@ export async function attachSession(
         ),
         {
           promptPreview: metadata.promptPreview,
+          saveAppApprovalDiagnostic: (diagnostic) =>
+            saveAppApprovalDiagnostic(sessionId, diagnostic),
           onAppApproval: async (record) => {
             knownRuntime = withAppApprovals(
               { ...knownRuntime, appApprovals: [record] },

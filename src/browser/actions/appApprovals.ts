@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { BrowserAutomationError } from "../../oracle/errors.js";
 import type { BrowserAppApprovalRecord, BrowserLogger, ChromeClient } from "../types.js";
-import { guardedTrustedClick } from "./composerTools.js";
+import { guardedTrustedClick, type GuardedTrustedClickResult } from "./composerTools.js";
 
 /**
  * Allow-type buttons of ChatGPT's tool-permission prompts, compared trimmed and case-folded.
@@ -23,6 +24,11 @@ export interface AppApprovalVocabulary {
   prefixes: ReadonlyArray<{ prefix: string; rank: number }>;
   /** A label (or aria-label) containing any of these is never an allow button. */
   deny: readonly string[];
+  /**
+   * Beginnings of labels that look like an allow or approve button. Such a button that is not
+   * taken is reported (with why), so a renamed or moved prompt never goes unnoticed.
+   */
+  allowLike: readonly string[];
 }
 
 /** What counts as an allow button, compared case-folded with whitespace collapsed. */
@@ -35,6 +41,7 @@ export const APP_APPROVAL_VOCABULARY: AppApprovalVocabulary = {
     { prefix: "허용", rank: 2 },
   ],
   deny: ["don't", "do not", "deny", "not now", "cancel", "거부", "허용 안", "허용하지", "취소"],
+  allowLike: ["allow", "always", "허용", "항상", "1회", "한 번만", "approve", "승인"],
 };
 
 export interface AppApprovalCard {
@@ -48,7 +55,50 @@ export interface AppApprovalCard {
   toolText: string;
   /** Best allow-type button (lowest rank) and its index in the remembered button list. */
   button: { label: string; rank: number; index: number };
+  /** Index of the card element in the remembered subject list (for diagnostics). */
+  subject?: number;
 }
+
+/** An allow-looking button, or an allowed app's prompt, that the scan does not take. */
+export interface AppApprovalSkip {
+  /**
+   * label: no known allow label (an allowed app's prompt with unknown buttons, or an
+   * allow-looking label that is not in the list); excluded: an ancestor rules the place out;
+   * no-card: nothing around the button counts as a card.
+   */
+  reason: "label" | "excluded" | "no-card";
+  /** Labels of the buttons concerned. */
+  labels: string[];
+  /** The card's title, when there is a card. */
+  title: string;
+  /** The allowed app that title names, if any. */
+  app: string | null;
+  /** The excluding ancestor (tag#id.classes [role] [data-testid]) for "excluded". */
+  detail: string;
+  /** Index of the element to describe in a diagnostic. */
+  subject: number;
+}
+
+/** What a diagnostic file holds about a card that was not taken or not clicked. */
+export interface AppApprovalDiagnosticPage {
+  url: string;
+  /** The card's outerHTML, cut at about 30 KB. */
+  html: string;
+  htmlLength: number;
+  /** The card and its ancestors up to body. */
+  ancestors: Array<{ tag: string; id: string; className: string; role: string; testId: string }>;
+  buttons: Array<{ label: string; text: string; ariaLabel: string | null; disabled: boolean }>;
+}
+
+export interface AppApprovalDiagnostic {
+  /** The log line it belongs to. */
+  reason: string;
+  capturedAt: string;
+  /** Null when the card was gone before it could be read. */
+  page: AppApprovalDiagnosticPage | null;
+}
+
+const DIAGNOSTIC_HTML_CHARS = 30_000;
 
 /**
  * Finds visible approval cards. A candidate is an allow-type button. When its nearest alert or
@@ -68,7 +118,13 @@ export function scanAppApprovalCards(
   doc: Document,
   allowApps: readonly string[],
   vocabulary: AppApprovalVocabulary,
-): { cards: AppApprovalCard[]; buttons: Element[] } {
+): {
+  cards: AppApprovalCard[];
+  buttons: Element[];
+  skipped: AppApprovalSkip[];
+  subjects: Element[];
+  labelOf: (button: Element) => string;
+} {
   const normalize = (value: unknown): string =>
     String(value ?? "")
       .replace(/\s+/g, " ")
@@ -98,6 +154,7 @@ export function scanAppApprovalCards(
   const hints = [
     ...vocabulary.exact.map((entry) => entry.label),
     ...vocabulary.prefixes.map((entry) => entry.prefix),
+    ...vocabulary.allowLike,
   ];
   const mayAllow = (button: Element): boolean => {
     const quick = `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""}`;
@@ -167,6 +224,26 @@ export function scanAppApprovalCards(
     }
     return -1;
   };
+  const allowLike = (text: string): boolean => {
+    const folded = fold(text);
+    return !denied(folded) && vocabulary.allowLike.some((prefix) => folded.startsWith(prefix));
+  };
+  const describe = (element: Element): string => {
+    const classes = String(element.getAttribute("class") ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 4);
+    const role = element.getAttribute("role");
+    const testId = element.getAttribute("data-testid");
+    const id = element.getAttribute("id");
+    return [
+      element.tagName.toLowerCase(),
+      id ? `#${id}` : "",
+      classes.map((name) => `.${name}`).join(""),
+      role ? ` [role=${role}]` : "",
+      testId ? ` [data-testid=${testId}]` : "",
+    ].join("");
+  };
   const textOf = (root: Element, skip: string): string => {
     const parts: string[] = [];
     const walk = (node: Node): void => {
@@ -196,22 +273,27 @@ export function scanAppApprovalCards(
    * button must sit in a dialog, a turn or main with no excluded place in its whole ancestry: an
    * article inside prose or a user message must not end the check early.
    */
-  const placeOf = (button: Element): { region: Element | null; role: boolean } => {
+  const placeOf = (
+    button: Element,
+  ): { region: Element | null; role: boolean; excludedBy: Element | null } => {
     const role = roleCardOf(button);
     if (role) {
       for (let node: Element | null = role; node; node = node.parentElement) {
-        if (node.matches(USER) || node.matches(EDITABLE)) return { region: null, role: true };
+        if (node.matches(USER) || node.matches(EDITABLE)) {
+          return { region: null, role: true, excludedBy: node };
+        }
       }
-      return { region: role, role: true };
+      return { region: role, role: true, excludedBy: null };
     }
     for (let node = button.parentElement; node; node = node.parentElement) {
       if (node.matches(OFF_LIMITS) || node.matches(PAGE_CHROME)) {
-        return { region: null, role: false };
+        return { region: null, role: false, excludedBy: node };
       }
     }
     return {
       region: button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main"),
       role: false,
+      excludedBy: null,
     };
   };
   const cardOf = (button: Element, region: Element): Element | null => {
@@ -343,19 +425,56 @@ export function scanAppApprovalCards(
     role: boolean;
     textCard: Element;
   };
+  const enabled = (button: Element): boolean =>
+    !button.hasAttribute("disabled") && button.getAttribute("aria-disabled") !== "true";
+  const subjects: Element[] = [];
+  const subjectOf = (element: Element): number => {
+    const index = subjects.indexOf(element);
+    if (index >= 0) return index;
+    subjects.push(element);
+    return subjects.length - 1;
+  };
+  const skipped: AppApprovalSkip[] = [];
+  // Allow-looking buttons outside any role card whose label is not in the list; reported below
+  // unless their card is taken through another button.
+  const unknown: Array<{ label: string; region: Element; textCard: Element }> = [];
   const candidates: Candidate[] = [];
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
-    if (!mayAllow(button) || !visible(button)) continue;
-    if (button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true")
-      continue;
+    if (!mayAllow(button) || !visible(button) || !enabled(button)) continue;
     const text = label(button);
     const rank = rankOf(button, text);
-    if (rank < 0) continue;
-    const { region, role } = placeOf(button);
-    if (!region) continue;
+    if (rank < 0 && !allowLike(text)) continue;
+    const { region, role, excludedBy } = placeOf(button);
+    if (!region) {
+      const around = roleCardOf(button) ?? cardOf(button, doc.body) ?? button;
+      skipped.push({
+        reason: excludedBy ? "excluded" : "no-card",
+        labels: [text],
+        title: "",
+        app: null,
+        detail: excludedBy ? describe(excludedBy) : "",
+        subject: subjectOf(around),
+      });
+      continue;
+    }
     // The nearest ancestor with text of its own; a role card counts even with only a label.
     const textCard = cardOf(button, region) ?? (role ? region : null);
-    if (!textCard) continue;
+    if (!textCard) {
+      skipped.push({
+        reason: "no-card",
+        labels: [text],
+        title: "",
+        app: null,
+        detail: "",
+        subject: subjectOf(button.parentElement ?? button),
+      });
+      continue;
+    }
+    if (rank < 0) {
+      // Role cards are reported whole by the pass over role cards below.
+      if (!role) unknown.push({ label: text, region, textCard });
+      continue;
+    }
     candidates.push({ button, rank, label: text, region, role, textCard });
   }
   // A role element holding several prompts (buttons under different text blocks) is a container:
@@ -391,9 +510,51 @@ export function scanAppApprovalCards(
       title: title.slice(0, 200),
       toolText: text.slice(0, 500),
       button: { label: bestLabel, rank, index: buttons.length - 1 },
+      subject: subjectOf(card),
     });
   }
-  return { cards, buttons };
+  // Role cards with no allow button: reported when their title names an allowed app (its
+  // buttons were renamed, e.g. "Continue") or when one of them looks like an allow button.
+  const takenRegions = new Set(
+    candidates.filter((entry) => entry.role).map((entry) => entry.region),
+  );
+  for (const role of Array.from(doc.querySelectorAll(ROLE_CARD))) {
+    if (takenRegions.has(role) || !visible(role) || role.querySelector(EDITABLE)) continue;
+    let placeable = true;
+    for (let node: Element | null = role; node; node = node.parentElement) {
+      if (node.matches(USER) || node.matches(EDITABLE)) placeable = false;
+    }
+    if (!placeable) continue;
+    const own = Array.from(role.querySelectorAll(BUTTON)).filter(
+      (button) => button.closest(ROLE_CARD) === role && visible(button) && enabled(button),
+    );
+    if (own.length === 0) continue;
+    const labels = own.map((button) => label(button));
+    const title = titlesOf(role, role)[0] ?? "";
+    const app = names(title);
+    if (!app && !labels.some(allowLike)) continue;
+    skipped.push({
+      reason: "label",
+      labels,
+      title: title.slice(0, 200),
+      app,
+      detail: "",
+      subject: subjectOf(role),
+    });
+  }
+  for (const { label: text, region, textCard } of unknown) {
+    if (byCard.has(textCard)) continue;
+    const title = titlesOf(textCard, region)[0] ?? "";
+    skipped.push({
+      reason: "label",
+      labels: [text],
+      title: title.slice(0, 200),
+      app: names(title),
+      detail: "",
+      subject: subjectOf(textCard),
+    });
+  }
+  return { cards, buttons, skipped, subjects, labelOf: label };
 }
 
 export function buildAppApprovalScanExpression(
@@ -402,9 +563,42 @@ export function buildAppApprovalScanExpression(
 ): string {
   return `(() => {
     const scan = ${scanAppApprovalCards.toString()};
-    const { cards, buttons } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
-    window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons };
-    return cards;
+    const { cards, buttons, skipped, subjects, labelOf } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
+    window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons, subjects, labelOf };
+    return { cards, skipped };
+  })()`;
+}
+
+/**
+ * Reads what a diagnostic file needs about subject `subject` of the scan stored under `token`:
+ * its outerHTML (cut at about 30 KB), its buttons and its ancestors up to body. Null when the
+ * element is gone.
+ */
+export function buildAppApprovalDiagnosticExpression(token: string, subject: number): string {
+  return `(() => {
+    const store = window.__oracleApprovalButtons;
+    if (!store || store.token !== ${JSON.stringify(token)}) return null;
+    const node = store.subjects?.[${subject}];
+    if (!node || !node.isConnected) return null;
+    const ancestors = [];
+    for (let current = node; current; current = current.parentElement) {
+      ancestors.push({
+        tag: String(current.tagName || '').toLowerCase(),
+        id: current.getAttribute('id') || '',
+        className: current.getAttribute('class') || '',
+        role: current.getAttribute('role') || '',
+        testId: current.getAttribute('data-testid') || '',
+      });
+      if (current === document.body) break;
+    }
+    const buttons = Array.from(node.querySelectorAll('button, [role="button"]')).map((button) => ({
+      label: typeof store.labelOf === 'function' ? store.labelOf(button) : '',
+      text: String(button.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300),
+      ariaLabel: button.getAttribute('aria-label'),
+      disabled: button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true',
+    }));
+    const html = String(node.outerHTML || '');
+    return { url: location.href, html: html.slice(0, ${DIAGNOSTIC_HTML_CHARS}), htmlLength: html.length, ancestors, buttons };
   })()`;
 }
 
@@ -432,8 +626,28 @@ export interface AppApprovalMonitorOptions {
   logger: BrowserLogger;
   intervalMs?: number;
   onApproval?: (record: BrowserAppApprovalRecord) => void | Promise<void>;
+  /**
+   * Saves a diagnostic of a card that was not taken or whose click did not happen, once per card
+   * (the run writes it into its session directory). Returns where it went, if anywhere.
+   */
+  saveDiagnostic?: (diagnostic: AppApprovalDiagnostic) => Promise<string | undefined | void>;
   /** Run-level set of stop functions, so the run's cleanup can stop a monitor it raced past. */
   registry?: Set<() => Promise<void>>;
+}
+
+const quote = (labels: readonly string[]) =>
+  labels.map((label) => `"${label.slice(0, 80)}"`).join(", ") || "(no label)";
+
+/** The log line for a button or prompt the scan does not take. */
+export function describeAppApprovalSkip(skip: AppApprovalSkip): string {
+  const card = skip.title ? ` in "${skip.title.slice(0, 160)}"` : "";
+  if (skip.reason === "excluded") {
+    return `[browser] App approval left for the user: ${quote(skip.labels)} sits inside ${skip.detail || "an excluded place"}, where approval cards are not taken from.`;
+  }
+  if (skip.reason === "no-card") {
+    return `[browser] App approval left for the user: ${quote(skip.labels)} has no card around it.`;
+  }
+  return `[browser] App approval left for the user: no known allow label among ${quote(skip.labels)}${card}.`;
 }
 
 // Unref'd so a monitor can never keep the process alive on its own.
@@ -457,27 +671,106 @@ export function startAppApprovalMonitor(
   const allowApps = options.allowApps.map((app) => app.trim()).filter(Boolean);
   if (allowApps.length === 0) return async () => {};
   const intervalMs = Math.max(250, options.intervalMs ?? 1_500);
-  const leftForUser = new Set<string>();
+  // Each distinct outcome is logged once per card, and again only when it changes.
+  const reported = new Set<string>();
+  const diagnosed = new Set<string>();
   const lastClick = new Map<string, number>();
+  const failures = new Map<string, { attempts: number; outcome: string }>();
   const reportedErrors = new Set<string>();
   let stopped = false;
 
+  const reportOnce = (key: string, line: string): boolean => {
+    if (reported.has(key)) return false;
+    reported.add(key);
+    options.logger(line);
+    return true;
+  };
+  // A diagnostic never stops the watch: failures to read or save it are logged and dropped.
+  const diagnose = async (
+    cardKey: string,
+    reason: string,
+    token: string,
+    subject: number | undefined,
+  ): Promise<void> => {
+    if (!options.saveDiagnostic || diagnosed.has(cardKey)) return;
+    diagnosed.add(cardKey);
+    try {
+      let page: AppApprovalDiagnosticPage | null = null;
+      if (typeof subject === "number") {
+        const evaluated = await runtime.evaluate({
+          expression: buildAppApprovalDiagnosticExpression(token, subject),
+          returnByValue: true,
+        });
+        page = (evaluated?.result?.value as AppApprovalDiagnosticPage | null | undefined) ?? null;
+      }
+      const saved = await options.saveDiagnostic({
+        reason,
+        capturedAt: new Date().toISOString(),
+        page,
+      });
+      if (saved) options.logger(`[browser] App approval diagnostic saved: ${saved}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      options.logger(`[browser] App approval diagnostic could not be saved: ${message}`);
+    }
+  };
+
+  /** A trusted click on the card's button; a click the guard cancelled counts as not happened. */
+  const tryTrustedClick = async (
+    card: AppApprovalCard,
+    token: string,
+  ): Promise<GuardedTrustedClickResult | { status: "cancelled"; detail: string }> => {
+    try {
+      return await guardedTrustedClick(runtime, input, {
+        locate: buildAppApprovalLocate(allowApps, token, card),
+        stage: "app-approval",
+        target: `The "${card.button.label}" button for ${card.app}`,
+        settleTimeoutMs: 1_500,
+      });
+    } catch (error) {
+      if (
+        error instanceof BrowserAutomationError &&
+        error.details?.code === "trusted-click-cancelled"
+      ) {
+        return { status: "cancelled", detail: "the button moved or was covered at delivery" };
+      }
+      throw error;
+    }
+  };
+
   const poll = async (): Promise<void> => {
     const token = randomUUID();
-    const { result } = await runtime.evaluate({
+    const evaluated = await runtime.evaluate({
       expression: buildAppApprovalScanExpression(allowApps, token),
       returnByValue: true,
     });
-    const cards = Array.isArray(result?.value) ? (result.value as AppApprovalCard[]) : [];
+    if (evaluated?.exceptionDetails) {
+      const details = evaluated.exceptionDetails;
+      throw new Error(
+        `the page scan threw: ${details.exception?.description ?? details.text ?? "unknown error"}`,
+      );
+    }
+    const value = evaluated?.result?.value as
+      | AppApprovalCard[]
+      | { cards?: AppApprovalCard[]; skipped?: AppApprovalSkip[] }
+      | undefined;
+    const cards = Array.isArray(value) ? value : Array.isArray(value?.cards) ? value.cards : [];
+    const skipped = !Array.isArray(value) && Array.isArray(value?.skipped) ? value.skipped : [];
     const visibleKeys = new Set(cards.map((card) => card.key));
     for (const key of lastClick.keys()) if (!visibleKeys.has(key)) lastClick.delete(key);
+    for (const key of failures.keys()) if (!visibleKeys.has(key)) failures.delete(key);
+    for (const skip of skipped) {
+      const cardKey = `skip\n${skip.title}\n${skip.labels.join("\n")}`;
+      const line = describeAppApprovalSkip(skip);
+      if (reportOnce(`${cardKey}\n${skip.reason}\n${skip.detail}`, line)) {
+        await diagnose(cardKey, line, token, skip.subject);
+      }
+    }
     for (const card of cards) {
       if (!card.app) {
-        if (!leftForUser.has(card.key)) {
-          leftForUser.add(card.key);
-          options.logger(
-            `[browser] App approval for "${(card.title || card.toolText).slice(0, 160)}" left for the user (its title names no app in --browser-allow-app).`,
-          );
+        const line = `[browser] App approval for "${(card.title || card.toolText).slice(0, 160)}" left for the user (its title names no app in --browser-allow-app).`;
+        if (reportOnce(`${card.key}\ntitle`, line)) {
+          await diagnose(card.key, line, token, card.subject);
         }
         continue;
       }
@@ -489,16 +782,22 @@ export function startAppApprovalMonitor(
         );
       }
       lastClick.set(card.key, Date.now());
-      const clicked = await guardedTrustedClick(runtime, input, {
-        locate: buildAppApprovalLocate(allowApps, token, card),
-        stage: "app-approval",
-        target: `The "${card.button.label}" button for ${card.app}`,
-        settleTimeoutMs: 1_500,
-      });
+      const clicked = await tryTrustedClick(card, token);
       if (clicked.status !== "clicked") {
         lastClick.delete(card.key);
+        const state = failures.get(card.key) ?? { attempts: 0, outcome: "" };
+        state.attempts += 1;
+        failures.set(card.key, state);
+        const outcome = `${clicked.status}${clicked.detail ? `: ${clicked.detail}` : ""}`;
+        if (outcome !== state.outcome || state.attempts % 10 === 0) {
+          const line = `[browser] App approval for ${card.app}: the "${card.button.label}" click did not happen (${outcome}; attempt ${state.attempts}); will retry.`;
+          options.logger(line);
+          await diagnose(card.key, line, token, card.subject);
+        }
+        state.outcome = outcome;
         continue;
       }
+      failures.delete(card.key);
       const record: BrowserAppApprovalRecord = {
         app: card.app,
         button: card.button.label,

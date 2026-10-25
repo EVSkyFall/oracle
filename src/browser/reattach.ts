@@ -47,7 +47,7 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
-import { withAppApprovalMonitor } from "./actions/appApprovals.js";
+import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
@@ -73,6 +73,8 @@ export interface ReattachDeps {
   createTemporaryProfile?: () => Promise<string>;
   /** Called as soon as an allowed app's tool prompt is approved while reattached. */
   onAppApproval?: (record: BrowserAppApprovalRecord) => void | Promise<void>;
+  /** Saves a diagnostic of an approval card that was not taken or not clicked (session files). */
+  saveAppApprovalDiagnostic?: AppApprovalMonitorOptions["saveDiagnostic"];
 }
 
 export interface ReattachResult {
@@ -278,6 +280,7 @@ async function resumeBrowserSessionInternal(
       allowApps: normalizeBrowserAllowApps(config?.allowApps),
       logger,
       onApproval: deps.onAppApproval,
+      saveDiagnostic: deps.saveAppApprovalDiagnostic,
     };
     if (config?.researchMode === "deep") {
       const waitForDeepResearch =
@@ -569,6 +572,7 @@ async function resumeBrowserSessionViaNewChrome(
       allowApps: resolved.allowApps,
       logger,
       onApproval: deps.onAppApproval,
+      saveDiagnostic: deps.saveAppApprovalDiagnostic,
     };
     if (resolved.researchMode === "deep") {
       const waitForDeepResearch =

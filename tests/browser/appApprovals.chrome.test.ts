@@ -120,7 +120,7 @@ describe.runIf(enabled)("app approval monitor in real Chrome", () => {
         expression: buildAppApprovalScanExpression(["CODEXish"], "fixture"),
         returnByValue: true,
       });
-      const cards = result.value as Array<{ app: string | null; title: string }>;
+      const { cards } = result.value as { cards: Array<{ app: string | null; title: string }> };
       expect(cards.map((entry) => [entry.title, entry.app])).toEqual([
         ["Allow Gmail?", null],
         ["Allow Gmail?", null],
@@ -165,7 +165,7 @@ describe.runIf(enabled)("app approval monitor in real Chrome", () => {
         expression: buildAppApprovalScanExpression(["CODEXish"], "fixture"),
         returnByValue: true,
       });
-      const cards = result.value as Array<{ app: string | null; title: string }>;
+      const { cards } = result.value as { cards: Array<{ app: string | null; title: string }> };
       expect(cards.map((entry) => [entry.title, entry.app])).toEqual([
         ...Array.from({ length: 7 }, () => ["Allow Gmail?", null]),
         ["Allow CODEXish?", "CODEXish"],

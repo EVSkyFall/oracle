@@ -491,6 +491,274 @@ describe("app approval role cards", () => {
   });
 });
 
+describe("app approval skips", () => {
+  const skippedOf = (children: DomNode[]) =>
+    scanAppApprovalCards(
+      new FakeDocument(children) as unknown as Document,
+      ["CODEXish"],
+      APP_APPROVAL_VOCABULARY,
+    );
+
+  test("an allowed app's alert with unknown buttons is reported with its labels", () => {
+    const { cards, skipped } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", { role: "alert" }, [
+          new DomNode("p", {}, ["Allow CODEXish to use Fs Read?"]),
+          new DomNode("div", {}, [button("Cancel"), button("Continue")]),
+        ]),
+      ]),
+    ]);
+    expect(cards).toEqual([]);
+    expect(skipped).toEqual([
+      expect.objectContaining({
+        reason: "label",
+        labels: ["Cancel", "Continue"],
+        title: "Allow CODEXish to use Fs Read?",
+        app: "CODEXish",
+      }),
+    ]);
+  });
+
+  test("another app's alert without allow-looking buttons is not reported", () => {
+    const { skipped } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", { role: "alert" }, [
+          new DomNode("p", {}, ["Gmail could not connect"]),
+          button("Retry"),
+        ]),
+      ]),
+    ]);
+    expect(skipped).toEqual([]);
+  });
+
+  test("an allow-looking label outside the list is reported, in role cards and other cards", () => {
+    const { cards, skipped } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", { class: "card" }, [
+          new DomNode("p", {}, ["Allow CODEXish to run echo?"]),
+          button("Approve"),
+        ]),
+        new DomNode("div", { role: "alertdialog" }, [
+          new DomNode("p", {}, ["Allow Gmail to send?"]),
+          button("Allowed"),
+        ]),
+      ]),
+    ]);
+    expect(cards).toEqual([]);
+    expect(skipped.map((skip) => [skip.reason, skip.labels, skip.app])).toEqual([
+      ["label", ["Allowed"], null],
+      ["label", ["Approve"], "CODEXish"],
+    ]);
+  });
+
+  test("an allow button in an excluded place is reported with that place", () => {
+    const card = () =>
+      new DomNode("div", {}, [new DomNode("p", {}, ["Allow CODEXish?"]), button("Always allow")]);
+    const { cards, skipped } = skippedOf([
+      new DomNode("nav", {}, [card()]),
+      new DomNode("main", {}, [
+        new DomNode("form", { class: "relative flex flex-col gap-2 extra" }, [card()]),
+      ]),
+    ]);
+    expect(cards).toEqual([]);
+    expect(skipped.map((skip) => [skip.reason, skip.labels, skip.detail])).toEqual([
+      ["excluded", ["Always allow"], "nav"],
+      ["excluded", ["Always allow"], "form.relative.flex.flex-col.gap-2"],
+    ]);
+  });
+
+  test("an allow button with nothing around it is reported as having no card", () => {
+    const { skipped } = skippedOf([
+      new DomNode("main", {}, [new DomNode("div", {}, [button("Allow")])]),
+    ]);
+    expect(skipped).toEqual([expect.objectContaining({ reason: "no-card", labels: ["Allow"] })]);
+  });
+
+  test("deny buttons and the other buttons of a taken card are not reported", () => {
+    const { cards, skipped } = skippedOf([
+      new DomNode("main", {}, [
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow CODEXish to run echo?"]),
+          button("Approve all"),
+          button("Always allow"),
+          button("Don't allow"),
+        ]),
+        new DomNode("div", { role: "alert" }, [
+          new DomNode("p", {}, ["Allow CODEXish to read?"]),
+          button("Allow once"),
+          button("Approve later"),
+        ]),
+      ]),
+    ]);
+    expect(cards).toHaveLength(2);
+    expect(skipped).toEqual([]);
+  });
+});
+
+describe("app approval monitor reporting", () => {
+  const codexishCard = {
+    key: "codexish",
+    app: "CODEXish",
+    title: "Allow CODEXish?",
+    toolText: "CODEXish wants to run echo",
+    button: { label: "Always allow", rank: 0, index: 0 },
+    subject: 0,
+  };
+  const page = {
+    url: "https://chatgpt.com/c/x",
+    html: "<div role=alert>…</div>",
+    htmlLength: 24,
+    ancestors: [{ tag: "div", id: "", className: "", role: "alert", testId: "" }],
+    buttons: [{ label: "Continue", text: "Continue", ariaLabel: null, disabled: false }],
+  };
+
+  test("reports each skip and each card for another app once, with one diagnostic per card", async () => {
+    const scanResult = {
+      cards: [
+        {
+          key: "gmail",
+          app: null,
+          title: "Allow Gmail?",
+          toolText: "Allow Gmail?",
+          button: { label: "Allow", rank: 2, index: 0 },
+          subject: 0,
+        },
+      ],
+      skipped: [
+        {
+          reason: "label",
+          labels: ["Continue"],
+          title: "Allow CODEXish?",
+          app: "CODEXish",
+          detail: "",
+          subject: 1,
+        },
+        {
+          reason: "excluded",
+          labels: ["Allow"],
+          title: "",
+          app: null,
+          detail: "form.relative",
+          subject: 2,
+        },
+      ],
+    };
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          return { result: { value: scanResult } };
+        }
+        if (expression.includes("store.subjects")) return { result: { value: page } };
+        return { result: { value: null } };
+      }),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const saveDiagnostic = vi.fn(async () => "C:/sessions/s/artifacts/app-approval-diag-1.html");
+    const stop = startAppApprovalMonitor(runtime as never, undefined, {
+      allowApps: ["CODEXish"],
+      logger,
+      intervalMs: 250,
+      saveDiagnostic,
+    });
+    await vi.waitFor(
+      () =>
+        expect(
+          runtime.evaluate.mock.calls.filter(([call]) =>
+            call.expression.includes("window.__oracleApprovalButtons = {"),
+          ).length,
+        ).toBeGreaterThanOrEqual(4),
+      { timeout: 5_000 },
+    );
+    await stop();
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    expect(lines.filter((line) => line.includes('no known allow label among "Continue"'))).toEqual([
+      '[browser] App approval left for the user: no known allow label among "Continue" in "Allow CODEXish?".',
+    ]);
+    expect(lines.filter((line) => line.includes("sits inside form.relative"))).toHaveLength(1);
+    expect(lines.filter((line) => line.includes('"Allow Gmail?" left for the user'))).toHaveLength(
+      1,
+    );
+    expect(saveDiagnostic).toHaveBeenCalledTimes(3);
+    expect(saveDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: expect.stringContaining('no known allow label among "Continue"'),
+        page,
+      }),
+    );
+    expect(lines.filter((line) => line.includes("diagnostic saved"))).toHaveLength(3);
+  });
+
+  test("a click that does not happen is logged with its status, when it changes and every 10 attempts", async () => {
+    let arms = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          return { result: { value: { cards: [codexishCard], skipped: [] } } };
+        }
+        if (expression.includes("store.subjects")) return { result: { value: page } };
+        if (expression.includes("__oracleTrustedClickGuards ??=")) {
+          arms += 1;
+          // Attempts 1-11: the button moved before the click; then it is never reached.
+          return {
+            result: {
+              value: arms <= 11 ? { ready: false } : { ready: true, contextMatches: true },
+            },
+          };
+        }
+        if (expression.includes("const summary = { reached")) {
+          return { result: { value: { reached: false, blocked: null } } };
+        }
+        if (expression.includes("'settling'")) {
+          return { result: { value: { status: "ready", x: 50, y: 60 } } };
+        }
+        return { result: { value: null } };
+      }),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const saveDiagnostic = vi.fn(async () => undefined);
+    const onApproval = vi.fn();
+    const stop = startAppApprovalMonitor(
+      runtime as never,
+      { dispatchMouseEvent: vi.fn() } as never,
+      { allowApps: ["CODEXish"], logger, intervalMs: 250, saveDiagnostic, onApproval },
+    );
+    await vi.waitFor(() => expect(arms).toBeGreaterThanOrEqual(13), { timeout: 20_000 });
+    await stop();
+    const failures = logger.mock.calls
+      .map(([line]) => String(line))
+      .filter((line) => line.includes("click did not happen"));
+    expect(failures).toEqual([
+      '[browser] App approval for CODEXish: the "Always allow" click did not happen (obscured: target moved before the click; attempt 1); will retry.',
+      '[browser] App approval for CODEXish: the "Always allow" click did not happen (obscured: target moved before the click; attempt 10); will retry.',
+      '[browser] App approval for CODEXish: the "Always allow" click did not happen (unreached: the click did not reach the target; attempt 12); will retry.',
+    ]);
+    expect(saveDiagnostic).toHaveBeenCalledTimes(1);
+    expect(onApproval).not.toHaveBeenCalled();
+  }, 30_000);
+
+  test("a page scan that throws is reported once and the watch goes on", async () => {
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: { type: "object", subtype: "error" },
+        exceptionDetails: { text: "Uncaught", exception: { description: "TypeError: boom" } },
+      })),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const stop = startAppApprovalMonitor(runtime as never, undefined, {
+      allowApps: ["CODEXish"],
+      logger,
+      intervalMs: 250,
+    });
+    await vi.waitFor(() => expect(runtime.evaluate.mock.calls.length).toBeGreaterThanOrEqual(3), {
+      timeout: 5_000,
+    });
+    await stop();
+    expect(logger.mock.calls.map(([line]) => String(line))).toEqual([
+      "[browser] App approval check failed (will keep watching): the page scan threw: TypeError: boom",
+    ]);
+  });
+});
+
 describe("app approval monitor", () => {
   test("approves allowed cards, records them, and logs other cards once", async () => {
     const cards = [

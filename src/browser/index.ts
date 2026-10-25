@@ -67,6 +67,7 @@ import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { withAppApprovalMonitor } from "./actions/appApprovals.js";
+import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
 import { formatModelPickerEvidence, readModelPickerEvidence } from "./actions/modelPickerState.js";
@@ -1306,6 +1307,7 @@ async function runBrowserModeInternal(
             appApprovals.push(record);
             await emitRuntimeHint();
           },
+          saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic(options.sessionId, diagnostic),
         },
         operation,
       );
@@ -3178,6 +3180,7 @@ async function runRemoteBrowserMode(
             appApprovals.push(record);
             await emitRuntimeHint();
           },
+          saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic(options.sessionId, diagnostic),
         },
         operation,
       );
