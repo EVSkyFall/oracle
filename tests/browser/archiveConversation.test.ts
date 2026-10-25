@@ -13,7 +13,7 @@ import {
   readArchiveSignals,
   resolveBrowserArchiveDecision,
 } from "../../src/browser/actions/archiveConversation.js";
-import { FakeDocument, FakeElement } from "./domFixture.js";
+import { DomNode, FakeDocument, FakeElement } from "./domFixture.js";
 
 describe("browser conversation archive policy", () => {
   test("archives successful non-project one-shots in auto mode", () => {
@@ -361,20 +361,27 @@ describe("archive locale label inventory", () => {
 });
 
 describe("archive confirmation ownership", () => {
-  const dialog = (text: string) =>
-    new FakeElement("div", { role: "dialog" }, [
-      new FakeElement("p", {}, [], text),
-      new FakeElement("button", {}, [], "Archive"),
+  type Part = DomNode | string;
+  const dialog = (...text: Part[]) =>
+    new DomNode("div", { role: "dialog" }, [
+      new DomNode("p", {}, text),
+      new DomNode("div", {}, [new DomNode("button", {}, ["Archive"])]),
     ]);
-  const page = (...dialogs: FakeElement[]) =>
+  const strong = (name: string) => new DomNode("strong", {}, [name]);
+  const confirmOf = (node: DomNode) => node.children[1].children[0];
+  const page = (titles: Record<string, string>, ...dialogs: DomNode[]) =>
     new FakeDocument([
-      new FakeElement("nav", {}, [
-        new FakeElement("a", { href: "/c/aaa" }, [], "Trip planning"),
-        new FakeElement("a", { href: "/c/bbb" }, [], "Budget review"),
-      ]),
+      new DomNode(
+        "nav",
+        {},
+        Object.entries(titles).map(
+          ([id, title]) => new DomNode("a", { href: `/c/${id}` }, [title]),
+        ),
+      ),
       ...dialogs,
     ]);
-  const inspect = async (doc: FakeDocument, before: FakeElement[] = []) => {
+  const TITLES = { aaa: "Trip planning", bbb: "Budget review" };
+  const inspect = async (doc: FakeDocument, before: DomNode[] = []) => {
     const { inspectArchiveConfirm, ARCHIVE_LABELS } =
       await import("../../src/browser/actions/archiveConversation.js");
     return inspectArchiveConfirm(doc as unknown as Document, ARCHIVE_LABELS, {
@@ -384,21 +391,50 @@ describe("archive confirmation ownership", () => {
   };
 
   test("only a dialog that appeared after our click, naming our chat or none, is ours", async () => {
-    const ours = dialog("This will archive Trip planning.");
-    expect((await inspect(page(ours))).button).toBe(ours.children[1]);
+    const ours = dialog("This will archive ", strong("Trip planning"), ".");
+    expect((await inspect(page(TITLES, ours))).button).toBe(confirmOf(ours));
     const unnamed = dialog("Archive this chat?");
-    expect((await inspect(page(unnamed))).button).toBe(unnamed.children[1]);
+    expect((await inspect(page(TITLES, unnamed))).button).toBe(confirmOf(unnamed));
     const old = dialog("Archive this chat?");
-    expect(await inspect(page(old), [old])).toEqual({ button: null, ambiguous: null });
+    expect(await inspect(page(TITLES, old), [old])).toEqual({ button: null, ambiguous: null });
   });
 
   test("another chat's confirmation, or two new ones, are ambiguous and nothing is chosen", async () => {
-    await expect(inspect(page(dialog("This will archive Budget review.")))).resolves.toEqual({
+    await expect(
+      inspect(page(TITLES, dialog("This will archive ", strong("Budget review"), "."))),
+    ).resolves.toEqual({
       button: null,
       ambiguous: 'the confirmation names another chat ("budget review")',
     });
     await expect(
-      inspect(page(dialog("Archive this chat?"), dialog("Archive this chat?"))),
+      inspect(page(TITLES, dialog("This will archive “Budget review”."))),
+    ).resolves.toMatchObject({ button: null, ambiguous: expect.stringContaining("budget review") });
+    await expect(
+      inspect(page(TITLES, dialog("Archive this chat?"), dialog("Archive this chat?"))),
     ).resolves.toEqual({ button: null, ambiguous: "2 new confirmation dialogs are open" });
+  });
+
+  test("a chat name counts only as a whole name, never as part of other text", async () => {
+    const titles = { aaa: "Plan", bbb: "Plan review" };
+    // Our chat "Plan" is part of the other chat's name: that confirmation is not ours.
+    await expect(
+      inspect(page(titles, dialog("This will archive ", strong("Plan review"), "."))),
+    ).resolves.toEqual({
+      button: null,
+      ambiguous: 'the confirmation names another chat ("plan review")',
+    });
+    const ours = dialog("This will archive ", strong("Plan"), ".");
+    expect((await inspect(page(titles, ours))).button).toBe(confirmOf(ours));
+    // A name that only appears inside a sentence names no chat; the dialog is ours by appearing
+    // after our click.
+    const prose = dialog("This will archive Plan review.");
+    expect((await inspect(page(titles, prose))).button).toBe(confirmOf(prose));
+  });
+
+  test("button labels never name a chat, so a chat titled Archive leaves a generic confirmation ours", async () => {
+    const generic = dialog("Archive this chat?");
+    await expect(inspect(page({ aaa: "Trip planning", bbb: "Archive" }, generic))).resolves.toEqual(
+      { button: confirmOf(generic), ambiguous: null },
+    );
   });
 });

@@ -35,13 +35,16 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
   const params = new URLSearchParams(location.search);
   const mode = params.get('mode') || 'today';
   const rows = (params.get('rows') || '').split(',').filter(Boolean);
+  // titles=bbb:Archive,aaa:Plan gives rows their own titles; the default is "Chat <id>".
+  const titles = Object.fromEntries((params.get('titles') || '').split(',').filter(Boolean).map((entry) => entry.split(':')));
+  const titleOf = (id) => titles[id] || 'Chat ' + id;
   const legacyLayout = mode === 'legacy' || mode === 'spa-switch';
   window.actions = [];
   const list = document.getElementById('list');
   for (const id of rows) {
     const item = document.createElement('div');
     item.setAttribute('role', 'listitem');
-    item.innerHTML = '<div role="group" class="row" aria-label="Chat ' + id + '"><div><a href="/c/' + id + '">Chat ' + id + '</a></div>' +
+    item.innerHTML = '<div role="group" class="row" aria-label="Chat ' + id + '"><div><a href="/c/' + id + '">' + titleOf(id) + '</a></div>' +
       (legacyLayout ? '' : '<div class="actions"><div role="presentation"><button type="button" id="trigger-' + id + '" aria-label="Chat actions" aria-haspopup="menu" aria-expanded="false">⋯</button></div><button type="button" aria-label="Pin chat">p</button></div>') +
       '</div>';
     list.append(item);
@@ -58,20 +61,26 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
       history.pushState({}, '', '/');
     }
   };
-  // A confirmation dialog whose Archive button archives \`chat\`; named = it says which chat.
+  // A confirmation dialog whose Archive button archives \`chat\`; named = it says which chat (in
+  // <strong>, like ChatGPT's delete confirmation). \`dialog.chat\` can be set later.
   const openConfirm = (chat, named) => {
     const dialog = document.createElement('div');
     dialog.setAttribute('role', 'dialog');
     dialog.style.cssText = 'position: fixed; left: 450px; top: 200px; width: 320px; height: 120px; background: #fff; border: 1px solid #000;';
-    dialog.innerHTML = '<p>' + (named ? 'This will archive Chat ' + chat + '.' : 'Archive this chat?') + '</p><button type="button" style="width: 90px; height: 24px">Archive</button>';
+    dialog.innerHTML = '<p>' + (named ? 'This will archive <strong>' + titleOf(chat) + '</strong>.' : 'Archive this chat?') + '</p><button type="button" style="width: 90px; height: 24px">Archive</button>';
+    dialog.chat = chat;
     dialog.querySelector('button').addEventListener('click', (event) => {
       if (!event.isTrusted) return;
-      window.actions.push({ item: 'Confirm', chat });
+      window.actions.push({ item: 'Confirm', chat: dialog.chat });
       dialog.remove();
-      archiveRow(chat);
+      archiveRow(dialog.chat);
     });
     document.body.append(dialog);
+    return dialog;
   };
+  // A generic confirmation that exists hidden before any click and is shown by Archive.
+  const hiddenConfirm = mode === 'hidden-confirm' ? openConfirm(null, false) : null;
+  if (hiddenConfirm) hiddenConfirm.style.display = 'none';
   let open = null;
   const closeMenu = () => {
     if (!open) return;
@@ -103,6 +112,7 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
         if (mode === 'stuck-nav') { history.pushState({}, '', '/c/zzz'); return; }
         if (mode === 'confirm') { openConfirm(chat, true); return; }
         if (mode === 'unnamed-confirm') { openConfirm(chat, false); return; }
+        if (mode === 'hidden-confirm') { hiddenConfirm.chat = chat; hiddenConfirm.style.display = 'block'; return; }
         // Another chat's confirmation opens on the same page while we wait for ours.
         if (mode === 'foreign-confirm') { setTimeout(() => openConfirm('bbb', true), 100); return; }
         archiveRow(chat);
@@ -270,10 +280,17 @@ describe.runIf(enabled)("conversation archive in real Chrome", () => {
     expect((await pageState()).actions).toEqual([{ item: "Archive", chat: "aaa" }]);
   }, 60_000);
 
-  test.each([["confirm"], ["unnamed-confirm"]])(
-    "the confirmation that our Archive click opened is confirmed (%s)",
-    async (mode) => {
-      const url = await load("aaa", { rows: "bbb,aaa", mode });
+  test.each([
+    ["confirm", ""],
+    ["unnamed-confirm", ""],
+    // A chat titled like the confirm button does not make a generic confirmation foreign.
+    ["unnamed-confirm", "bbb:Archive"],
+    // Hidden before the Archive click and shown after it: it is new.
+    ["hidden-confirm", ""],
+  ])(
+    "the confirmation that our Archive click opened is confirmed (%s, titles %j)",
+    async (mode, titles) => {
+      const url = await load("aaa", { rows: "bbb,aaa", mode, titles });
       await expect(archive(url)).resolves.toMatchObject({ archived: true });
       const state = await pageState();
       expect(state.actions).toEqual([
@@ -285,10 +302,15 @@ describe.runIf(enabled)("conversation archive in real Chrome", () => {
     60_000,
   );
 
-  test.each([["foreign-confirm"], ["stale-confirm"]])(
-    "a confirmation that is not ours is never clicked (%s)",
-    async (mode) => {
-      const url = await load("aaa", { rows: "bbb,aaa", mode });
+  test.each([
+    ["foreign-confirm", ""],
+    // Our chat "Plan" is only part of the name the confirmation shows.
+    ["foreign-confirm", "aaa:Plan,bbb:Plan review"],
+    ["stale-confirm", ""],
+  ])(
+    "a confirmation that is not ours is never clicked (%s, titles %j)",
+    async (mode, titles) => {
+      const url = await load("aaa", { rows: "bbb,aaa", mode, titles });
       const logger = vi.fn();
       await expect(archive(url, logger)).resolves.toMatchObject({
         archived: false,

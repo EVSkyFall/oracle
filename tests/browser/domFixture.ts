@@ -98,6 +98,30 @@ export class FakeElement {
   }
 }
 
+/** FakeElement with text nodes, enough for page functions that walk `childNodes`. */
+export class DomNode extends FakeElement {
+  nodeType = 1;
+  constructor(
+    tag: string,
+    attrs: Record<string, string> = {},
+    readonly nodes: Array<DomNode | string> = [],
+  ) {
+    super(
+      tag,
+      attrs,
+      nodes.filter((node): node is DomNode => typeof node !== "string"),
+    );
+  }
+  get childNodes(): Array<DomNode | { nodeType: number; nodeValue: string }> {
+    return this.nodes.map((node) =>
+      typeof node === "string" ? { nodeType: 3, nodeValue: node } : node,
+    );
+  }
+  override get textContent(): string {
+    return this.nodes.map((node) => (typeof node === "string" ? node : node.textContent)).join("");
+  }
+}
+
 export class FakeInputElement extends FakeElement {
   constructor(readonly files: Array<{ name: string }>) {
     super("input", { type: "file" });

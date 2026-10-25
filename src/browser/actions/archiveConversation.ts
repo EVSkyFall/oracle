@@ -349,10 +349,26 @@ export function menuOffersUnarchive(
 }
 
 /**
+ * Page function: the dialogs shown right now. A dialog that exists but is hidden is left out,
+ * so it counts as new once it is shown after our Archive click.
+ */
+export function shownArchiveDialogs(doc: Document): Element[] {
+  return Array.from(doc.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(
+    (node) => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = doc.defaultView?.getComputedStyle?.(node);
+      return style?.display !== "none" && style?.visibility !== "hidden";
+    },
+  );
+}
+
+/**
  * Page function: the Archive button of the confirmation dialog that belongs to our Archive
- * click. The dialog was not open before the click (`before`), and when it names a chat it names
- * ours (by its sidebar title). More than one such dialog, or one that names only another chat,
- * is ambiguous and nothing is chosen.
+ * click. The dialog was not shown before the click (`before`), which is what makes it ours.
+ * Chat names count only as whole names: an element of the dialog (never a button) or a quoted
+ * run whose full text equals a sidebar title. Naming ours or no chat → chosen; naming only
+ * another chat, or more than one new dialog → ambiguous and nothing is chosen.
  */
 export function inspectArchiveConfirm(
   doc: Document,
@@ -364,6 +380,7 @@ export function inspectArchiveConfirm(
 ): { button: Element | null; ambiguous: string | null } {
   const normalize = (value: unknown) =>
     String(value ?? "")
+      .normalize("NFC")
       .replace(/\s+/g, " ")
       .trim()
       .toLowerCase();
@@ -414,11 +431,33 @@ export function inspectArchiveConfirm(
       const title = normalize(link.textContent);
       if (title) titles.set(id, title);
     }
-    const text = normalize(dialog.textContent);
+    const QUOTES = /^["“”„«»「」『』]+|["“”„«»「」『』]+$/g;
+    const BUTTONS = 'button, [role="button"]';
+    const names = new Set<string>();
+    // The text of a subtree without its buttons; every element's own text is a candidate name.
+    const walk = (node: Node): string => {
+      if (node.nodeType === 3) return node.nodeValue ?? "";
+      if (node.nodeType !== 1) return "";
+      const element = node as Element;
+      if (element.matches(BUTTONS)) return " ";
+      const text = Array.from(element.childNodes).map(walk).join("");
+      if (element !== dialog) {
+        const whole = normalize(normalize(text).replace(QUOTES, ""));
+        if (whole) names.add(whole);
+      }
+      return text;
+    };
+    const dialogText = walk(dialog);
+    for (const match of dialogText.matchAll(
+      /"([^"]+)"|“([^“”]+)”|„([^„“”]+)[“”]|«([^«»]+)»|「([^「」]+)」|『([^『』]+)』/g,
+    )) {
+      const quoted = normalize(match.slice(1).find(Boolean));
+      if (quoted) names.add(quoted);
+    }
     const ours = titles.get(options.conversationId);
-    if (ours && text.includes(ours)) return { button, ambiguous: null };
+    if (ours && names.has(ours)) return { button, ambiguous: null };
     for (const [id, title] of titles) {
-      if (id !== options.conversationId && text.includes(title)) {
+      if (id !== options.conversationId && names.has(title)) {
         return { button: null, ambiguous: `the confirmation names another chat ("${title}")` };
       }
     }
@@ -653,10 +692,10 @@ async function runArchive(
       continue;
     }
     const itemLocate = `() => (${findArchiveMenuItem.toString()})((${menuLocate(path)})(), ${labels})`;
-    // The confirmation that follows must be a dialog that was not open before this click.
+    // The confirmation that follows must be a dialog that was not shown before this click.
     await evaluateValue(
       runtime,
-      `(() => { window.__oracleArchiveDialogsBefore = new WeakSet(Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))); return true; })()`,
+      `(() => { window.__oracleArchiveDialogsBefore = new WeakSet((${shownArchiveDialogs.toString()})(document)); return true; })()`,
     );
     const item = await archiveClick(runtime, input, {
       locate: itemLocate,

@@ -5,31 +5,7 @@ import {
   scanAppApprovalCards,
   startAppApprovalMonitor,
 } from "../../src/browser/actions/appApprovals.js";
-import { FakeDocument, FakeElement } from "./domFixture.js";
-
-/** FakeElement with text nodes, enough for the scanner's text walk. */
-class DomNode extends FakeElement {
-  nodeType = 1;
-  constructor(
-    tag: string,
-    attrs: Record<string, string> = {},
-    readonly nodes: Array<DomNode | string> = [],
-  ) {
-    super(
-      tag,
-      attrs,
-      nodes.filter((node): node is DomNode => typeof node !== "string"),
-    );
-  }
-  get childNodes(): Array<DomNode | { nodeType: number; nodeValue: string }> {
-    return this.nodes.map((node) =>
-      typeof node === "string" ? { nodeType: 3, nodeValue: node } : node,
-    );
-  }
-  override get textContent(): string {
-    return this.nodes.map((node) => (typeof node === "string" ? node : node.textContent)).join("");
-  }
-}
+import { DomNode, FakeDocument } from "./domFixture.js";
 
 const button = (label: string) => new DomNode("button", {}, [label]);
 const scan = (children: DomNode[], allowApps = ["CODEXish"]) =>
