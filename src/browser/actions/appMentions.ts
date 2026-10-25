@@ -4,12 +4,12 @@ import { delay } from "../utils.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { captureComposerNavigationUrl } from "./attachmentContext.js";
 import {
-  COMPOSER_MENTION_SELECTOR,
   COMPOSER_PANEL_ROW_SELECTOR,
   COMPOSER_TOKEN_SELECTOR,
   closeComposerPlusPanel,
   composerRowTitleEquals,
   guardedTrustedClick,
+  isWebSearchPill,
   readComposerPanelRows,
   readComposerPromptText,
   readComposerRowLabels,
@@ -26,10 +26,13 @@ export function buildEditorMentionNamesExpression(): string {
     const editor = ${JSON.stringify(INPUT_SELECTORS)}.flatMap(selector => Array.from(document.querySelectorAll(selector))).find(visible);
     if (!editor) return null;
     const names = ${readMentionNames.toString()};
-    const mentions = Array.from(editor.querySelectorAll(${JSON.stringify(COMPOSER_MENTION_SELECTOR)}));
+    const isSearchPill = ${isWebSearchPill.toString()};
+    // The same candidates the prompt reader treats as tokens (prompt-link-only chips included),
+    // identified by any name attribute or the visible label; the Web search pill is no app.
+    const mentions = Array.from(editor.querySelectorAll(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)}));
     // Nested mention markup (a label span inside the chip) is read through its outermost chip.
     const outer = mentions.filter(node => !mentions.some(other => other !== node && other.contains(node)));
-    return Array.from(new Set(outer.flatMap(names)));
+    return Array.from(new Set(outer.filter(node => !isSearchPill(node)).flatMap(names)));
   })()`;
 }
 

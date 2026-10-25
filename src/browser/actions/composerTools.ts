@@ -53,14 +53,17 @@ export function readMentionNames(node: Element): string[] {
     "plugin-mention-display-name",
     "app-mention-name",
     "plugin-mention-name",
+    "data-prompt-link-label",
   ];
-  const label = String(node.textContent ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/^[@$]\s*/, "");
-  return [...attributes.map((name) => String(node.getAttribute(name) ?? "").trim()), label].filter(
-    (value) => value.length > 0,
-  );
+  const clean = (value: unknown) =>
+    String(value ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^[@$]\s*/, "");
+  return [
+    ...attributes.map((name) => clean(node.getAttribute(name))),
+    clean(node.textContent),
+  ].filter((value) => value.length > 0);
 }
 
 /** Page function: whether an editor token is the Web search pill (current or legacy markup). */

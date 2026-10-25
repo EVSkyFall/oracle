@@ -133,6 +133,43 @@ describe("editor mention detection", () => {
     expect(mentionNamesInclude(names, "CODEXish")).toBe(true);
     expect(mentionNamesInclude(names, "Slack")).toBe(true);
   });
+
+  test("finds prompt-link-only chips like the prompt reader's tokens, never the search pill", () => {
+    const editor = new FakeElement("div", { contenteditable: "true", role: "textbox" }, [
+      new FakeElement("p", {}, [
+        new FakeElement(
+          "span",
+          {
+            "data-prompt-link-href": "plugin://dev-1@curated",
+            "data-prompt-link-label": "@CODEXish",
+          },
+          [],
+          "CODEXish",
+        ),
+        new FakeElement(
+          "span",
+          { "data-prompt-link-href": "app://connector_notion" },
+          [],
+          "@Notion",
+        ),
+        new FakeElement(
+          "span",
+          {
+            "data-system-hint-type": "search",
+            "data-prompt-link-href": "chatgpt-system-hint://search",
+          },
+          [],
+          "Search",
+        ),
+      ]),
+    ]);
+    const names = new Function("document", `return ${buildEditorMentionNamesExpression()}`)(
+      new FakeDocument([editor]),
+    ) as string[];
+    expect(mentionNamesInclude(names, "CODEXish")).toBe(true);
+    expect(mentionNamesInclude(names, "Notion")).toBe(true);
+    expect(mentionNamesInclude(names, "Search")).toBe(false);
+  });
 });
 
 describe("inserting app mentions", () => {
