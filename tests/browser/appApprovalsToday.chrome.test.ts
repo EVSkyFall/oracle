@@ -413,6 +413,42 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     }
   }, 60_000);
 
+  test("(k) two places that look the same are reported once each, without touching the page", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-approval-diag-home-"));
+    setOracleHomeDirOverrideForTest(home);
+    try {
+      const docked = `<div class="row-a">${pick("a", "Allow", "data-stays")}</div><div class="row-b">${pick("b", "Allow", "data-stays")}</div>`;
+      const { picks, lines, setup } = await run(todayPage({ docked }), {
+        setup: "document.body.outerHTML",
+        watchMs: 2_500,
+        monitor: {
+          saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic("fixture", diagnostic),
+        },
+      });
+      expect(picks).toEqual([]);
+      expect(lines.filter((line) => line.includes("sits inside form.relative"))).toHaveLength(2);
+      const dir = path.join(home, "sessions", "fixture", "artifacts");
+      expect((await fs.readdir(dir)).sort()).toEqual([
+        "app-approval-diag-1.html",
+        "app-approval-diag-2.html",
+      ]);
+      // The page is read, never marked.
+      const client = await CDP({ port: chrome!.port });
+      try {
+        const { result } = await client.Runtime.evaluate({
+          expression: "document.body.outerHTML",
+          returnByValue: true,
+        });
+        expect(result.value).toBe(setup);
+      } finally {
+        await client.close().catch(() => undefined);
+      }
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await fs.rm(home, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }, 60_000);
+
   test("(i) deny and don't-allow buttons are never clicked", async () => {
     const denyOnly = alertCard(
       "deny-only",

@@ -1201,6 +1201,51 @@ describe("app approval monitor reporting", () => {
     ).toBe(true);
   }, 30_000);
 
+  test("reports are per card identity: same-looking cards stay apart, a card is diagnosed once", async () => {
+    let poll = 0;
+    const excluded = (id: number, labels: string[]) => ({
+      reason: "excluded",
+      labels,
+      title: "",
+      app: null,
+      detail: "nav",
+      subject: id,
+      id,
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          poll += 1;
+          // Cards 7 and 8 look the same; card 7's labels change from the fourth poll on.
+          const labels7 = poll >= 4 ? ["Allow", "Always allow"] : ["Allow"];
+          return {
+            result: {
+              value: { cards: [], skipped: [excluded(7, labels7), excluded(8, ["Allow"])] },
+            },
+          };
+        }
+        if (expression.includes("store.subjects")) return { result: { value: page } };
+        return { result: { value: null } };
+      }),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const saveDiagnostic = vi.fn(async () => undefined);
+    const stop = startAppApprovalMonitor(runtime as never, undefined, {
+      allowApps: ["CODEXish"],
+      logger,
+      intervalMs: 250,
+      saveDiagnostic,
+    });
+    await vi.waitFor(() => expect(poll).toBeGreaterThanOrEqual(6), { timeout: 5_000 });
+    await stop();
+    expect(logger.mock.calls.map(([line]) => String(line))).toEqual([
+      '[browser] App approval left for the user: "Allow" sits inside nav, where approval cards are not taken from.',
+      '[browser] App approval left for the user: "Allow" sits inside nav, where approval cards are not taken from.',
+      '[browser] App approval left for the user: "Allow", "Always allow" sits inside nav, where approval cards are not taken from.',
+    ]);
+    expect(saveDiagnostic).toHaveBeenCalledTimes(2);
+  });
+
   test("a page scan that throws is reported once and the watch goes on", async () => {
     const runtime = {
       evaluate: vi.fn(async () => ({

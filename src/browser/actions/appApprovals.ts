@@ -64,6 +64,8 @@ export interface AppApprovalCard {
   button: { label: string; rank: number; index: number };
   /** Index of the card element in the remembered subject list (for diagnostics). */
   subject?: number;
+  /** The card's identity in the page across polls (set by the scan expression). */
+  id?: number;
 }
 
 /** An allow-looking button, or an allowed app's prompt, that the scan does not take. */
@@ -84,6 +86,8 @@ export interface AppApprovalSkip {
   detail: string;
   /** Index of the element to describe in a diagnostic. */
   subject: number;
+  /** That element's identity in the page across polls (set by the scan expression). */
+  id?: number;
 }
 
 /** What a diagnostic file holds about a card that was not taken or not clicked. */
@@ -697,7 +701,17 @@ export function buildAppApprovalScanExpression(
     const scan = ${scanAppApprovalCards.toString()};
     const { cards, buttons, skipped, subjects, labelOf } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
     window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons, subjects, labelOf };
-    return { cards, skipped };
+    // A card's identity across polls, kept beside the page (the DOM is never marked).
+    const ids = window.__oracleApprovalIds || (window.__oracleApprovalIds = { map: new WeakMap(), next: 1 });
+    const idOf = (node) => {
+      let id = ids.map.get(node);
+      if (id === undefined) { id = ids.next++; ids.map.set(node, id); }
+      return id;
+    };
+    return {
+      cards: cards.map((card) => ({ ...card, id: idOf(subjects[card.subject]) })),
+      skipped: skipped.map((skip) => ({ ...skip, id: idOf(subjects[skip.subject]) })),
+    };
   })()`;
 }
 
@@ -933,45 +947,53 @@ export function startAppApprovalMonitor(
       | undefined;
     const cards = Array.isArray(value) ? value : Array.isArray(value?.cards) ? value.cards : [];
     const skipped = !Array.isArray(value) && Array.isArray(value?.skipped) ? value.skipped : [];
-    const visibleKeys = new Set(cards.map((card) => card.key));
+    // Cards are told apart by their identity in the page (two cards with the same text, or two
+    // places with no title, stay two); without one, by their text.
+    const cardIdentity = (card: AppApprovalCard) =>
+      card.id !== undefined ? `card:${card.id}` : card.key;
+    const skipIdentity = (skip: AppApprovalSkip) =>
+      skip.id !== undefined ? `card:${skip.id}` : `skip\n${skip.title}\n${skip.labels.join("\n")}`;
+    const visibleKeys = new Set(cards.map(cardIdentity));
     for (const key of lastClick.keys()) if (!visibleKeys.has(key)) lastClick.delete(key);
     for (const key of failures.keys()) if (!visibleKeys.has(key)) failures.delete(key);
     for (const skip of skipped) {
-      const cardKey = `skip\n${skip.title}\n${skip.labels.join("\n")}`;
+      const identity = skipIdentity(skip);
       const line = describeAppApprovalSkip(skip);
-      if (reportOnce(`${cardKey}\n${skip.reason}\n${skip.detail}`, line)) {
-        await diagnose(cardKey, line, token, skip.subject);
+      const outcome = `${skip.reason}\n${skip.detail}\n${skip.labels.join("\n")}`;
+      if (reportOnce(`${identity}\n${outcome}`, line)) {
+        await diagnose(identity, line, token, skip.subject);
       }
     }
     for (const card of cards) {
+      const identity = cardIdentity(card);
       if (!card.app) {
         const line = `[browser] App approval for "${(card.title || card.toolText).slice(0, 160)}" left for the user (its title names no app in --browser-allow-app).`;
-        if (reportOnce(`${card.key}\ntitle`, line)) {
-          await diagnose(card.key, line, token, card.subject);
+        if (reportOnce(`${identity}\ntitle\n${card.title}`, line)) {
+          await diagnose(identity, line, token, card.subject);
         }
         continue;
       }
-      const previous = lastClick.get(card.key);
+      const previous = lastClick.get(identity);
       if (previous !== undefined && Date.now() - previous < RECLICK_AFTER_MS) continue;
       if (previous !== undefined) {
         options.logger(
           `[browser] App approval for ${card.app} is still shown; clicking "${card.button.label}" again.`,
         );
       }
-      lastClick.set(card.key, Date.now());
+      lastClick.set(identity, Date.now());
       const first = await tryTrustedClick(card, token);
       let method: NonNullable<BrowserAppApprovalRecord["method"]> | null =
         first.status === "clicked" ? first.method : null;
       let how = method === "synthetic" ? "synthetic click" : "trusted click";
       if (first.status !== "clicked") {
-        const state = failures.get(card.key) ?? { attempts: 0, outcome: "" };
+        const state = failures.get(identity) ?? { attempts: 0, outcome: "" };
         state.attempts += 1;
-        failures.set(card.key, state);
+        failures.set(identity, state);
         const outcome = `${first.status}${first.detail ? `: ${first.detail}` : ""}`;
         if (outcome !== state.outcome || state.attempts % 10 === 0) {
           const line = `[browser] App approval for ${card.app}: the "${card.button.label}" click did not happen (${outcome}; attempt ${state.attempts}); will retry.`;
           options.logger(line);
-          await diagnose(card.key, line, token, card.subject);
+          await diagnose(identity, line, token, card.subject);
         }
         state.outcome = outcome;
         // Every third miss in a row: the card goes to the end of the view (a thread that keeps
@@ -1009,10 +1031,10 @@ export function startAppApprovalMonitor(
         }
       }
       if (!method) {
-        lastClick.delete(card.key);
+        lastClick.delete(identity);
         continue;
       }
-      failures.delete(card.key);
+      failures.delete(identity);
       const record: BrowserAppApprovalRecord = {
         app: card.app,
         button: card.button.label,
