@@ -142,7 +142,10 @@ export function scanAppApprovalCards(
   const BUTTON = 'button, [role="button"]';
   const DIALOG = '[role="dialog"], [role="alertdialog"]';
   // Elements that announce themselves as a prompt; such an element is the card wherever it sits.
-  const ROLE_CARD = '[role="alert"], [role="alertdialog"], [role="dialog"]';
+  // ChatGPT's approval card (2026-10-26) marks itself as an approval surface; its role="alert"
+  // wraps only the text, while the buttons sit in a sibling form.
+  const ROLE_CARD =
+    '[role="alert"], [role="alertdialog"], [role="dialog"], [data-codex-approval-surface="true"]';
   const TURN =
     '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article';
   // Today's user turn carries no role attribute, only its markdown root and group classes.
@@ -151,8 +154,11 @@ export function scanAppApprovalCards(
   const PROSE = '.markdown, [class*="markdown"], [class*="prose"]';
   const EDITABLE =
     '[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], [role="textbox"], textarea';
-  // Places that never hold a permission card of the current turn.
-  const OFF_LIMITS = `${PROSE}, ${USER}, form, ${EDITABLE}, [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
+  // Places that never hold a permission card of the current turn. A form counts only when it is
+  // the composer (it holds an editor): the approval card keeps its own buttons in a small form.
+  const OFF_LIMITS = `${PROSE}, ${USER}, ${EDITABLE}, [data-composer-overlay-floating-ui], [data-testid*="composer" i]`;
+  const composerForm = (node: Element): boolean =>
+    node.matches("form") && Boolean(node.querySelector(EDITABLE));
   const PAGE_CHROME = 'nav, aside, header, [data-testid*="sidebar" i]';
   const ARGUMENTS = "code, pre, samp, kbd";
   // Buttons whose text and aria-label hold no allow word are skipped before any layout query.
@@ -294,7 +300,7 @@ export function scanAppApprovalCards(
       return { region: role, role: true, excludedBy: null };
     }
     for (let node = button.parentElement; node; node = node.parentElement) {
-      if (node.matches(OFF_LIMITS) || node.matches(PAGE_CHROME)) {
+      if (node.matches(OFF_LIMITS) || composerForm(node) || node.matches(PAGE_CHROME)) {
         return { region: null, role: false, excludedBy: node };
       }
     }
@@ -547,8 +553,11 @@ export function scanAppApprovalCards(
   const takenRegions = new Set(
     candidates.filter((entry) => entry.role).map((entry) => entry.region),
   );
+  // A role element inside a taken card (the approval card's text-only alert) is part of it.
+  const takenCards = Array.from(byCard.keys());
   for (const role of Array.from(doc.querySelectorAll(ROLE_CARD))) {
     if (takenRegions.has(role) || !visible(role) || chatSurface(role)) continue;
+    if (takenCards.some((card) => card !== role && card.contains(role))) continue;
     let placeable = true;
     for (let node: Element | null = role; node; node = node.parentElement) {
       if (node.matches(USER) || node.matches(EDITABLE)) placeable = false;

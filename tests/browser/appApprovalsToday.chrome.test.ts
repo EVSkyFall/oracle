@@ -6,6 +6,7 @@ import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
 import {
   buildAppApprovalDiagnosticExpression,
+  buildAppApprovalScanExpression,
   startAppApprovalMonitor,
   type AppApprovalMonitorOptions,
 } from "../../src/browser/actions/appApprovals.js";
@@ -78,6 +79,31 @@ const pick = (id: string, html: string, attributes = "") =>
 
 const alertCard = (id: string, title: string, detail: string, buttons: string) =>
   `<div role="alert" data-card="${id}"><div class="flex gap-3"><div class="icon"></div><div><p>${title}</p><p>${detail}</p></div></div><div class="flex gap-2">${buttons}</div></div>`;
+
+// ChatGPT's approval card as captured by a diagnostic on a live Pro run (2026-10-26), stripped to
+// its structure: a text-only role="alert" and, beside it, the buttons in the card's own form.
+const capturedCard = (marked: boolean) => `
+  <div data-card="captured" class="flex flex-col overflow-hidden rounded-3xl border @container/approval-card"${marked ? ' data-codex-approval-surface="true"' : ""}>
+    <div class="flex min-h-0 min-w-0 flex-col gap-2 px-4 pt-4 pb-3"><div class="flex items-start gap-2">
+      <div class="min-w-0 flex-1" aria-atomic="true" role="alert"><div class="flex min-w-0 flex-col gap-2">
+        <div class="flex items-center gap-2"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M0 0h16v16H0z"></path></svg><span class="min-w-0">CODEXish</span></div>
+        <div class="flex min-w-0 flex-col gap-0.5">
+          <div class="min-w-0 font-medium">Allow ChatGPT to use CODEXish?</div>
+          <div class="text-size-chat-sm">ChatGPT will call CODEXish's Host Capabilities tool. <button type="button" data-pick="details" data-stays aria-haspopup="dialog" aria-expanded="false" data-state="closed">See details</button></div>
+        </div>
+      </div></div>
+    </div></div>
+    <form class="flex shrink-0 items-center gap-2 px-4 pt-2 pb-4">
+      <button type="button" data-pick="always" data-state="closed"><span class="truncate">Always allow</span></button>
+      <div class="ms-auto flex min-w-0 items-center gap-2">
+        <button type="button" data-pick="deny" data-stays>Deny<span><kbd aria-hidden="true">Esc</kbd></span></button>
+        <div class="inline-flex self-start items-stretch overflow-hidden rounded-full min-w-0">
+          <button type="button" data-pick="once"><span class="truncate">Allow once</span><span><kbd aria-hidden="true">⏎</kbd></span></button>
+          <button type="button" data-pick="options" data-stays aria-label="Approval options" aria-haspopup="menu" aria-expanded="false" data-state="closed"><svg width="20" height="21"><path d="M0 0h20v21H0z"></path></svg></button>
+        </div>
+      </div>
+    </form>
+  </div>`;
 
 const KOREAN_CODEXISH = alertCard(
   "codexish",
@@ -192,6 +218,35 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     expect(picks).toEqual(["always"]);
     expect(records[0]).toMatchObject({ app: "CODEXish", button: "항상 허용" });
   }, 60_000);
+
+  test.each([
+    ["marked as an approval surface", true],
+    ["without the marker", false],
+  ])(
+    "the captured live card (buttons in its own form) is approved with Always allow when %s",
+    async (_how, marked) => {
+      const html = todayPage({
+        thread: `<div class="block-BQZwFn"><div>${capturedCard(marked)}</div></div>`,
+      });
+      const titleScan = `(${buildAppApprovalScanExpression(["CODEXish"], "title-check")}).cards.map((card) => [card.app, card.title, card.button.label])`;
+      const { picks, records, lines, setup } = await run(html, {
+        setup: titleScan,
+        done: (list) => list.length === 1,
+        watchMs: 2_000,
+      });
+      expect(setup).toEqual([["CODEXish", "CODEXish", "Always allow"]]);
+      expect(picks).toEqual(["always"]);
+      expect(records).toEqual([
+        expect.objectContaining({
+          app: "CODEXish",
+          button: "Always allow",
+          method: "trusted-click",
+        }),
+      ]);
+      expect(lines.filter((line) => line.includes("left for the user"))).toEqual([]);
+    },
+    60_000,
+  );
 
   test("(c) labels with a shortcut hint or an icon are approved", async () => {
     const card = alertCard(

@@ -10,6 +10,8 @@ import {
 import { DomNode, FakeDocument } from "./domFixture.js";
 
 const button = (label: string) => new DomNode("button", {}, [label]);
+// The composer form always holds its editor; a form without one is not the composer.
+const composerEditor = () => new DomNode("div", { contenteditable: "true", role: "textbox" });
 const scan = (children: DomNode[], allowApps = ["CODEXish"]) =>
   scanAppApprovalCards(
     new FakeDocument(children) as unknown as Document,
@@ -212,7 +214,9 @@ describe("app approval scope", () => {
     [
       "the composer",
       (card: DomNode) =>
-        new DomNode("main", {}, [new DomNode("form", { "data-chatgpt-composer": "" }, [card])]),
+        new DomNode("main", {}, [
+          new DomNode("form", { "data-chatgpt-composer": "" }, [card, composerEditor()]),
+        ]),
     ],
     [
       "assistant prose",
@@ -380,6 +384,83 @@ describe("app approval scope", () => {
     title.nodes.splice(0, 1, "Allow CODEXish to run echo?");
     allow.nodes.splice(0, 1, "Deny");
     expect(locate()).toBeNull();
+  });
+});
+
+describe("ChatGPT's approval card as captured on 2026-10-26", () => {
+  // Structure of the live card: a text-only role="alert" and, beside it, the buttons in the
+  // card's own small form; the card marks itself as an approval surface.
+  const capturedCard = (marked: boolean) =>
+    new DomNode(
+      "div",
+      marked
+        ? { class: "flex flex-col @container/approval-card", "data-codex-approval-surface": "true" }
+        : { class: "flex flex-col @container/approval-card" },
+      [
+        new DomNode("div", { class: "flex min-h-0 flex-col gap-2" }, [
+          new DomNode("div", { class: "flex items-start gap-2" }, [
+            new DomNode("div", { class: "min-w-0 flex-1", "aria-atomic": "true", role: "alert" }, [
+              new DomNode("div", { class: "flex min-w-0 flex-col gap-2" }, [
+                new DomNode("div", { class: "flex items-center gap-2" }, [
+                  new DomNode("svg", {}, [new DomNode("path")]),
+                  new DomNode("span", {}, ["CODEXish"]),
+                ]),
+                new DomNode("div", { class: "flex min-w-0 flex-col gap-0.5" }, [
+                  new DomNode("div", {}, ["Allow ChatGPT to use CODEXish?"]),
+                  new DomNode("div", {}, [
+                    "ChatGPT will call CODEXish's Host Capabilities tool. ",
+                    new DomNode("button", { type: "button" }, ["See details"]),
+                  ]),
+                ]),
+              ]),
+            ]),
+          ]),
+        ]),
+        new DomNode("form", { class: "flex shrink-0 items-center gap-2" }, [
+          new DomNode("button", { type: "button" }, [new DomNode("span", {}, ["Always allow"])]),
+          new DomNode("div", { class: "ms-auto flex" }, [
+            new DomNode("button", { type: "button" }, [
+              "Deny",
+              new DomNode("span", {}, [new DomNode("kbd", { "aria-hidden": "true" }, ["Esc"])]),
+            ]),
+            new DomNode("div", { class: "inline-flex" }, [
+              new DomNode("button", { type: "button" }, [
+                new DomNode("span", {}, ["Allow once"]),
+                new DomNode("span", {}, [new DomNode("kbd", { "aria-hidden": "true" }, ["⏎"])]),
+              ]),
+              new DomNode("button", { type: "button", "aria-label": "Approval options" }, [
+                new DomNode("svg"),
+              ]),
+            ]),
+          ]),
+        ]),
+      ],
+    );
+
+  test.each([
+    ["marked as an approval surface", true],
+    ["without the marker", false],
+  ])("is approved with Always allow when %s, and nothing else is reported", (_how, marked) => {
+    const { cards, skipped } = scanAppApprovalCards(
+      new FakeDocument([
+        new DomNode("main", {}, [
+          new DomNode("div", { class: "block-BQZwFn" }, [
+            new DomNode("div", {}, [capturedCard(marked)]),
+          ]),
+          new DomNode("form", { class: "relative flex flex-col gap-2" }, [composerEditor()]),
+        ]),
+      ]) as unknown as Document,
+      ["CODEXish"],
+      APP_APPROVAL_VOCABULARY,
+    );
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      app: "CODEXish",
+      title: "CODEXish",
+      button: { label: "Always allow", rank: 0 },
+    });
+    expect(cards[0]!.toolText).toContain("Allow ChatGPT to use CODEXish?");
+    expect(skipped).toEqual([]);
   });
 });
 
@@ -628,7 +709,10 @@ describe("app approval skips", () => {
     const { cards, skipped } = skippedOf([
       new DomNode("nav", {}, [card()]),
       new DomNode("main", {}, [
-        new DomNode("form", { class: "relative flex flex-col gap-2 extra" }, [card()]),
+        new DomNode("form", { class: "relative flex flex-col gap-2 extra" }, [
+          card(),
+          composerEditor(),
+        ]),
       ]),
     ]);
     expect(cards).toEqual([]);
@@ -650,7 +734,7 @@ describe("app approval skips", () => {
       subjectOfSkip([
         new DomNode("main", {}, [
           new DomNode("p", {}, ["Conversation text"]),
-          new DomNode("form", { class: "relative flex" }, [row]),
+          new DomNode("form", { class: "relative flex" }, [row, composerEditor()]),
         ]),
       ]),
     ).toBe(row);
@@ -669,7 +753,9 @@ describe("app approval skips", () => {
       new DomNode("p", {}, ["Allow CODEXish?"]),
       button("Always allow"),
     ]);
-    expect(subjectOfSkip([new DomNode("main", {}, [new DomNode("form", {}, [card])])])).toBe(card);
+    expect(
+      subjectOfSkip([new DomNode("main", {}, [new DomNode("form", {}, [card, composerEditor()])])]),
+    ).toBe(card);
   });
 
   test("a card that holds a rendered message is narrowed to its button", () => {
