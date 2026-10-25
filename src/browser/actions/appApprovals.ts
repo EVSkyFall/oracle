@@ -123,6 +123,18 @@ export function scanAppApprovalCards(
       return !display.startsWith("inline") && display !== "contents" && display !== "none";
     return BLOCK_TAGS.test(element.tagName);
   };
+  // Text a reader does not see is not part of a rendered line.
+  const hiddenElement = (element: Element): boolean => {
+    if (element.getAttribute("aria-hidden") === "true") return true;
+    const style = doc.defaultView?.getComputedStyle?.(element);
+    if (style?.display === "none" || /^(hidden|collapse)$/.test(style?.visibility ?? "")) {
+      return true;
+    }
+    // A display: contents wrapper has no box of its own, but its children render.
+    if (style?.display === "contents") return false;
+    const rect = element.getBoundingClientRect?.();
+    return Boolean(rect) && (rect.width === 0 || rect.height === 0);
+  };
   const firstLineOf = (root: Element | null): string => {
     if (!root) return "";
     const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
@@ -148,7 +160,12 @@ export function scanAppApprovalCards(
       }
       if (node.nodeType !== 1) return;
       const element = node as Element;
-      if (!top && (element.matches(skip) || element.getAttribute("aria-hidden") === "true")) return;
+      // Chrome computes display: inline and no box for <br>, but it always ends the line.
+      if (element.tagName === "BR") {
+        breakLine();
+        return;
+      }
+      if (!top && (element.matches(skip) || hiddenElement(element))) return;
       const block = !top && isBlock(element);
       if (block) breakLine();
       for (const child of Array.from(element.childNodes)) walk(child, false);

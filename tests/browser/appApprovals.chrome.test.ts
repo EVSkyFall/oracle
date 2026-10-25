@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
-import { startAppApprovalMonitor } from "../../src/browser/actions/appApprovals.js";
+import {
+  buildAppApprovalScanExpression,
+  startAppApprovalMonitor,
+} from "../../src/browser/actions/appApprovals.js";
 import type { BrowserAppApprovalRecord } from "../../src/browser/types.js";
 
 // Real-Chrome fixture: trusted clicks, elementFromPoint and scrolling cannot be faked.
@@ -82,6 +85,50 @@ describe.runIf(enabled)("app approval monitor in real Chrome", () => {
       expect(
         logger.mock.calls.some(([line]) => String(line).includes("Allow Gmail to send an email?")),
       ).toBe(true);
+    } finally {
+      await client?.close().catch(() => undefined);
+      chrome.kill();
+      await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }, 60_000);
+
+  test("a title line ends at <br>, and hidden text is never part of it", async () => {
+    const card = (id: string, title: string) =>
+      `<div role="dialog" id="${id}"><p>${title}</p><button>Allow</button></div>`;
+    const html = `<!doctype html><html><body>
+      ${card("br", "Allow Gmail?<br>message: CODEXish")}
+      ${card("none", '<span style="display:none">CODEXish </span>Allow Gmail?')}
+      ${card("visibility", '<span style="visibility:hidden">CODEXish </span>Allow Gmail?')}
+      ${card("aria", '<span aria-hidden="true">CODEXish </span>Allow Gmail?')}
+      ${card("zero", '<span style="display:inline-block;width:0;height:0;overflow:hidden">CODEXish </span>Allow Gmail?')}
+      ${card("control", "Allow CODEXish?<br>message: run echo")}
+    </body></html>`;
+    const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-approval-fixture-"));
+    const chrome = await chromeLauncher.launch({
+      chromeFlags: ["--headless=new", "--window-size=900,900", "--no-first-run"],
+      userDataDir,
+    });
+    let client: Awaited<ReturnType<typeof CDP>> | undefined;
+    try {
+      client = await CDP({ port: chrome.port });
+      await Promise.all([client.Page.enable(), client.Runtime.enable()]);
+      await client.Page.navigate({
+        url: `data:text/html;base64,${Buffer.from(html).toString("base64")}`,
+      });
+      await client.Page.loadEventFired();
+      const { result } = await client.Runtime.evaluate({
+        expression: buildAppApprovalScanExpression(["CODEXish"], "fixture"),
+        returnByValue: true,
+      });
+      const cards = result.value as Array<{ app: string | null; title: string }>;
+      expect(cards.map((entry) => [entry.title, entry.app])).toEqual([
+        ["Allow Gmail?", null],
+        ["Allow Gmail?", null],
+        ["Allow Gmail?", null],
+        ["Allow Gmail?", null],
+        ["Allow Gmail?", null],
+        ["Allow CODEXish?", "CODEXish"],
+      ]);
     } finally {
       await client?.close().catch(() => undefined);
       chrome.kill();
