@@ -118,9 +118,33 @@ vi.mock("../../src/browser/targetClaim.js", async (importOriginal) => ({
 vi.mock("../../src/browser/actions/thinkingTime.js", () => ({
   ensureThinkingTime: vi.fn(async () => undefined),
 }));
+// The order of picker reads, maximum-thinking-time checks and the send.
+const steps = vi.hoisted(() => ({ order: [] as string[] }));
+const pickerRead = {
+  modelLabel: "GPT-6",
+  tierLabel: "Extra High",
+  sliderValue: 3,
+  readable: true,
+  source: "chatgpt-model-picker" as const,
+  capturedAt: "2026-10-25T00:00:00.000Z",
+};
+vi.mock("../../src/browser/actions/modelPickerState.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/browser/actions/modelPickerState.js")>()),
+  readModelPickerEvidence: vi.fn(async () => {
+    steps.order.push("picker");
+    return pickerRead;
+  }),
+}));
+const enforceCap = vi.hoisted(() => vi.fn());
+vi.mock("../../src/browser/actions/thinkingTimeCap.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/browser/actions/thinkingTimeCap.js")>()),
+  browserThinkingCapSteps: vi.fn(() => ({})),
+  enforceThinkingTimeCap: enforceCap,
+}));
 vi.mock("../../src/browser/providerDomFlow.js", () => ({
   runProviderSubmissionFlow: vi.fn(
     async (_provider: unknown, input: { state: Record<string, unknown> }) => {
+      steps.order.push("submit");
       submissions.push(input.state);
       throw SUBMIT_REACHED;
     },
@@ -132,6 +156,12 @@ describe("runBrowserMode no-focus wiring", () => {
     created.length = 0;
     submissions.length = 0;
     activations.length = 0;
+    steps.order.length = 0;
+    enforceCap.mockReset();
+    enforceCap.mockImplementation(async (maxLevel: string) => {
+      steps.order.push(`cap:${maxLevel}`);
+      return { maxLevel, status: "within", before: pickerRead, capturedAt: "now" };
+    });
     emulationFails = false;
     onscreen.mockClear();
     launchChrome.mockClear();
@@ -334,6 +364,70 @@ describe("runBrowserMode no-focus wiring", () => {
       expect(activations).toEqual(noFocus ? ["bringToFront", "trustedClick"] : ["trustedClick"]);
       expect(fallbackLines).toHaveLength(noFocus ? 1 : 0);
       expect(submissions[0]?.activateBeforeTrustedInput).toBe(true);
+    },
+  );
+
+  const runConfig = (mode: string, extra: Record<string, unknown>) =>
+    mode === "local"
+      ? { manualLogin: false, noFocus: true, cookieSync: false, ...extra }
+      : {
+          remoteChrome: { host: "127.0.0.1", port: 9555 },
+          manualLogin: false,
+          noFocus: true,
+          ...extra,
+        };
+
+  test.each(["local", "remote"])(
+    "a %s run with a maximum thinking time checks the tier right before the send, also with strategy ignore",
+    async (mode) => {
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "capped",
+          config: runConfig(mode, { maxThinkingTime: "extra-high", modelStrategy: "ignore" }),
+          log: vi.fn<(message: string) => void>(),
+        }),
+      ).rejects.toBe(SUBMIT_REACHED);
+      expect(steps.order).toEqual(["picker", "cap:extra-high", "submit"]);
+    },
+  );
+
+  test.each(["local", "remote"])(
+    "a %s run refused by the maximum thinking time never reaches the send",
+    async (mode) => {
+      enforceCap.mockImplementation(async () => {
+        steps.order.push("cap");
+        throw new BrowserAutomationError("Thinking time: still Pro; nothing was sent.", {
+          stage: "thinking-time-cap",
+          code: "thinking-time-above-max",
+        });
+      });
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "refused",
+          config: runConfig(mode, { maxThinkingTime: "extra-high" }),
+          log: vi.fn<(message: string) => void>(),
+        }),
+      ).rejects.toMatchObject({ details: { code: "thinking-time-above-max" } });
+      expect(steps.order).toEqual(["picker", "cap"]);
+      expect(submissions).toEqual([]);
+    },
+  );
+
+  test.each(["local", "remote"])(
+    "a %s run without a maximum still records the picker evidence before the send",
+    async (mode) => {
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "evidence",
+          config: runConfig(mode, {}),
+          log: vi.fn<(message: string) => void>(),
+        }),
+      ).rejects.toBe(SUBMIT_REACHED);
+      expect(steps.order).toEqual(["picker", "submit"]);
+      expect(enforceCap).not.toHaveBeenCalled();
     },
   );
 
