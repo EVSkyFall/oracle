@@ -41,6 +41,11 @@ export interface BrowserAppApprovalRecord {
   /** The card's text without its buttons: what ChatGPT asked to run. */
   toolText: string;
   approvedAt: string;
+  /**
+   * How the button was clicked: a trusted (CDP) click, a synthetic event sequence where no
+   * input domain exists, or click() from inside the page after trusted clicks kept missing.
+   */
+  method?: "trusted-click" | "synthetic" | "in-page-click";
 }
 
 /** A ChatGPT app/connector to mention in each prompt (for example CODEXish). */

@@ -293,6 +293,29 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     }
   }, 60_000);
 
+  test("(h) a card that trusted clicks never reach is clicked in the page after 3 attempts", async () => {
+    // A transparent layer over the whole page: every point belongs to it, wherever the card is.
+    const shield =
+      '<div id="shield" style="position: fixed; inset: 0; z-index: 50; background: transparent"></div>';
+    const { picks, records, lines } = await run(
+      todayPage({ thread: KOREAN_CODEXISH, extra: shield }),
+      { done: (list) => list.length === 1, watchMs: 1_000 },
+    );
+    expect(picks).toEqual(["always (in-page)"]);
+    expect(records).toEqual([
+      expect.objectContaining({ app: "CODEXish", button: "항상 허용", method: "in-page-click" }),
+    ]);
+    expect(lines.filter((line) => line.includes("click did not happen ("))).toEqual([
+      '[browser] App approval for CODEXish: the "항상 허용" click did not happen (obscured: div#shield; attempt 1); will retry.',
+    ]);
+    expect(lines).toContain(
+      '[browser] App approval for CODEXish: 3 clicks on "항상 허용" did not happen; scrolling the card to the end of the view for one more.',
+    );
+    expect(
+      lines.some((line) => line.includes('approved ("항상 허용") by in-page click() at')),
+    ).toBe(true);
+  }, 60_000);
+
   test("(i) deny and don't-allow buttons are never clicked", async () => {
     const denyOnly = alertCard(
       "deny-only",

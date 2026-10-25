@@ -621,6 +621,42 @@ export function buildAppApprovalLocate(
   }`;
 }
 
+/** Scrolls the card remembered under `token` (or else its button) to the end of the view. */
+export function buildAppApprovalScrollToEndExpression(
+  token: string,
+  card: Pick<AppApprovalCard, "button" | "subject">,
+): string {
+  return `(() => {
+    const store = window.__oracleApprovalButtons;
+    if (!store || store.token !== ${JSON.stringify(token)}) return false;
+    const node = store.subjects?.[${card.subject ?? -1}] ?? store.nodes?.[${card.button.index}] ?? null;
+    if (!node || !node.isConnected) return false;
+    node.scrollIntoView({ block: 'end', inline: 'nearest' });
+    return true;
+  })()`;
+}
+
+/**
+ * Last resort for a button that trusted clicks cannot reach (covered or moving): click() from
+ * inside the page, on the button only while a fresh scan verifies it as the same app's allow
+ * button.
+ */
+export function buildAppApprovalInPageClickExpression(
+  allowApps: readonly string[],
+  token: string,
+  card: Pick<AppApprovalCard, "app" | "button">,
+): string {
+  return `(() => {
+    const locate = ${buildAppApprovalLocate(allowApps, token, card)};
+    const target = locate();
+    if (!target) return { status: 'missing' };
+    if (target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true') return { status: 'disabled' };
+    if (typeof target.click === 'function') target.click();
+    else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    return { status: 'clicked' };
+  })()`;
+}
+
 export interface AppApprovalMonitorOptions {
   allowApps: readonly string[];
   logger: BrowserLogger;
@@ -719,6 +755,7 @@ export function startAppApprovalMonitor(
   const tryTrustedClick = async (
     card: AppApprovalCard,
     token: string,
+    scrollBlock: "center" | "end" = "center",
   ): Promise<GuardedTrustedClickResult | { status: "cancelled"; detail: string }> => {
     try {
       return await guardedTrustedClick(runtime, input, {
@@ -726,6 +763,7 @@ export function startAppApprovalMonitor(
         stage: "app-approval",
         target: `The "${card.button.label}" button for ${card.app}`,
         settleTimeoutMs: 1_500,
+        scrollBlock,
       });
     } catch (error) {
       if (
@@ -782,19 +820,57 @@ export function startAppApprovalMonitor(
         );
       }
       lastClick.set(card.key, Date.now());
-      const clicked = await tryTrustedClick(card, token);
-      if (clicked.status !== "clicked") {
-        lastClick.delete(card.key);
+      const first = await tryTrustedClick(card, token);
+      let method: NonNullable<BrowserAppApprovalRecord["method"]> | null =
+        first.status === "clicked" ? first.method : null;
+      let how = method === "synthetic" ? "synthetic click" : "trusted click";
+      if (first.status !== "clicked") {
         const state = failures.get(card.key) ?? { attempts: 0, outcome: "" };
         state.attempts += 1;
         failures.set(card.key, state);
-        const outcome = `${clicked.status}${clicked.detail ? `: ${clicked.detail}` : ""}`;
+        const outcome = `${first.status}${first.detail ? `: ${first.detail}` : ""}`;
         if (outcome !== state.outcome || state.attempts % 10 === 0) {
           const line = `[browser] App approval for ${card.app}: the "${card.button.label}" click did not happen (${outcome}; attempt ${state.attempts}); will retry.`;
           options.logger(line);
           await diagnose(card.key, line, token, card.subject);
         }
         state.outcome = outcome;
+        // Every third miss in a row: the card goes to the end of the view (a thread that keeps
+        // itself at the bottom lets it stay there) for one more trusted click, and then the
+        // button that a fresh scan verifies again is clicked from inside the page.
+        if (state.attempts % 3 === 0) {
+          options.logger(
+            `[browser] App approval for ${card.app}: ${state.attempts} clicks on "${card.button.label}" did not happen; scrolling the card to the end of the view for one more.`,
+          );
+          await runtime
+            .evaluate({
+              expression: buildAppApprovalScrollToEndExpression(token, card),
+              returnByValue: true,
+            })
+            .catch(() => undefined);
+          const retried = await tryTrustedClick(card, token, "end");
+          if (retried.status === "clicked") {
+            method = retried.method;
+            how = `${retried.method === "synthetic" ? "synthetic" : "trusted"} click after scrolling to the end`;
+          } else {
+            const evaluated = await runtime.evaluate({
+              expression: buildAppApprovalInPageClickExpression(allowApps, token, card),
+              returnByValue: true,
+            });
+            const inPage = evaluated?.result?.value as { status?: string } | undefined;
+            if (inPage?.status === "clicked") {
+              method = "in-page-click";
+              how = "in-page click()";
+            } else {
+              options.logger(
+                `[browser] App approval for ${card.app}: the scrolled click did not happen either (${retried.status}${retried.detail ? `: ${retried.detail}` : ""}), and the in-page click found no verified "${card.button.label}" button (${inPage?.status ?? "no answer"}); will retry.`,
+              );
+            }
+          }
+        }
+      }
+      if (!method) {
+        lastClick.delete(card.key);
         continue;
       }
       failures.delete(card.key);
@@ -803,9 +879,10 @@ export function startAppApprovalMonitor(
         button: card.button.label,
         toolText: card.toolText,
         approvedAt: new Date().toISOString(),
+        method,
       };
       options.logger(
-        `[browser] App approval: ${record.app} approved ("${record.button}") at ${record.approvedAt}: ${record.toolText.slice(0, 200)}`,
+        `[browser] App approval: ${record.app} approved ("${record.button}") by ${how} at ${record.approvedAt}: ${record.toolText.slice(0, 200)}`,
       );
       await options.onApproval?.(record);
     }

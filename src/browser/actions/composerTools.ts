@@ -272,6 +272,8 @@ function buildPageHelpers(): string {
         .filter(node => { if (seen.has(node) || !__visible(node)) return false; seen.add(node); return true; });
     };
     const __describe = node => node ? String(node.tagName || '').toLowerCase() +
+      (node.getAttribute?.('id') ? '#' + node.getAttribute('id') : '') +
+      String(node.getAttribute?.('class') || '').split(/\\s+/).filter(Boolean).slice(0, 3).map(name => '.' + name).join('') +
       (node.getAttribute?.('aria-label') ? '[aria-label="' + node.getAttribute('aria-label') + '"]' : '') +
       (node.getAttribute?.('data-testid') ? '[data-testid="' + node.getAttribute('data-testid') + '"]' : '') : 'nothing';
   `;
@@ -306,6 +308,11 @@ export interface GuardedTrustedClickOptions {
   /** Human-readable target name for errors. */
   target: string;
   settleTimeoutMs?: number;
+  /**
+   * Where a target outside the view (or covered) is scrolled to: the centre by default, or the
+   * end of the view, which suits a thread that keeps itself scrolled to the bottom.
+   */
+  scrollBlock?: "center" | "end";
 }
 
 export type GuardedTrustedClickResult =
@@ -333,6 +340,7 @@ export async function guardedTrustedClick(
   const navigationCheck = options.navigationUrl
     ? `() => ${buildComposerNavigationValidationExpression(options.navigationUrl)}`
     : `() => ({ contextMatches: true })`;
+  const scrollBlock = JSON.stringify(options.scrollBlock ?? "center");
   const measure = `(() => {
     ${buildPageHelpers()}
     const locate = ${options.locate};
@@ -345,7 +353,7 @@ export async function guardedTrustedClick(
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     if (!(x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight)) {
-      target.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+      target.scrollIntoView?.({ block: ${scrollBlock}, inline: 'nearest' });
       return { status: 'settling' };
     }
     const hit = document.elementFromPoint(x, y);
@@ -378,7 +386,7 @@ export async function guardedTrustedClick(
         scrolledForCover = true;
         await runtime
           .evaluate({
-            expression: `(() => { ${buildPageHelpers()} const target = (${options.locate})(); target?.scrollIntoView?.({ block: 'center', inline: 'nearest' }); return true; })()`,
+            expression: `(() => { ${buildPageHelpers()} const target = (${options.locate})(); target?.scrollIntoView?.({ block: ${scrollBlock}, inline: 'nearest' }); return true; })()`,
             returnByValue: true,
           })
           .catch(() => undefined);

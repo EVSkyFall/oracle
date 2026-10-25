@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   APP_APPROVAL_VOCABULARY,
+  buildAppApprovalInPageClickExpression,
   buildAppApprovalLocate,
   scanAppApprovalCards,
   startAppApprovalMonitor,
@@ -334,6 +335,28 @@ describe("app approval scope", () => {
       ]),
     ]);
     expect(byLabel).toMatchObject({ app: null, title: "Allow Slack to post?" });
+  });
+
+  test("the in-page click clicks only a button the fresh scan verifies", () => {
+    const allow = Object.assign(button("Always allow"), { click: vi.fn() });
+    const title = new DomNode("p", {}, ["Allow CODEXish to run echo?"]);
+    const document = new FakeDocument([
+      new DomNode("div", { role: "alert" }, [title, new DomNode("div", {}, [allow])]),
+    ]);
+    const window = { __oracleApprovalButtons: { token: "t", nodes: [allow] } };
+    const card = { app: "CODEXish", button: { label: "Always allow", rank: 0, index: 0 } };
+    const clickInPage = () =>
+      new Function(
+        "document",
+        "window",
+        `return ${buildAppApprovalInPageClickExpression(["CODEXish"], "t", card)}`,
+      )(document, window);
+    title.nodes.splice(0, 1, "Allow Gmail to run echo?");
+    expect(clickInPage()).toEqual({ status: "missing" });
+    expect(allow.click).not.toHaveBeenCalled();
+    title.nodes.splice(0, 1, "Allow CODEXish to run echo?");
+    expect(clickInPage()).toEqual({ status: "clicked" });
+    expect(allow.click).toHaveBeenCalledTimes(1);
   });
 
   test("the click target is re-checked at delivery", () => {
@@ -688,25 +711,35 @@ describe("app approval monitor reporting", () => {
     expect(lines.filter((line) => line.includes("diagnostic saved"))).toHaveLength(3);
   });
 
-  test("a click that does not happen is logged with its status, when it changes and every 10 attempts", async () => {
-    let arms = 0;
+  // A mock page whose guard arms on demand: `arm()` says whether the button is still in place
+  // when the click is armed, `reached` whether the trusted click reaches it, `inPage` what the
+  // in-page click finds.
+  const clickPage = (state: { arm: () => boolean; reached?: boolean; inPage?: string }) => {
+    const order: string[] = [];
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("window.__oracleApprovalButtons = {")) {
           return { result: { value: { cards: [codexishCard], skipped: [] } } };
         }
+        if (expression.includes("scrollIntoView({ block: 'end'")) {
+          order.push("scroll-end");
+          return { result: { value: true } };
+        }
+        if (expression.includes("target.click()")) {
+          order.push("in-page");
+          return { result: { value: { status: state.inPage ?? "missing" } } };
+        }
         if (expression.includes("store.subjects")) return { result: { value: page } };
         if (expression.includes("__oracleTrustedClickGuards ??=")) {
-          arms += 1;
-          // Attempts 1-11: the button moved before the click; then it is never reached.
+          order.push("arm");
           return {
             result: {
-              value: arms <= 11 ? { ready: false } : { ready: true, contextMatches: true },
+              value: state.arm() ? { ready: true, contextMatches: true } : { ready: false },
             },
           };
         }
         if (expression.includes("const summary = { reached")) {
-          return { result: { value: { reached: false, blocked: null } } };
+          return { result: { value: { reached: state.reached ?? false, blocked: null } } };
         }
         if (expression.includes("'settling'")) {
           return { result: { value: { status: "ready", x: 50, y: 60 } } };
@@ -714,7 +747,14 @@ describe("app approval monitor reporting", () => {
         return { result: { value: null } };
       }),
     };
+    return { runtime, order };
+  };
+
+  test("a click that does not happen is logged with its status, when it changes and every 10 attempts", async () => {
+    let reachable = false;
+    const { runtime } = clickPage({ arm: () => reachable });
     const logger = Object.assign(vi.fn(), { verbose: false });
+    const lines = () => logger.mock.calls.map(([line]) => String(line));
     const saveDiagnostic = vi.fn(async () => undefined);
     const onApproval = vi.fn();
     const stop = startAppApprovalMonitor(
@@ -722,18 +762,100 @@ describe("app approval monitor reporting", () => {
       { dispatchMouseEvent: vi.fn() } as never,
       { allowApps: ["CODEXish"], logger, intervalMs: 250, saveDiagnostic, onApproval },
     );
-    await vi.waitFor(() => expect(arms).toBeGreaterThanOrEqual(13), { timeout: 20_000 });
-    await stop();
-    const failures = logger.mock.calls
-      .map(([line]) => String(line))
-      .filter((line) => line.includes("click did not happen"));
-    expect(failures).toEqual([
+    try {
+      await vi.waitFor(
+        () => expect(lines().some((line) => line.includes("attempt 10)"))).toBe(true),
+        {
+          timeout: 30_000,
+        },
+      );
+      // From now on the button holds still but the click never reaches it.
+      reachable = true;
+      await vi.waitFor(
+        () => expect(lines().some((line) => line.includes("(unreached"))).toBe(true),
+        {
+          timeout: 10_000,
+        },
+      );
+    } finally {
+      await stop();
+    }
+    const failures = lines().filter((line) => line.includes("click did not happen ("));
+    expect(failures.slice(0, 2)).toEqual([
       '[browser] App approval for CODEXish: the "Always allow" click did not happen (obscured: target moved before the click; attempt 1); will retry.',
       '[browser] App approval for CODEXish: the "Always allow" click did not happen (obscured: target moved before the click; attempt 10); will retry.',
-      '[browser] App approval for CODEXish: the "Always allow" click did not happen (unreached: the click did not reach the target; attempt 12); will retry.',
+    ]);
+    expect(failures[2]).toMatch(
+      /^\[browser\] App approval for CODEXish: the "Always allow" click did not happen \(unreached: the click did not reach the target; attempt 1\d\); will retry\.$/,
+    );
+    expect(failures).toHaveLength(3);
+    expect(
+      lines()
+        .filter((line) => line.includes('clicks on "Always allow" did not happen'))
+        .slice(0, 3),
+    ).toEqual([
+      '[browser] App approval for CODEXish: 3 clicks on "Always allow" did not happen; scrolling the card to the end of the view for one more.',
+      '[browser] App approval for CODEXish: 6 clicks on "Always allow" did not happen; scrolling the card to the end of the view for one more.',
+      '[browser] App approval for CODEXish: 9 clicks on "Always allow" did not happen; scrolling the card to the end of the view for one more.',
     ]);
     expect(saveDiagnostic).toHaveBeenCalledTimes(1);
     expect(onApproval).not.toHaveBeenCalled();
+  }, 60_000);
+
+  test("after three misses the card goes to the end of the view, then the verified button is clicked in the page", async () => {
+    const { runtime, order } = clickPage({ arm: () => false, inPage: "clicked" });
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const onApproval = vi.fn();
+    const stop = startAppApprovalMonitor(
+      runtime as never,
+      { dispatchMouseEvent: vi.fn() } as never,
+      { allowApps: ["CODEXish"], logger, intervalMs: 250, onApproval },
+    );
+    try {
+      await vi.waitFor(() => expect(onApproval).toHaveBeenCalled(), { timeout: 20_000 });
+    } finally {
+      await stop();
+    }
+    expect(order.slice(0, 6)).toEqual(["arm", "arm", "arm", "scroll-end", "arm", "in-page"]);
+    // The retry after the scroll keeps the card at the end instead of centring it again.
+    expect(
+      runtime.evaluate.mock.calls.some(
+        ([call]) =>
+          call.expression.includes("'settling'") && call.expression.includes('block: "end"'),
+      ),
+    ).toBe(true);
+    expect(onApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ app: "CODEXish", button: "Always allow", method: "in-page-click" }),
+    );
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    expect(
+      lines.some((line) => line.includes('approved ("Always allow") by in-page click() at')),
+    ).toBe(true);
+  }, 30_000);
+
+  test("a trusted click that lands after the scroll to the end is recorded as one", async () => {
+    let arms = 0;
+    const { runtime, order } = clickPage({ arm: () => ++arms > 3, reached: true });
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const onApproval = vi.fn();
+    const stop = startAppApprovalMonitor(
+      runtime as never,
+      { dispatchMouseEvent: vi.fn() } as never,
+      { allowApps: ["CODEXish"], logger, intervalMs: 250, onApproval },
+    );
+    try {
+      await vi.waitFor(() => expect(onApproval).toHaveBeenCalled(), { timeout: 20_000 });
+    } finally {
+      await stop();
+    }
+    expect(order).not.toContain("in-page");
+    expect(onApproval).toHaveBeenCalledWith(expect.objectContaining({ method: "trusted-click" }));
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    expect(
+      lines.some((line) =>
+        line.includes('approved ("Always allow") by trusted click after scrolling to the end at'),
+      ),
+    ).toBe(true);
   }, 30_000);
 
   test("a page scan that throws is reported once and the watch goes on", async () => {
