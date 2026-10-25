@@ -258,18 +258,28 @@ export function findHeaderConversationMenuButton(
       return labels.some((entry) => label.includes(entry));
     })
     .map((node) => ({ node, rect: node.getBoundingClientRect() }));
+  // Header position only: a matching button elsewhere may belong to anything.
   const header = candidates
     .filter(({ rect }) => rect.top < 180 && rect.right > width - 420)
     .sort((a, b) => b.rect.right - a.rect.right);
-  return (header[0] ?? candidates[0])?.node ?? null;
+  return header[0]?.node ?? null;
 }
 
-/** Page function: the open menu that belongs to `trigger`. */
-export function findMenuForTrigger(doc: Document, trigger: Element | null): Element | null {
+/**
+ * Page function: the open menu that belongs to `trigger`: linked to it (`aria-controls`, or
+ * `aria-labelledby` = its id), or, without link attributes, the only unlinked menu while the
+ * trigger reads expanded. A menu linked to another trigger, or one in `openBefore` (open before
+ * our click), is never used.
+ */
+export function findMenuForTrigger(
+  doc: Document,
+  trigger: Element | null,
+  openBefore?: { has(menu: Element): boolean } | null,
+): Element | null {
   if (!trigger) return null;
   const menus = Array.from(doc.querySelectorAll('[role="menu"]')).filter((menu) => {
     const rect = menu.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return rect.width > 0 && rect.height > 0 && !openBefore?.has(menu);
   });
   const controls = trigger.getAttribute("aria-controls");
   const id = trigger.getAttribute("id");
@@ -279,10 +289,13 @@ export function findMenuForTrigger(doc: Document, trigger: Element | null): Elem
       (id && menu.getAttribute("aria-labelledby") === id),
   );
   if (linked) return linked;
-  // Menus without the link attributes: the only open one, while the trigger is not linked to
-  // another menu.
-  const linkedElsewhere = Boolean(controls) || trigger.getAttribute("aria-expanded") === "false";
-  return !linkedElsewhere && menus.length === 1 ? menus[0] : null;
+  if (trigger.getAttribute("aria-expanded") !== "true") return null;
+  const unlinked = menus.filter((menu) => {
+    const labelledBy = menu.getAttribute("aria-labelledby");
+    const menuId = menu.getAttribute("id");
+    return (!labelledBy || labelledBy === id) && !(controls && menuId && menuId !== controls);
+  });
+  return unlinked.length === 1 ? unlinked[0] : null;
 }
 
 /** Page function: the Archive item in `menu` (never Unarchive, Restore or anything else). */
@@ -412,7 +425,7 @@ type ArchiveOutcome =
   | { status: "skipped"; reason: string; detail?: string; conversationUrl?: string | null }
   | { status: "failed"; error: string; conversationUrl?: string | null };
 
-type ArchivePath = { name: string; trigger: string; target: string };
+type ArchivePath = { name: string; trigger: string; target: string; navigationUrl: string };
 
 const ARCHIVE_STAGE = "archive-conversation";
 const REASON_RANK: Record<string, number> = {
@@ -420,6 +433,30 @@ const REASON_RANK: Record<string, number> = {
   "conversation-menu-not-opened": 1,
   "archive-menu-item-not-found": 2,
 };
+
+type ArchiveClickResult =
+  | Awaited<ReturnType<typeof guardedTrustedClick>>
+  | { status: "conversation-changed" | "cancelled"; detail?: string };
+
+/** A guarded click whose navigation or delivery cancellation is a result, not an error. */
+async function archiveClick(
+  runtime: ChromeClient["Runtime"],
+  input: ChromeClient["Input"] | undefined,
+  options: { locate: string; target: string; navigationUrl: string; settleTimeoutMs: number },
+): Promise<ArchiveClickResult> {
+  try {
+    return await guardedTrustedClick(runtime, input, { ...options, stage: ARCHIVE_STAGE });
+  } catch (error) {
+    const code = (error as { details?: { code?: string } })?.details?.code;
+    if (code === "attachment-control-unexpected-navigation") {
+      return { status: "conversation-changed", detail: "the open page changed before the click" };
+    }
+    if (code === "trusted-click-cancelled") {
+      return { status: "cancelled", detail: "the target moved or was covered at the click" };
+    }
+    throw error;
+  }
+}
 
 async function evaluateValue<T>(
   runtime: ChromeClient["Runtime"],
@@ -430,7 +467,7 @@ async function evaluateValue<T>(
 }
 
 const menuLocate = (path: ArchivePath) =>
-  `() => (${findMenuForTrigger.toString()})(document, (${path.trigger})())`;
+  `() => (${findMenuForTrigger.toString()})(document, (${path.trigger})(), window.__oracleArchiveMenusBefore ?? null)`;
 
 async function waitForMenu(
   runtime: ChromeClient["Runtime"],
@@ -467,19 +504,31 @@ async function closeMenus(
   }
 }
 
-/** Opens the path's menu. Returns why not, or null when it is open. */
+/** Opens the path's menu with our own click. Returns why not, or null when it is open. */
 async function openPathMenu(
   runtime: ChromeClient["Runtime"],
   input: ChromeClient["Input"] | undefined,
   path: ArchivePath,
 ): Promise<{ reason: string; detail: string } | null> {
-  if (await waitForMenu(runtime, path, 0)) return null;
-  const clicked = await guardedTrustedClick(runtime, input, {
+  // A menu that is already open was not opened by us: close it and never adopt it.
+  const openMenus = await evaluateValue<number>(
+    runtime,
+    `document.querySelectorAll('[role="menu"]').length`,
+  );
+  if (openMenus) await closeMenus(runtime, input);
+  await evaluateValue(
+    runtime,
+    `(() => { window.__oracleArchiveMenusBefore = new WeakSet(Array.from(document.querySelectorAll('[role="menu"]'))); return true; })()`,
+  );
+  const clicked = await archiveClick(runtime, input, {
     locate: path.trigger,
-    stage: ARCHIVE_STAGE,
     target: path.target,
+    navigationUrl: path.navigationUrl,
     settleTimeoutMs: 1_500,
   });
+  if (clicked.status === "conversation-changed") {
+    return { reason: "conversation-changed", detail: `${path.name}: ${clicked.detail}` };
+  }
   if (clicked.status === "missing") {
     return { reason: "conversation-menu-not-found", detail: `${path.name}: no menu button` };
   }
@@ -499,24 +548,35 @@ async function runArchive(
   conversationUrl: string | null,
 ): Promise<ArchiveOutcome> {
   const startUrl = (await evaluateValue<string>(runtime, "location.href")) ?? conversationUrl;
-  const conversationId = conversationIdFromUrl(conversationUrl) ?? conversationIdFromUrl(startUrl);
+  // Only the run's own conversation is ever archived; without its id nothing is.
+  const conversationId = conversationIdFromUrl(conversationUrl);
+  if (!conversationId || !startUrl) {
+    return {
+      status: "skipped",
+      reason: "missing-conversation-url",
+      detail: "the run's conversation id is unknown",
+      conversationUrl: startUrl,
+    };
+  }
   const pageConversationId = conversationIdFromUrl(startUrl);
   const labels = JSON.stringify(ARCHIVE_LABELS);
   const signalsExpression = `(${readArchiveSignals.toString()})(document, ${JSON.stringify(conversationId)}, ${labels})`;
-  const paths: ArchivePath[] = [];
-  if (conversationId) {
-    paths.push({
+  // Every click is cancelled at delivery if the open page is no longer the one we started on.
+  const paths: ArchivePath[] = [
+    {
       name: "sidebar row",
       trigger: `() => (${findConversationRowMenuButton.toString()})(document, ${JSON.stringify(conversationId)}, ${JSON.stringify(ARCHIVE_LABELS.rowMenuButton)})`,
       target: "The chat's sidebar menu button",
-    });
-  }
+      navigationUrl: startUrl,
+    },
+  ];
   // The header menu acts on the open page, so it is only used while that page is this chat.
-  if (!conversationId || pageConversationId === conversationId) {
+  if (pageConversationId === conversationId) {
     paths.push({
       name: "header menu",
       trigger: `() => (${findHeaderConversationMenuButton.toString()})(document, ${JSON.stringify(ARCHIVE_LABELS.headerMenuButton)})`,
       target: "The conversation menu button",
+      navigationUrl: startUrl,
     });
   }
   const before = await evaluateValue<{ rowPresent?: boolean }>(runtime, signalsExpression);
@@ -527,19 +587,33 @@ async function runArchive(
     details.push(detail);
     if ((REASON_RANK[nextReason] ?? 0) >= (REASON_RANK[reason] ?? 0)) reason = nextReason;
   };
+  const conversationChanged = (detail: string): ArchiveOutcome => ({
+    status: "skipped",
+    reason: "conversation-changed",
+    detail: `${detail}; nothing more was clicked`,
+    conversationUrl: startUrl,
+  });
   for (const path of paths) {
     const notOpen = await openPathMenu(runtime, input, path);
+    if (notOpen?.reason === "conversation-changed") {
+      await closeMenus(runtime, input);
+      return conversationChanged(notOpen.detail);
+    }
     if (notOpen) {
       note(notOpen.reason, notOpen.detail);
       continue;
     }
     const itemLocate = `() => (${findArchiveMenuItem.toString()})((${menuLocate(path)})(), ${labels})`;
-    const item = await guardedTrustedClick(runtime, input, {
+    const item = await archiveClick(runtime, input, {
       locate: itemLocate,
-      stage: ARCHIVE_STAGE,
       target: "The ChatGPT Archive menu item",
+      navigationUrl: path.navigationUrl,
       settleTimeoutMs: 1_000,
     });
+    if (item.status === "conversation-changed") {
+      await closeMenus(runtime, input);
+      return conversationChanged(`${path.name}: ${item.detail}`);
+    }
     if (item.status !== "clicked") {
       note(
         "archive-menu-item-not-found",
@@ -554,6 +628,7 @@ async function runArchive(
         conversationId,
         pageConversationId,
         rowPresentBefore,
+        navigationUrl: path.navigationUrl,
       })
     ) {
       return { status: "archived", conversationUrl: startUrl };
@@ -585,6 +660,7 @@ async function waitForArchived(
     conversationId: string | null;
     pageConversationId: string | null;
     rowPresentBefore: boolean;
+    navigationUrl: string;
   },
 ): Promise<boolean> {
   const confirmLocate = `() => (${findArchiveConfirmButton.toString()})(document, ${JSON.stringify(ARCHIVE_LABELS)})`;
@@ -598,20 +674,23 @@ async function waitForArchived(
     if (signals) {
       if (signals.toast) return true;
       if (options.rowPresentBefore && !signals.rowPresent) return true;
+      // Leaving the chat counts only as the effect of our own Archive click on the open chat
+      // (ChatGPT sends you home); a move to another conversation is not an archive.
       if (
-        options.conversationId &&
+        !options.rowPresentBefore &&
         options.pageConversationId === options.conversationId &&
-        signals.pageConversationId !== options.conversationId
+        signals.pageConversationId === null
       )
         return true;
     }
     if (!confirmed && (await evaluateValue<boolean>(runtime, `Boolean((${confirmLocate})())`))) {
-      const clicked = await guardedTrustedClick(runtime, input, {
+      const clicked = await archiveClick(runtime, input, {
         locate: confirmLocate,
-        stage: ARCHIVE_STAGE,
         target: "The archive confirmation button",
+        navigationUrl: options.navigationUrl,
         settleTimeoutMs: 1_000,
       });
+      if (clicked.status === "conversation-changed") return false;
       confirmed = clicked.status === "clicked";
     }
     if (Date.now() >= deadline) return false;

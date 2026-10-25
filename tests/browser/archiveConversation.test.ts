@@ -122,6 +122,22 @@ describe("archiveChatGptConversation", () => {
     });
     expect(logger).toHaveBeenCalledWith("[browser] ChatGPT archive skipped (target closed).");
   });
+
+  test("without the run's own conversation id nothing is clicked", async () => {
+    // The open page is a conversation, but the run's id is unknown: it may not be ours.
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValue({ result: { value: "https://chatgpt.com/c/someone-else" } }),
+    };
+    await expect(
+      archiveChatGptConversation(runtime as never, vi.fn() as never, {
+        mode: "always",
+        conversationUrl: null,
+      }),
+    ).resolves.toMatchObject({ archived: false, reason: "missing-conversation-url" });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
 });
 
 // Today's sidebar row (2026-10): a role="group" row inside a role="list", the chat link, and a
@@ -190,8 +206,12 @@ describe("archive locators", () => {
     ).toBe("trigger-aaa");
   });
 
-  test("the header menu button is never one inside the sidebar list", () => {
-    const more = new FakeElement("button", { id: "more", "aria-label": "More" });
+  test("the header menu button is only one in the header position, never in the sidebar", () => {
+    const at = (attrs: Record<string, string>, rect: { top: number; right: number }) =>
+      Object.assign(new FakeElement("button", attrs), {
+        getBoundingClientRect: () => ({ width: 20, height: 20, ...rect }),
+      });
+    const more = at({ id: "more", "aria-label": "More" }, { top: 8, right: 1170 });
     const page = doc(
       sidebar(row("aaa", [chatActions("aaa", "More")])),
       new FakeElement("header", {}, [more]),
@@ -202,6 +222,17 @@ describe("archive locators", () => {
     expect(
       findHeaderConversationMenuButton(
         doc(sidebar(row("aaa", [chatActions("aaa", "More")]))),
+        ARCHIVE_LABELS.headerMenuButton,
+      ),
+    ).toBeNull();
+    // A matching button anywhere else (here: a drawer row far below the header) is not used.
+    const elsewhere = at(
+      { id: "drawer-more", "aria-label": "More options" },
+      { top: 600, right: 900 },
+    );
+    expect(
+      findHeaderConversationMenuButton(
+        doc(new FakeElement("div", {}, [elsewhere])),
         ARCHIVE_LABELS.headerMenuButton,
       ),
     ).toBeNull();
@@ -217,10 +248,26 @@ describe("archive locators", () => {
     expect(findMenuForTrigger(doc(other), el(trigger))).toBeNull();
     // A closed trigger never adopts an unrelated open menu.
     expect(findMenuForTrigger(doc(other), el(chatActions("aaa")))).toBeNull();
-    // Menus without link attributes: the only open one.
+    // Menus without link attributes: only while the trigger reads expanded.
     const bare = new FakeElement("button", { "aria-haspopup": "menu" });
     const lone = menu(["Archive"]);
+    expect(findMenuForTrigger(doc(lone), el(bare))).toBeNull();
+    bare.setAttribute("aria-expanded", "true");
     expect(findMenuForTrigger(doc(lone), el(bare))).toBe(el(lone));
+  });
+
+  test("never uses a menu linked to another trigger or one that was open before our click", () => {
+    // A trigger without link attributes that reads expanded.
+    const bare = new FakeElement("button", { "aria-haspopup": "menu", "aria-expanded": "true" });
+    const othersMenu = menu(["Rename", "Archive"], { "aria-labelledby": "radix-other" });
+    expect(findMenuForTrigger(doc(othersMenu), el(bare))).toBeNull();
+    const lone = menu(["Archive"]);
+    expect(findMenuForTrigger(doc(lone), el(bare), new Set([el(lone)]))).toBeNull();
+    // Even a linked menu that was already open is not adopted.
+    const trigger = chatActions("aaa");
+    const linked = menu(["Archive"], { "aria-labelledby": "trigger-aaa" });
+    expect(findMenuForTrigger(doc(linked), el(trigger), new Set([el(linked)]))).toBeNull();
+    expect(findMenuForTrigger(doc(linked), el(trigger), new Set())).toBe(el(linked));
   });
 
   test("picks Archive, never Delete, Unarchive or Restore", () => {

@@ -35,13 +35,14 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
   const params = new URLSearchParams(location.search);
   const mode = params.get('mode') || 'today';
   const rows = (params.get('rows') || '').split(',').filter(Boolean);
+  const legacyLayout = mode === 'legacy' || mode === 'spa-switch';
   window.actions = [];
   const list = document.getElementById('list');
   for (const id of rows) {
     const item = document.createElement('div');
     item.setAttribute('role', 'listitem');
     item.innerHTML = '<div role="group" class="row" aria-label="Chat ' + id + '"><div><a href="/c/' + id + '">Chat ' + id + '</a></div>' +
-      (mode === 'legacy' ? '' : '<div class="actions"><div role="presentation"><button type="button" id="trigger-' + id + '" aria-label="Chat actions" aria-haspopup="menu" aria-expanded="false">⋯</button></div><button type="button" aria-label="Pin chat">p</button></div>') +
+      (legacyLayout ? '' : '<div class="actions"><div role="presentation"><button type="button" id="trigger-' + id + '" aria-label="Chat actions" aria-haspopup="menu" aria-expanded="false">⋯</button></div><button type="button" aria-label="Pin chat">p</button></div>') +
       '</div>';
     list.append(item);
   }
@@ -69,11 +70,14 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
       item.tabIndex = -1;
       item.textContent = label;
       item.addEventListener('click', () => {
+        // The header menu acts on whatever chat is open when it is clicked.
+        chat = chat ?? currentChat();
         window.actions.push({ item: label, chat });
         closeMenu();
         if (label !== 'Archive' || mode === 'stuck') return;
+        if (mode === 'stuck-nav') { history.pushState({}, '', '/c/zzz'); return; }
         document.querySelector('a[href="/c/' + chat + '"]')?.closest('[role="listitem"]')?.remove();
-        if (mode === 'legacy') {
+        if (legacyLayout) {
           const toast = document.createElement('div');
           toast.setAttribute('role', 'status');
           toast.textContent = 'Chat archived';
@@ -97,12 +101,25 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     }
     if (open && open.trigger === trigger) { closeMenu(); return; }
     if (trigger.id === 'more') {
-      openMenu(trigger, mode === 'legacy' ? ['Pin', 'Archive', 'View files in chat'] : ['Pin', 'Plugins', 'View files in chat'], currentChat());
+      openMenu(trigger, legacyLayout ? ['Pin', 'Archive', 'View files in chat'] : ['Pin', 'Plugins', 'View files in chat'], null);
+      // The single-page app moves to another chat while the menu is open.
+      if (mode === 'spa-switch') setTimeout(() => history.pushState({}, '', '/c/zzz'), 50);
+    } else if (trigger.dataset.inert === 'true') {
+      return;
     } else {
       openMenu(trigger, ['Rename', 'Pin', 'Share', 'Archive', 'Delete', 'Move to project'], trigger.id.slice('trigger-'.length));
     }
   });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeMenu(); });
+  if (mode === 'stale-menu') {
+    // Another chat's menu is already open, and this chat's button has no link attributes and
+    // opens nothing.
+    const own = document.getElementById('trigger-aaa');
+    own.removeAttribute('id');
+    own.removeAttribute('aria-expanded');
+    own.dataset.inert = 'true';
+    openMenu(document.getElementById('trigger-bbb'), ['Rename', 'Archive', 'Delete'], 'bbb');
+  }
 </script></body></html>`;
 
 describe.runIf(enabled)("conversation archive in real Chrome", () => {
@@ -205,6 +222,29 @@ describe.runIf(enabled)("conversation archive in real Chrome", () => {
       reason: "conversation-menu-not-found",
     });
     expect((await pageState()).actions).toEqual([]);
+  }, 60_000);
+
+  test("the header Archive click is cancelled when the page moves to another chat", async () => {
+    const url = await load("aaa", { rows: "bbb", mode: "spa-switch" });
+    await expect(archive(url)).resolves.toMatchObject({
+      archived: false,
+      reason: "conversation-changed",
+    });
+    expect((await pageState()).actions).toEqual([]);
+  }, 60_000);
+
+  test("a menu that another chat's button opened is never used", async () => {
+    const url = await load("aaa", { rows: "bbb,aaa", mode: "stale-menu" });
+    await expect(archive(url)).resolves.toMatchObject({ archived: false });
+    const state = await pageState();
+    expect(state.actions).toEqual([]);
+    expect(state.rows).toEqual(["/c/bbb", "/c/aaa"]);
+  }, 60_000);
+
+  test("moving to another chat after the Archive click is not an archive", async () => {
+    const url = await load("aaa", { rows: "aaa", mode: "stuck-nav" });
+    await expect(archive(url)).resolves.toMatchObject({ archived: false });
+    expect((await pageState()).actions).toEqual([{ item: "Archive", chat: "aaa" }]);
   }, 60_000);
 
   test("an Archive click that changes nothing is reported as not confirmed", async () => {
