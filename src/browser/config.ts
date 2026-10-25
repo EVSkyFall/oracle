@@ -159,6 +159,7 @@ export function resolveBrowserConfig(
     remoteChromeProfileRoot:
       config?.remoteChromeProfileRoot ?? DEFAULT_BROWSER_CONFIG.remoteChromeProfileRoot,
     thinkingTime: config?.thinkingTime,
+    maxThinkingTime: config?.maxThinkingTime,
     researchMode,
     archiveConversations,
     resumeConversationUrl:

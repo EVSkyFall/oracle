@@ -162,6 +162,7 @@ interface CliOptions extends OptionValues {
   browserManualLoginProfileDir?: string;
   copyProfile?: string;
   browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
+  browserMaxThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
   browserCaptureProviderNative?: boolean;
   browserResearch?: "off" | "search" | "deep";
   browserFollowUp?: string[];
@@ -845,6 +846,14 @@ program
     new Option(
       "--browser-thinking-time <level>",
       "Thinking time intensity for Thinking/Pro models: light, standard, extended, extra-high (Extra High), pro (Pro tier of the active model), heavy, or ChatGPT UI aliases.",
+    )
+      .argParser(parseThinkingTimeOption)
+      .hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-max-thinking-time <level>",
+      "Highest thinking time a prompt may be sent with (same levels as --browser-thinking-time). Right before every submission the picker is read; a higher tier is lowered to this level, and a tier that still reads higher stops the run before anything is sent.",
     )
       .argParser(parseThinkingTimeOption)
       .hideHelp(),
@@ -2320,7 +2329,10 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const browserConfig = await (async (): Promise<BrowserSessionConfig | undefined> => {
     if (sessionMode !== "browser") return undefined;
     if (browserFollowup) {
-      return browserFollowup.browserConfig;
+      // This invocation's maximum (flag or config) also binds a follow-up of an older session.
+      return options.browserMaxThinkingTime
+        ? { ...browserFollowup.browserConfig, maxThinkingTime: options.browserMaxThinkingTime }
+        : browserFollowup.browserConfig;
     }
     const { buildBrowserConfig, resolveBrowserModelLabel } =
       await import("../src/cli/browserConfig.js");
@@ -3067,6 +3079,10 @@ function printDebugHelp(cliName: string): void {
     [
       "--browser-thinking-time <level>",
       "Thinking time: light, standard, extended, extra-high, pro, or heavy.",
+    ],
+    [
+      "--browser-max-thinking-time <level>",
+      "Highest thinking time to send with; a higher tier is lowered before every submission.",
     ],
     ["--browser-timeout <ms|s|m>", "Cap total wait time for the assistant response."],
     ["--browser-input-timeout <ms|s|m>", "Cap how long we wait for the composer textarea."],

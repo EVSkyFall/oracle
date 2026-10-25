@@ -39,6 +39,7 @@ import {
   formatSessionBrowserModelWithRequestedKey,
   resolveSessionBrowserModelDisplayName,
 } from "../browser/modelDisplay.js";
+import { formatModelPickerEvidence } from "../browser/actions/modelPickerState.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? kleur.dim(text) : text);
@@ -415,6 +416,8 @@ export async function attachSession(
           ),
           modelSelection: metadata.browser?.modelSelection,
           thinkingSelection: metadata.browser?.thinkingSelection,
+          modelPicker: metadata.browser?.modelPicker,
+          thinkingCap: metadata.browser?.thinkingCap,
           warnings: metadata.browser?.warnings,
         },
         artifacts,
@@ -802,6 +805,8 @@ export function formatBrowserEvidence(metadata: SessionMetadata): string[] | nul
   if (
     !browser?.modelSelection &&
     !browser?.thinkingSelection &&
+    !browser?.modelPicker &&
+    !browser?.thinkingCap?.length &&
     (!browser?.warnings || browser.warnings.length === 0)
   ) {
     return null;
@@ -814,6 +819,15 @@ export function formatBrowserEvidence(metadata: SessionMetadata): string[] | nul
   const thinkingEvidence = browser.thinkingSelection;
   if (thinkingEvidence) {
     lines.push(`effort ${formatBrowserThinkingSelectionEvidence(thinkingEvidence)}`);
+  }
+  if (browser.modelPicker) {
+    lines.push(`picker ${formatModelPickerEvidence(browser.modelPicker)}`);
+  }
+  for (const check of browser.thinkingCap ?? []) {
+    const shown = check.after ?? check.before;
+    lines.push(
+      `max effort ${check.maxLevel}: ${check.status} (${formatModelPickerEvidence(shown)})`,
+    );
   }
   for (const warning of browser.warnings ?? []) {
     lines.push(`warning ${warning.code}: ${warning.message}`);

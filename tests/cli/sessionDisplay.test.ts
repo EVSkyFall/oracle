@@ -961,3 +961,40 @@ describe("attachSession rendering", () => {
     expect(sessionStoreMock.readLog).not.toHaveBeenCalled();
   });
 });
+
+describe("formatBrowserEvidence picker lines", () => {
+  test("shows what the picker showed and each maximum-thinking-time check", () => {
+    const pickerRead = (tierLabel: string, sliderValue: number) => ({
+      modelLabel: "GPT-6",
+      tierLabel,
+      sliderValue,
+      sliderMin: 0,
+      sliderMax: 4,
+      readable: true,
+      source: "chatgpt-model-picker" as const,
+      capturedAt: "2026-10-25T00:00:00.000Z",
+    });
+    const metadata: SessionMetadata = {
+      id: "sess",
+      createdAt: new Date().toISOString(),
+      status: "completed",
+      options: {},
+      browser: {
+        modelPicker: pickerRead("Extra High", 3),
+        thinkingCap: [
+          {
+            maxLevel: "extra-high",
+            status: "lowered",
+            before: pickerRead("Pro", 4),
+            after: pickerRead("Extra High", 3),
+            capturedAt: "2026-10-25T00:00:00.000Z",
+          },
+        ],
+      },
+    };
+    expect(formatBrowserEvidence(metadata)).toEqual([
+      'picker model "GPT-6", tier "Extra High", slider 3 (0-4)',
+      'max effort extra-high: lowered (model "GPT-6", tier "Extra High", slider 3 (0-4))',
+    ]);
+  });
+});

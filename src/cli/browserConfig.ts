@@ -102,6 +102,8 @@ export interface BrowserFlagOptions {
   remoteHost?: string;
   /** Thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', 'heavy' */
   browserThinkingTime?: ThinkingTimeLevel;
+  /** Highest thinking time a prompt may be sent with; checked right before every submission. */
+  browserMaxThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
   browserCaptureProviderNative?: boolean;
@@ -372,6 +374,7 @@ export async function buildBrowserConfig(
     remoteChrome,
     browserTabRef: options.browserTab ?? undefined,
     thinkingTime,
+    maxThinkingTime: normalizeThinkingTimeLevel(options.browserMaxThinkingTime) ?? undefined,
     researchMode:
       options.browserResearch === "deep" || options.browserResearch === "search"
         ? options.browserResearch

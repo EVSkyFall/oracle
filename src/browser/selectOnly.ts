@@ -6,6 +6,7 @@ import type {
 } from "./types.js";
 import type {
   BrowserModelSelectionEvidence,
+  BrowserThinkingCapEvidence,
   BrowserThinkingSelectionEvidence,
 } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
@@ -19,6 +20,7 @@ import {
   currentTierLevel,
   type ModelPickerRestoreResult,
 } from "./actions/modelPickerState.js";
+import { isAboveThinkingCap } from "./actions/thinkingTimeCap.js";
 
 export interface SelectOnlyCheckOptions {
   runtime: ChromeClient["Runtime"];
@@ -27,6 +29,8 @@ export interface SelectOnlyCheckOptions {
   /** Model the run selects with strategy "select"; null when the run keeps ChatGPT's model. */
   requestedModel: string | null;
   requestedThinkingTime: ThinkingTimeLevel | null;
+  /** The run's maximum thinking time; its check is part of `applySelection`. */
+  maxThinkingTime?: ThinkingTimeLevel | null;
   /**
    * The run's own model and thinking-time selection, exactly as before a real submit. It must
    * use the Runtime it is given, so its page-side work can be awaited before restoring.
@@ -35,6 +39,7 @@ export interface SelectOnlyCheckOptions {
   readEvidence: () => {
     model?: BrowserModelSelectionEvidence;
     thinking?: BrowserThinkingSelectionEvidence;
+    thinkingCap?: BrowserThinkingCapEvidence;
   };
 }
 
@@ -104,11 +109,15 @@ export async function runSelectOnlyCheck(
 ): Promise<BrowserSelectOnlyReport> {
   const { runtime, input, logger } = options;
   const report = (
-    fields: Omit<BrowserSelectOnlyReport, "requestedModel" | "requestedThinkingTime">,
+    fields: Omit<
+      BrowserSelectOnlyReport,
+      "requestedModel" | "requestedThinkingTime" | "maxThinkingTime"
+    >,
   ) => ({
     ...fields,
     requestedModel: options.requestedModel,
     requestedThinkingTime: options.requestedThinkingTime,
+    ...(options.maxThinkingTime ? { maxThinkingTime: options.maxThinkingTime } : {}),
   });
   const before = await readModelPickerState(runtime, input).catch(() => null);
   logger(`[browser] Select-only: before: ${formatModelPickerState(before)}.`);
@@ -142,7 +151,7 @@ export async function runSelectOnlyCheck(
     await page.settle();
     // A failed read must not skip the restore below.
     const selected = await readModelPickerState(runtime, input).catch(() => null);
-    const { model, thinking } = options.readEvidence();
+    const { model, thinking, thinkingCap } = options.readEvidence();
     const problems: string[] = [];
     if (selectionError) problems.push(selectionError);
     if (!selected) problems.push("the model picker could not be read after selecting");
@@ -161,11 +170,22 @@ export async function runSelectOnlyCheck(
         );
       }
     }
+    if (options.maxThinkingTime) {
+      if (!thinkingCap && !selectionError) {
+        problems.push(`the maximum thinking time "${options.maxThinkingTime}" was not checked`);
+      }
+      if (selected && isAboveThinkingCap(currentTierLevel(selected), options.maxThinkingTime)) {
+        problems.push(
+          `the picker shows tier "${selected.tierLabel ?? "unknown"}" above the maximum "${options.maxThinkingTime}"`,
+        );
+      }
+    }
     const verified = problems.length === 0;
     logger(
       `[browser] Select-only: selected: ${formatModelPickerState(selected)}` +
         `${model?.resolvedLabel ? `; model evidence "${model.resolvedLabel}"` : ""}` +
         `${thinking?.resolvedLabel ? `; effort evidence "${thinking.resolvedLabel}"` : ""}` +
+        `${thinkingCap ? `; maximum "${thinkingCap.maxLevel}": ${thinkingCap.status}` : ""}` +
         `; ${verified ? "verified" : `NOT verified (${problems.join("; ")})`}.`,
     );
 
@@ -194,6 +214,7 @@ export async function runSelectOnlyCheck(
       restored: restore.state,
       restoreVerified: restore.restored,
       ...(restore.detail ? { restoreDetail: restore.detail } : {}),
+      ...(thinkingCap ? { thinkingCap } : {}),
     });
   });
 }

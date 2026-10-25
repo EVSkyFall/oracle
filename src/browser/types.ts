@@ -2,7 +2,9 @@ import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
+  BrowserModelPickerEvidence,
   BrowserModelSelectionEvidence,
+  BrowserThinkingCapEvidence,
   BrowserThinkingSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
@@ -154,6 +156,11 @@ export interface BrowserAutomationConfig {
   copyProfileSource?: string | null;
   /** Thinking time intensity level for Thinking/Pro models: light, standard, extended, heavy */
   thinkingTime?: ThinkingTimeLevel;
+  /**
+   * Highest effort tier a prompt may be sent with. Right before every submission the picker is
+   * read; a higher tier is lowered to this one, and a tier still above it stops the submission.
+   */
+  maxThinkingTime?: ThinkingTimeLevel;
   /** Browser-only research mode. "deep" activates ChatGPT Deep Research. */
   researchMode?: BrowserResearchMode;
   /** Archive completed ChatGPT conversations after local artifacts are saved. */
@@ -209,6 +216,9 @@ export interface BrowserSelectOnlyReport {
   reason?: string;
   requestedModel: string | null;
   requestedThinkingTime: string | null;
+  /** The run's maximum thinking time, when set; its check ran as it would before a submit. */
+  maxThinkingTime?: string;
+  thinkingCap?: BrowserThinkingCapEvidence;
   before: BrowserModelPickerState | null;
   selected: BrowserModelPickerState | null;
   restored: BrowserModelPickerState | null;
@@ -269,7 +279,14 @@ export interface BrowserRunOptions {
   runtimeHintCb?: (
     hint: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
+    pickerEvidence?: BrowserPickerEvidenceHint,
   ) => void | Promise<void>;
+}
+
+/** Picker evidence gathered so far, persisted with the runtime hint so failed runs keep it. */
+export interface BrowserPickerEvidenceHint {
+  modelPicker?: BrowserModelPickerEvidence;
+  thinkingCap?: BrowserThinkingCapEvidence[];
 }
 
 export interface BrowserArchiveResult {
@@ -298,6 +315,8 @@ export interface BrowserRunResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  modelPicker?: BrowserModelPickerEvidence;
+  thinkingCap?: BrowserThinkingCapEvidence[];
   providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   tookMs: number;
@@ -336,6 +355,7 @@ export type ResolvedBrowserConfig = Required<
     | "remoteChromeBrowserWSEndpoint"
     | "remoteChromeProfileRoot"
     | "thinkingTime"
+    | "maxThinkingTime"
     | "modelStrategy"
     | "maxConcurrentTabs"
     | "researchMode"
@@ -353,6 +373,7 @@ export type ResolvedBrowserConfig = Required<
   modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   thinkingTime?: ThinkingTimeLevel;
+  maxThinkingTime?: ThinkingTimeLevel;
   debugPort?: number | null;
   inlineCookiesSource?: string | null;
   remoteChrome?: { host: string; port: number } | null;

@@ -1824,6 +1824,73 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("a run refused by the maximum thinking time keeps the picker evidence and the refusal", async () => {
+    const pickerRead = (tierLabel: string, sliderValue: number) => ({
+      modelLabel: "GPT-6",
+      tierLabel,
+      sliderValue,
+      sliderMin: 0,
+      sliderMax: 4,
+      readable: true,
+      source: "chatgpt-model-picker",
+      capturedAt: "2026-10-25T00:00:00.000Z",
+    });
+    const refusal = new BrowserAutomationError(
+      'Thinking time: the picker still shows model "GPT-6", tier "Pro", slider 4 (0-4) after lowering it to the maximum "extra-high"; nothing was sent.',
+      {
+        stage: "thinking-time-cap",
+        code: "thinking-time-above-max",
+        maxThinkingTime: "extra-high",
+        before: pickerRead("Pro", 4),
+        after: pickerRead("Pro", 4),
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await (
+        deps as {
+          persistRuntimeHint?: (
+            runtime: Record<string, unknown>,
+            modelSelection?: Record<string, unknown>,
+            pickerEvidence?: Record<string, unknown>,
+          ) => Promise<void>;
+        }
+      ).persistRuntimeHint?.(
+        { chromePort: 9222, chromeHost: "127.0.0.1", promptSubmitted: false },
+        undefined,
+        { modelPicker: pickerRead("Pro", 4) },
+      );
+      throw refusal;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: { ...baseSessionMeta },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, maxThinkingTime: "extra-high" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/nothing was sent/);
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining({ promptSubmitted: false }),
+        modelPicker: expect.objectContaining({ tierLabel: "Pro", sliderValue: 4 }),
+      }),
+      error: expect.objectContaining({
+        details: expect.objectContaining({
+          code: "thinking-time-above-max",
+          maxThinkingTime: "extra-high",
+        }),
+      }),
+    });
+  });
+
   test("keeps session running when browser connection is lost", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",

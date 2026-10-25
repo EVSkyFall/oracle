@@ -1,5 +1,7 @@
 import type { ChromeClient, BrowserLogger, BrowserModelPickerState } from "../types.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
+import type { BrowserModelPickerEvidence } from "../../sessionStore.js";
+import { BrowserRunCancelledError } from "../../oracle/errors.js";
 import { MODEL_BUTTON_SELECTOR } from "../constants.js";
 import { delay } from "../utils.js";
 import { guardedTrustedClick } from "./composerTools.js";
@@ -268,7 +270,8 @@ async function readOpenStateWhenMounted(
   return state;
 }
 
-// Direction only: which way the slider moves from one effort level toward another.
+// Order of effort levels: which way the slider moves toward a level, and whether a tier is above
+// a maximum. Not slider values.
 const LEVEL_RANK: Partial<Record<ThinkingTimeLevel, number>> = {
   light: 0,
   standard: 1,
@@ -277,6 +280,29 @@ const LEVEL_RANK: Partial<Record<ThinkingTimeLevel, number>> = {
   heavy: 3.5,
   pro: 4,
 };
+
+/** Where `level` sits among effort levels; undefined for a level that cannot be placed. */
+export function thinkingLevelRank(level: ThinkingTimeLevel | null | undefined): number | undefined {
+  return level ? LEVEL_RANK[level] : undefined;
+}
+
+/** A picker reading as session evidence. A tier named only by a live announcement is left out. */
+export function modelPickerEvidence(
+  state: BrowserModelPickerState | null | undefined,
+): BrowserModelPickerEvidence {
+  const tierLabel = state && state.tierSource !== "announcement" ? (state.tierLabel ?? null) : null;
+  const sliderValue = state?.sliderValue ?? null;
+  return {
+    modelLabel: state?.modelLabel ?? null,
+    tierLabel,
+    sliderValue,
+    sliderMin: state?.sliderMin ?? null,
+    sliderMax: state?.sliderMax ?? null,
+    readable: Boolean(state?.modelLabel || tierLabel || sliderValue !== null),
+    source: "chatgpt-model-picker",
+    capturedAt: new Date().toISOString(),
+  };
+}
 
 /**
  * Opens the picker, reads what it shows (waiting for the slider to mount) and closes it again.
@@ -472,6 +498,69 @@ async function moveSliderToLevel(
 }
 
 /**
+ * Steps the effort slider down with trusted keys until the picker's tier is at or below
+ * `maxLevel`. Which slider direction lowers the tier is learned from the first step. Opens and
+ * closes the picker itself; the caller reads the result back.
+ */
+export async function lowerModelPickerTier(
+  runtime: ChromeClient["Runtime"],
+  input: ChromeClient["Input"] | undefined,
+  maxLevel: ThinkingTimeLevel,
+): Promise<{ lowered: boolean; detail?: string }> {
+  const cap = LEVEL_RANK[maxLevel];
+  if (cap === undefined) return { lowered: false, detail: `"${maxLevel}" cannot be placed` };
+  if (!(await openModelPicker(runtime, input))) {
+    return { lowered: false, detail: "the model picker did not open" };
+  }
+  try {
+    let step = -1;
+    let flipped = false;
+    const seen = new Set<number>();
+    for (;;) {
+      const state = await readOpenStateWhenMounted(runtime);
+      const value = state?.sliderValue ?? null;
+      if (value === null) return { lowered: false, detail: "the effort slider is not mounted" };
+      const shown = currentTierLevel(state);
+      const rank = shown ? LEVEL_RANK[shown] : undefined;
+      if (rank === undefined) {
+        return {
+          lowered: false,
+          detail: `tier "${state?.tierLabel ?? "unknown"}" cannot be placed`,
+        };
+      }
+      if (rank <= cap) return { lowered: true };
+      if (seen.has(value)) return { lowered: false, detail: "no slider step lowers the tier" };
+      seen.add(value);
+      const next = value + step;
+      const outside =
+        (state?.sliderMin !== null && state?.sliderMin !== undefined && next < state.sliderMin) ||
+        (state?.sliderMax !== null && state?.sliderMax !== undefined && next > state.sliderMax);
+      if (outside) {
+        if (flipped) return { lowered: false, detail: "no slider step lowers the tier" };
+        step = -step;
+        flipped = true;
+        seen.clear();
+        continue;
+      }
+      const reached = await moveSlider(runtime, input, next);
+      if (reached !== next) {
+        return { lowered: false, detail: `effort slider stopped at ${reached ?? "unknown"}` };
+      }
+      const afterRank = thinkingLevelRank(
+        currentTierLevel(await readOpenStateWhenMounted(runtime)),
+      );
+      if (afterRank !== undefined && afterRank > rank && !flipped) {
+        step = -step;
+        flipped = true;
+        seen.clear();
+      }
+    }
+  } finally {
+    await closeModelPicker(runtime, input);
+  }
+}
+
+/**
  * Puts the picker back to `target` (model radio first, then the effort slider) and reads it back.
  * A target known only by its tier label is restored by stepping the slider until it shows that
  * tier. The final read must show the slider at the target value (or, in a picker without a
@@ -566,6 +655,43 @@ export function thinkingLevelFromTierLabel(
   if (/(?:^|[^a-z])(?:instant|light|sofort|leicht)(?:[^a-z]|$)|最速|极速|즉시/.test(text))
     return "light";
   return null;
+}
+
+/** The evidence line for a stored picker reading, with the same shape as formatModelPickerState. */
+export function formatModelPickerEvidence(evidence: BrowserModelPickerEvidence): string {
+  if (!evidence.readable) return "picker unreadable";
+  return formatModelPickerState({
+    pickerLabel: null,
+    modelLabel: evidence.modelLabel,
+    modelOptions: [],
+    tierLabel: evidence.tierLabel,
+    sliderValue: evidence.sliderValue,
+    sliderMin: evidence.sliderMin ?? null,
+    sliderMax: evidence.sliderMax ?? null,
+    announcement: null,
+  });
+}
+
+/**
+ * Reads the picker for the run's evidence and logs one line. Never fails the run: a picker that
+ * cannot be read is recorded as unreadable.
+ */
+export async function readModelPickerEvidence(
+  runtime: ChromeClient["Runtime"],
+  input: ChromeClient["Input"] | undefined,
+  logger: BrowserLogger,
+): Promise<BrowserModelPickerEvidence> {
+  let state: BrowserModelPickerState | null = null;
+  let failure = "";
+  try {
+    state = await readModelPickerState(runtime, input);
+  } catch (error) {
+    if (error instanceof BrowserRunCancelledError) throw error;
+    failure = ` (reading it failed: ${error instanceof Error ? error.message : String(error)})`;
+  }
+  const evidence = modelPickerEvidence(state);
+  logger(`[browser] Model picker evidence: ${formatModelPickerEvidence(evidence)}${failure}.`);
+  return evidence;
 }
 
 /** One line of evidence, e.g. `model "GPT-6", tier "Pro", slider 4 (0-4)`. */

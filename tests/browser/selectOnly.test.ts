@@ -255,3 +255,69 @@ describe("select-only check", () => {
     expect(picker.restoreModelPickerState).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("select-only check with a maximum thinking time", () => {
+  const EXTRA_HIGH = state("Extra High", 3);
+  const capCheck = (status: "within" | "lowered") => ({
+    maxLevel: "extra-high" as const,
+    status,
+    before: {
+      modelLabel: "GPT-6",
+      tierLabel: status === "lowered" ? "Pro" : "Medium",
+      sliderValue: status === "lowered" ? 4 : 1,
+      readable: true,
+      source: "chatgpt-model-picker" as const,
+      capturedAt: "now",
+    },
+    capturedAt: "now",
+  });
+  const capOptions = (overrides: Partial<Parameters<typeof runSelectOnlyCheck>[0]> = {}) =>
+    options({
+      requestedModel: null,
+      requestedThinkingTime: null,
+      maxThinkingTime: "extra-high",
+      ...overrides,
+    });
+
+  test("runs the cap as a real run would, reports it and restores the previous tier", async () => {
+    picker.readModelPickerState.mockResolvedValueOnce(PRO).mockResolvedValueOnce(EXTRA_HIGH);
+    picker.restoreModelPickerState.mockResolvedValue({ restored: true, state: PRO });
+    const report = await runSelectOnlyCheck(
+      capOptions({ readEvidence: () => ({ thinkingCap: capCheck("lowered") }) }),
+    );
+    expect(report).toMatchObject({
+      verified: true,
+      maxThinkingTime: "extra-high",
+      thinkingCap: { status: "lowered", maxLevel: "extra-high" },
+      selected: { tierLabel: "Extra High", sliderValue: 3 },
+      restoreVerified: true,
+    });
+  });
+
+  test("a selection that ends above the maximum is not verified", async () => {
+    picker.readModelPickerState.mockResolvedValueOnce(MEDIUM).mockResolvedValueOnce(PRO);
+    picker.restoreModelPickerState.mockResolvedValue({ restored: true, state: MEDIUM });
+    const report = await runSelectOnlyCheck(
+      capOptions({ readEvidence: () => ({ thinkingCap: capCheck("within") }) }),
+    );
+    expect(report.verified).toBe(false);
+    expect(report.reason).toMatch(/tier "Pro" above the maximum "extra-high"/);
+  });
+
+  test("a cap refusal is reported and the previous selection is still restored", async () => {
+    picker.readModelPickerState.mockResolvedValueOnce(MEDIUM).mockResolvedValueOnce(PRO);
+    picker.restoreModelPickerState.mockResolvedValue({ restored: true, state: MEDIUM });
+    const report = await runSelectOnlyCheck(
+      capOptions({
+        applySelection: vi.fn(async () => {
+          throw new Error("Thinking time: the picker still shows Pro; nothing was sent.");
+        }),
+        readEvidence: () => ({}),
+      }),
+    );
+    expect(report.verified).toBe(false);
+    expect(report.reason).toMatch(/still shows Pro/);
+    expect(report.reason).not.toMatch(/was not checked/);
+    expect(picker.restoreModelPickerState).toHaveBeenCalledTimes(1);
+  });
+});

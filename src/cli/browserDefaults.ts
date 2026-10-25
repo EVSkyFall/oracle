@@ -41,6 +41,7 @@ export interface BrowserDefaultsOptions {
   browserKeepBrowser?: boolean;
   browserModelStrategy?: BrowserModelStrategy;
   browserThinkingTime?: ThinkingTimeLevel;
+  browserMaxThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserCaptureProviderNative?: boolean;
   browserArchive?: BrowserArchiveMode;
@@ -191,6 +192,10 @@ export function applyBrowserDefaultsFromConfig(
     browser.thinkingTime !== undefined
   ) {
     options.browserThinkingTime = normalizeThinkingTimeLevel(browser.thinkingTime) ?? undefined;
+  }
+  if (isUnset("browserMaxThinkingTime") && browser.maxThinkingTime !== undefined) {
+    options.browserMaxThinkingTime =
+      normalizeThinkingTimeLevel(browser.maxThinkingTime) ?? undefined;
   }
   if (
     isUnset("browserCaptureProviderNative") &&

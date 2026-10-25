@@ -1484,3 +1484,66 @@ describe("runBrowserSessionExecution", () => {
     expect(executeBrowser).toHaveBeenCalled();
   });
 });
+
+describe("picker evidence in the browser session result", () => {
+  test("returns the picker reading and cap checks, and persists them with the runtime hint", async () => {
+    const pickerRead = {
+      modelLabel: "GPT-6",
+      tierLabel: "Extra High",
+      sliderValue: 3,
+      sliderMin: 0,
+      sliderMax: 4,
+      readable: true,
+      source: "chatgpt-model-picker" as const,
+      capturedAt: "2026-10-25T00:00:00.000Z",
+    };
+    const capCheck = {
+      maxLevel: "extra-high" as const,
+      status: "within" as const,
+      before: pickerRead,
+      capturedAt: "2026-10-25T00:00:00.000Z",
+    };
+    const persistRuntimeHint = vi.fn();
+    const executeBrowser = vi.fn(async (options) => {
+      await options.runtimeHintCb?.({ chromePort: 9999, chromeHost: "127.0.0.1" }, undefined, {
+        modelPicker: pickerRead,
+        thinkingCap: [capCheck],
+      });
+      return {
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 10,
+        answerTokens: 1,
+        answerChars: 2,
+        modelPicker: pickerRead,
+        thinkingCap: [capCheck],
+      };
+    });
+    const result = await runBrowserSessionExecution(
+      { runOptions: baseRunOptions, browserConfig: baseConfig, cwd: "/repo", log: vi.fn() },
+      {
+        assemblePrompt: async () =>
+          ({
+            markdown: "prompt",
+            composerText: "prompt",
+            estimatedInputTokens: 1,
+            attachments: [],
+            inlineFileCount: 0,
+            tokenEstimateIncludesInlineFiles: false,
+            attachmentsPolicy: "auto",
+            attachmentMode: "inline",
+            fallback: null,
+          }) as BrowserPromptArtifacts,
+        executeBrowser,
+        persistRuntimeHint,
+      },
+    );
+    expect(result.modelPicker).toEqual(pickerRead);
+    expect(result.thinkingCap).toEqual([capCheck]);
+    expect(persistRuntimeHint).toHaveBeenCalledWith(
+      expect.objectContaining({ chromePort: 9999 }),
+      undefined,
+      { modelPicker: pickerRead, thinkingCap: [capCheck] },
+    );
+  });
+});

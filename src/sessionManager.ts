@@ -88,6 +88,8 @@ export interface BrowserSessionConfig {
   copyProfileSource?: string | null;
   /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
   thinkingTime?: ThinkingTimeLevel;
+  /** Highest effort tier a prompt may be sent with; checked right before every submission. */
+  maxThinkingTime?: ThinkingTimeLevel;
   /** Browser-only research mode. "deep" activates ChatGPT Deep Research. */
   researchMode?: BrowserResearchMode;
   /** Archive completed ChatGPT conversations after local artifacts are saved. */
@@ -197,6 +199,32 @@ export interface BrowserThinkingSelectionEvidence {
   capturedAt: string;
 }
 
+/** What the open model picker showed: its model, its effort tier and the effort slider. */
+export interface BrowserModelPickerEvidence {
+  modelLabel: string | null;
+  /** From the picker's tier header or slider text; null when only a live announcement named it. */
+  tierLabel: string | null;
+  sliderValue: number | null;
+  sliderMin?: number | null;
+  sliderMax?: number | null;
+  /** False when the picker could not be opened or showed neither a model nor a tier. */
+  readable: boolean;
+  source: "chatgpt-model-picker";
+  capturedAt: string;
+}
+
+export type BrowserThinkingCapStatus = "within" | "lowered" | "unreadable";
+
+/** One --browser-max-thinking-time check, made right before a submission. */
+export interface BrowserThinkingCapEvidence {
+  maxLevel: ThinkingTimeLevel;
+  status: BrowserThinkingCapStatus;
+  before: BrowserModelPickerEvidence;
+  /** The read after lowering, when the picker showed a tier above the cap. */
+  after?: BrowserModelPickerEvidence;
+  capturedAt: string;
+}
+
 export interface BrowserRunWarning {
   code: string;
   severity: "warning";
@@ -211,6 +239,10 @@ export interface BrowserMetadata {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  /** The picker as read after the run's selection, whatever the model strategy. */
+  modelPicker?: BrowserModelPickerEvidence;
+  /** One entry per submission when a maximum thinking time is set. */
+  thinkingCap?: BrowserThinkingCapEvidence[];
   providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
 }

@@ -106,6 +106,11 @@ const consultInputShape = {
   browserThinkingTime: browserThinkingTimeRawSchema
     .optional()
     .describe("Browser-only: set ChatGPT thinking time when supported by the chosen model."),
+  browserMaxThinkingTime: browserThinkingTimeRawSchema
+    .optional()
+    .describe(
+      "Browser-only: highest thinking time to send with. Right before every submission a higher tier is lowered to this level; a tier that still reads higher stops the run before anything is sent.",
+    ),
   browserModelStrategy: z
     .enum(["select", "current", "ignore"])
     .optional()
@@ -240,6 +245,7 @@ const consultDryRunResolvedShape = z.object({
     .object({
       desiredModel: z.string().nullable().optional(),
       thinkingTime: z.string().nullable().optional(),
+      maxThinkingTime: z.string().nullable().optional(),
       modelStrategy: z.string().nullable().optional(),
       researchMode: z.string().nullable().optional(),
       attachments: z.string().optional(),
@@ -357,6 +363,7 @@ export function buildConsultBrowserConfig({
   inputModel,
   browserModelLabel,
   browserThinkingTime,
+  browserMaxThinkingTime,
   browserModelStrategy,
   browserResearchMode,
   browserArchive,
@@ -370,6 +377,7 @@ export function buildConsultBrowserConfig({
   inputModel?: string;
   browserModelLabel?: string;
   browserThinkingTime?: ThinkingTimeLevel;
+  browserMaxThinkingTime?: ThinkingTimeLevel;
   browserModelStrategy?: BrowserModelStrategy;
   browserResearchMode?: "search" | "deep";
   browserArchive?: "auto" | "always" | "never";
@@ -425,6 +433,10 @@ export function buildConsultBrowserConfig({
         requestedModel: inputModel,
         modelStrategy,
       }),
+    maxThinkingTime:
+      browserMaxThinkingTime ??
+      normalizeThinkingTimeLevel(configuredBrowser.maxThinkingTime) ??
+      undefined,
     modelStrategy,
     researchMode: browserResearchMode ?? configuredBrowser.researchMode,
     archiveConversations: browserArchive ?? configuredBrowser.archiveConversations,
@@ -503,6 +515,7 @@ export function buildConsultDryRunResolved({
         ? {
             desiredModel,
             thinkingTime,
+            maxThinkingTime: browserConfig?.maxThinkingTime ?? null,
             modelStrategy: browserConfig?.modelStrategy ?? null,
             researchMode: browserConfig?.researchMode ?? null,
             attachments: runOptions.browserAttachments,
@@ -532,6 +545,9 @@ export function formatConsultDryRunResolved(details: ConsultDryRunResolved): str
   if (details.browser) {
     lines.push(`  browser desired model: ${details.browser.desiredModel ?? "(default)"}`);
     lines.push(`  browser thinking time: ${details.browser.thinkingTime ?? "(default)"}`);
+    if (details.browser.maxThinkingTime) {
+      lines.push(`  browser max thinking time: ${details.browser.maxThinkingTime}`);
+    }
     lines.push(`  browser model strategy: ${details.browser.modelStrategy ?? "(default)"}`);
     lines.push(`  browser research mode: ${details.browser.researchMode ?? "off"}`);
     lines.push(`  browser attachments: ${details.browser.attachments ?? "auto"}`);
@@ -588,6 +604,7 @@ export async function runConsultTool(
     browserBundleFiles,
     browserBundleFormat,
     browserThinkingTime,
+    browserMaxThinkingTime,
     browserModelStrategy,
     browserResearchMode,
     browserArchive,
@@ -656,6 +673,7 @@ export async function runConsultTool(
       inputModel: model,
       browserModelLabel,
       browserThinkingTime,
+      browserMaxThinkingTime,
       browserModelStrategy,
       browserResearchMode,
       browserArchive,

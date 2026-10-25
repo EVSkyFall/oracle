@@ -48,6 +48,11 @@ const chatGptImageInputShape = {
   browserThinkingTime: browserThinkingTimeRawSchema
     .optional()
     .describe("Set ChatGPT thinking time when supported by the chosen model."),
+  browserMaxThinkingTime: browserThinkingTimeRawSchema
+    .optional()
+    .describe(
+      "Highest thinking time to send with; a higher tier is lowered right before the submission.",
+    ),
   browserModelStrategy: z
     .enum(["select", "current", "ignore"])
     .optional()
@@ -79,6 +84,7 @@ const chatGptImageInputSchema = z
   .object({
     ...chatGptImageInputShape,
     browserThinkingTime: browserThinkingTimeInputSchema.optional(),
+    browserMaxThinkingTime: browserThinkingTimeInputSchema.optional(),
   })
   .strict();
 
@@ -112,6 +118,7 @@ export function buildChatGptImageConsultInput(input: ChatGptImageInput): Consult
     browserModelLabel: input.browserModelLabel,
     browserAttachments,
     browserThinkingTime: input.browserThinkingTime,
+    browserMaxThinkingTime: input.browserMaxThinkingTime,
     browserModelStrategy: input.browserModelStrategy,
     browserArchive: input.browserArchive,
     browserKeepBrowser: input.browserKeepBrowser,

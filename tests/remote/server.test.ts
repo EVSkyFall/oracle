@@ -1536,6 +1536,29 @@ describe("bridged result sanitization", () => {
                 source: "chatgpt-thinking-picker",
                 capturedAt: "2026-08-18T00:00:00.000Z",
               },
+              modelPicker: {
+                modelLabel: "GPT-6",
+                tierLabel: "Extra High",
+                sliderValue: 3,
+                readable: true,
+                source: "chatgpt-model-picker",
+                capturedAt: "2026-10-25T00:00:00.000Z",
+              },
+              thinkingCap: [
+                {
+                  maxLevel: "extra-high",
+                  status: "within",
+                  before: {
+                    modelLabel: "GPT-6",
+                    tierLabel: "Extra High",
+                    sliderValue: 3,
+                    readable: true,
+                    source: "chatgpt-model-picker",
+                    capturedAt: "2026-10-25T00:00:00.000Z",
+                  },
+                  capturedAt: "2026-10-25T00:00:00.000Z",
+                },
+              ],
               tabUrl: "https://chatgpt.com/c/abc-123",
               researchPlan: {
                 title: "Compare public release schedules",
@@ -1568,6 +1591,10 @@ describe("bridged result sanitization", () => {
         strictFailClosed: true,
       });
       expect(result.modelSelection?.resolvedLabel).toBe("GPT-5.6 Sol");
+      expect(result.modelPicker).toMatchObject({ tierLabel: "Extra High", sliderValue: 3 });
+      expect(result.thinkingCap).toEqual([
+        expect.objectContaining({ maxLevel: "extra-high", status: "within" }),
+      ]);
       expect(result.researchPlan).toMatchObject({
         title: "Compare public release schedules",
         steps: ["Read official sources", "Compare support dates"],

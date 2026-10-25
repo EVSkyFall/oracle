@@ -66,6 +66,8 @@ export interface BrowserConfigDefaults {
   modelStrategy?: BrowserModelStrategy;
   /** Thinking time intensity (ChatGPT Thinking/Pro models): 'light', 'standard', 'extended', 'heavy' */
   thinkingTime?: ThinkingTimeLevel;
+  /** Highest thinking time a prompt may be sent with (--browser-max-thinking-time). */
+  maxThinkingTime?: ThinkingTimeLevel;
   /** Browser-only research mode. "deep" activates ChatGPT Deep Research. */
   researchMode?: BrowserResearchMode;
   /** Archive completed ChatGPT conversations after local artifacts are saved. */
@@ -325,6 +327,7 @@ function sanitizeProjectConfig(config: UserConfig): UserConfig {
       "keepBrowser",
       "modelStrategy",
       "thinkingTime",
+      "maxThinkingTime",
       "researchMode",
       "archiveConversations",
       "manualLogin",

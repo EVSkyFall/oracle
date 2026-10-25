@@ -29,6 +29,7 @@ export const consultInputSchema = z
     browserBundleFiles: z.boolean().optional(),
     browserBundleFormat: z.enum(["auto", "text", "zip"]).optional(),
     browserThinkingTime: browserThinkingTimeInputSchema.optional(),
+    browserMaxThinkingTime: browserThinkingTimeInputSchema.optional(),
     browserModelStrategy: z.enum(["select", "current", "ignore"]).optional(),
     browserResearchMode: z.enum(["search", "deep"]).optional(),
     browserArchive: z.enum(["auto", "always", "never"]).optional(),

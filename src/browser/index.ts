@@ -24,6 +24,7 @@ import type {
   ChromeClient,
   BrowserAttachment,
   BrowserResearchPlanMetadata,
+  BrowserPickerEvidenceHint,
   ResolvedBrowserConfig,
   BrowserArchiveResult,
 } from "./types.js";
@@ -67,6 +68,8 @@ import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
+import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
+import { readModelPickerEvidence } from "./actions/modelPickerState.js";
 import { runSelectOnlyCheck } from "./selectOnly.js";
 import {
   isGeneratedImageAssistantAnswer,
@@ -90,7 +93,9 @@ import {
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import type {
+  BrowserModelPickerEvidence,
   BrowserModelSelectionEvidence,
+  BrowserThinkingCapEvidence,
   BrowserThinkingSelectionEvidence,
   SessionArtifact,
 } from "../sessionStore.js";
@@ -539,6 +544,17 @@ async function captureDeepResearchTargetBaseline(
   }
 }
 
+function pickerEvidenceHint(
+  modelPicker: BrowserModelPickerEvidence | undefined,
+  thinkingCap: BrowserThinkingCapEvidence[],
+): BrowserPickerEvidenceHint | undefined {
+  if (!modelPicker && thinkingCap.length === 0) return undefined;
+  return {
+    ...(modelPicker ? { modelPicker } : {}),
+    ...(thinkingCap.length > 0 ? { thinkingCap: [...thinkingCap] } : {}),
+  };
+}
+
 type BrowserSubmissionFallback = {
   prompt: string;
   attachments: BrowserAttachment[];
@@ -908,6 +924,8 @@ async function runBrowserModeInternal(
   const targetClaimId = randomUUID();
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let thinkingSelectionEvidence: BrowserThinkingSelectionEvidence | undefined;
+  let modelPickerRecord: BrowserModelPickerEvidence | undefined;
+  const thinkingCapChecks: BrowserThinkingCapEvidence[] = [];
   let researchPlan: BrowserResearchPlanMetadata | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
@@ -951,7 +969,11 @@ async function runBrowserModeInternal(
       ...(appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {}),
     };
     try {
-      await runtimeHintCb?.(hint, modelSelectionEvidence);
+      await runtimeHintCb?.(
+        hint,
+        modelSelectionEvidence,
+        pickerEvidenceHint(modelPickerRecord, thinkingCapChecks),
+      );
       await tabLease?.update({
         chromeHost,
         chromePort: chrome.port,
@@ -1591,6 +1613,22 @@ async function runBrowserModeInternal(
         );
       }
     };
+    // The maximum effort is checked right before every submission, whatever the model strategy.
+    const enforceMaxThinkingTime = async (runtime: ChromeClient["Runtime"] = Runtime) => {
+      if (!config.maxThinkingTime) return;
+      const check = await raceWithDisconnect(
+        enforceThinkingTimeCap(
+          config.maxThinkingTime,
+          browserThinkingCapSteps(runtime, Input, logger),
+          logger,
+        ),
+      );
+      thinkingCapChecks.push(check);
+      await emitRuntimeHint();
+      if (check.status === "lowered") {
+        await raceWithDisconnect(ensurePromptReady(runtime, config.inputTimeoutMs, logger));
+      }
+    };
     if (config.selectOnly) {
       const report = await runSelectOnlyCheck({
         runtime: Runtime,
@@ -1603,10 +1641,16 @@ async function runBrowserModeInternal(
         requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
           ? config.thinkingTime
           : null,
-        applySelection: (runtime) => applyRequestedSelection(runtime),
+        maxThinkingTime: config.maxThinkingTime ?? null,
+        applySelection: async (runtime) => {
+          await applyRequestedSelection(runtime);
+          // A real run checks the maximum right before it submits.
+          await enforceMaxThinkingTime(runtime);
+        },
         readEvidence: () => ({
           model: modelSelectionEvidence,
           thinking: thinkingSelectionEvidence,
+          thinkingCap: thinkingCapChecks.at(-1),
         }),
       });
       runStatus = "complete";
@@ -1615,6 +1659,7 @@ async function runBrowserModeInternal(
         answerMarkdown: "",
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
+        ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
         selectOnly: report,
         tookMs: Date.now() - startedAt,
         answerTokens: 0,
@@ -1630,6 +1675,8 @@ async function runBrowserModeInternal(
       });
     }
     await applyRequestedSelection();
+    modelPickerRecord = await raceWithDisconnect(readModelPickerEvidence(Runtime, Input, logger));
+    await emitRuntimeHint();
     const deepResearch = config.researchMode === "deep";
     const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
     let profileLock: ProfileRunLock | null = null;
@@ -1667,6 +1714,7 @@ async function runBrowserModeInternal(
       let attachmentNavigationUrl: string | undefined;
       await raceWithDisconnect(clearPromptComposer(Runtime, logger));
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+      await enforceMaxThinkingTime();
       if (submissionAttachments.length > 0) {
         if (!DOM) {
           throw new Error("Chrome DOM domain unavailable while uploading attachments.");
@@ -1933,6 +1981,8 @@ async function runBrowserModeInternal(
         archive,
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
+        modelPicker: modelPickerRecord,
+        ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
@@ -2383,6 +2433,8 @@ async function runBrowserModeInternal(
       archive,
       modelSelection: modelSelectionEvidence,
       thinkingSelection: thinkingSelectionEvidence,
+      modelPicker: modelPickerRecord,
+      ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
       tookMs: durationMs,
       answerTokens,
       answerChars,
@@ -2951,6 +3003,8 @@ async function runRemoteBrowserMode(
   const targetClaimId = randomUUID();
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let thinkingSelectionEvidence: BrowserThinkingSelectionEvidence | undefined;
+  let modelPickerRecord: BrowserModelPickerEvidence | undefined;
+  const thinkingCapChecks: BrowserThinkingCapEvidence[] = [];
   let researchPlan: BrowserResearchPlanMetadata | undefined;
   let attachedExistingTab = false;
   let ownsTarget = true;
@@ -2981,6 +3035,7 @@ async function runRemoteBrowserMode(
           ...(appApprovals.length > 0 ? { appApprovals: [...appApprovals] } : {}),
         },
         modelSelectionEvidence,
+        pickerEvidenceHint(modelPickerRecord, thinkingCapChecks),
       );
       await tabLease?.update({
         chromeHost: host,
@@ -3250,6 +3305,20 @@ async function runRemoteBrowserMode(
         );
       }
     };
+    // The maximum effort is checked right before every submission, whatever the model strategy.
+    const enforceMaxThinkingTime = async (runtime: ChromeClient["Runtime"] = Runtime) => {
+      if (!config.maxThinkingTime) return;
+      const check = await enforceThinkingTimeCap(
+        config.maxThinkingTime,
+        browserThinkingCapSteps(runtime, Input, logger),
+        logger,
+      );
+      thinkingCapChecks.push(check);
+      await emitRuntimeHint();
+      if (check.status === "lowered") {
+        await ensurePromptReady(runtime, config.inputTimeoutMs, logger);
+      }
+    };
     if (config.selectOnly) {
       const report = await runSelectOnlyCheck({
         runtime: Runtime,
@@ -3262,10 +3331,16 @@ async function runRemoteBrowserMode(
         requestedThinkingTime: shouldApplyThinkingTimeSelection(config)
           ? config.thinkingTime
           : null,
-        applySelection: (runtime) => applyRequestedSelection(runtime),
+        maxThinkingTime: config.maxThinkingTime ?? null,
+        applySelection: async (runtime) => {
+          await applyRequestedSelection(runtime);
+          // A real run checks the maximum right before it submits.
+          await enforceMaxThinkingTime(runtime);
+        },
         readEvidence: () => ({
           model: modelSelectionEvidence,
           thinking: thinkingSelectionEvidence,
+          thinkingCap: thinkingCapChecks.at(-1),
         }),
       });
       runStatus = "complete";
@@ -3274,6 +3349,7 @@ async function runRemoteBrowserMode(
         answerMarkdown: "",
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
+        ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
         selectOnly: report,
         tookMs: Date.now() - startedAt,
         answerTokens: 0,
@@ -3290,6 +3366,8 @@ async function runRemoteBrowserMode(
       };
     }
     await applyRequestedSelection();
+    modelPickerRecord = await readModelPickerEvidence(Runtime, Input, logger);
+    await emitRuntimeHint();
     const deepResearch = config.researchMode === "deep";
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
       await claimBrowserTarget(Runtime, targetClaimId);
@@ -3304,6 +3382,7 @@ async function runRemoteBrowserMode(
       let attachmentNavigationUrl: string | undefined;
       await clearPromptComposer(Runtime, logger);
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+      await enforceMaxThinkingTime();
       if (submissionAttachments.length > 0) {
         if (!DOM) {
           throw new Error("Chrome DOM domain unavailable while uploading attachments.");
@@ -3518,6 +3597,8 @@ async function runRemoteBrowserMode(
         archive,
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
+        modelPicker: modelPickerRecord,
+        ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
@@ -3935,6 +4016,8 @@ async function runRemoteBrowserMode(
       archive,
       modelSelection: modelSelectionEvidence,
       thinkingSelection: thinkingSelectionEvidence,
+      modelPicker: modelPickerRecord,
+      ...(thinkingCapChecks.length > 0 ? { thinkingCap: [...thinkingCapChecks] } : {}),
       controllerPid: process.pid,
       ...(appApprovals.length > 0 ? { appApprovals } : {}),
     };

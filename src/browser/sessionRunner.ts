@@ -4,7 +4,9 @@ import type { RunOracleOptions } from "../oracle.js";
 import { formatTokenCount } from "../oracle/runUtils.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
 import type {
+  BrowserModelPickerEvidence,
   BrowserModelSelectionEvidence,
+  BrowserThinkingCapEvidence,
   BrowserThinkingSelectionEvidence,
   BrowserRunWarning,
   BrowserSessionConfig,
@@ -21,7 +23,12 @@ import {
   materializeBrowserFallback,
 } from "./prompt.js";
 import { BrowserAutomationError, BrowserRunCancelledError } from "../oracle/errors.js";
-import type { BrowserArchiveResult, BrowserLogger, SavedBrowserFile } from "./types.js";
+import type {
+  BrowserArchiveResult,
+  BrowserLogger,
+  BrowserPickerEvidenceHint,
+  SavedBrowserFile,
+} from "./types.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -46,6 +53,8 @@ export interface BrowserExecutionResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  modelPicker?: BrowserModelPickerEvidence;
+  thinkingCap?: BrowserThinkingCapEvidence[];
   providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   answerText: string;
@@ -69,6 +78,7 @@ export interface BrowserSessionRunnerDeps {
   persistRuntimeHint?: (
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
+    pickerEvidence?: BrowserPickerEvidenceHint,
   ) => Promise<void> | void;
 }
 
@@ -330,12 +340,14 @@ async function executeAssembledBrowserSession({
       followUpPrompts: runOptions.browserFollowUps,
       signal,
       closeOwnedTabOnCancel: !executionBrowserConfig.keepBrowser,
-      runtimeHintCb: async (runtime, modelSelection) => {
+      runtimeHintCb: async (runtime, modelSelection, pickerEvidence) => {
         const runtimeWithController = {
           ...runtime,
           controllerPid: runtime.controllerPid ?? process.pid,
         };
-        if (modelSelection) {
+        if (pickerEvidence) {
+          await persistRuntimeHint(runtimeWithController, modelSelection, pickerEvidence);
+        } else if (modelSelection) {
           await persistRuntimeHint(runtimeWithController, modelSelection);
         } else {
           await persistRuntimeHint(runtimeWithController);
@@ -445,6 +457,8 @@ async function executeAssembledBrowserSession({
     archive: browserResult.archive,
     modelSelection,
     thinkingSelection,
+    modelPicker: browserResult.modelPicker,
+    thinkingCap: browserResult.thinkingCap,
     providerNativeCapture: browserResult.providerNativeCapture,
     warnings,
     answerText,

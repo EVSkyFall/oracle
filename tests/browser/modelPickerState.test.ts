@@ -163,3 +163,50 @@ describe("model picker state", () => {
     expect(thinkingLevelFromTierLabel(null)).toBeNull();
   });
 });
+
+describe("picker evidence", () => {
+  test("keeps model, trusted tier and slider, and leaves out a tier named only by an announcement", async () => {
+    const { modelPickerEvidence } = await import("../../src/browser/actions/modelPickerState.js");
+    const base = {
+      pickerLabel: null,
+      modelLabel: "GPT-6",
+      modelOptions: [],
+      tierLabel: "Extra High",
+      sliderValue: 3,
+      sliderMin: 0,
+      sliderMax: 4,
+      announcement: "Extra High, 4 of 5.",
+    };
+    expect(modelPickerEvidence({ ...base, tierSource: "header" })).toMatchObject({
+      modelLabel: "GPT-6",
+      tierLabel: "Extra High",
+      sliderValue: 3,
+      sliderMin: 0,
+      sliderMax: 4,
+      readable: true,
+      source: "chatgpt-model-picker",
+    });
+    expect(
+      modelPickerEvidence({ ...base, tierSource: "announcement", sliderValue: null }),
+    ).toMatchObject({ tierLabel: null, sliderValue: null, readable: true });
+    expect(modelPickerEvidence(null)).toMatchObject({ modelLabel: null, readable: false });
+  });
+
+  test("a picker read that fails is recorded as unreadable and logged in one line", async () => {
+    const { readModelPickerEvidence } =
+      await import("../../src/browser/actions/modelPickerState.js");
+    const lines: string[] = [];
+    const logger = Object.assign((line: string) => lines.push(line), { verbose: false });
+    const runtime = {
+      evaluate: async () => {
+        throw new Error("Target closed");
+      },
+    };
+    await expect(
+      readModelPickerEvidence(runtime as never, undefined, logger),
+    ).resolves.toMatchObject({ readable: false });
+    expect(lines).toEqual([
+      "[browser] Model picker evidence: picker unreadable (reading it failed: Target closed).",
+    ]);
+  });
+});

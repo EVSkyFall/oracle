@@ -58,6 +58,7 @@ import { delay, estimateTokenCount } from "../browser/utils.js";
 import type {
   BrowserAppApprovalRecord,
   BrowserLogger,
+  BrowserPickerEvidenceHint,
   SavedBrowserFile,
 } from "../browser/types.js";
 import { withAppApprovals } from "../browser/appApprovalRecords.js";
@@ -175,11 +176,16 @@ export async function performSessionRun({
         persistRuntimeHint: async (
           runtime: BrowserRuntimeMetadata,
           modelSelection?: BrowserModelSelectionEvidence,
+          pickerEvidence?: BrowserPickerEvidenceHint,
         ) => {
           const browser = {
             config: browserConfig,
             runtime,
             ...(modelSelection ? { modelSelection } : {}),
+            ...(pickerEvidence?.modelPicker ? { modelPicker: pickerEvidence.modelPicker } : {}),
+            ...(pickerEvidence?.thinkingCap?.length
+              ? { thinkingCap: pickerEvidence.thinkingCap }
+              : {}),
           };
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
@@ -253,6 +259,8 @@ export async function performSessionRun({
           archive: result.archive,
           modelSelection: result.modelSelection,
           thinkingSelection: result.thinkingSelection,
+          modelPicker: result.modelPicker,
+          thinkingCap: result.thinkingCap,
           providerNativeCapture: result.providerNativeCapture,
           warnings: browserWarnings.length > 0 ? browserWarnings : undefined,
         },
