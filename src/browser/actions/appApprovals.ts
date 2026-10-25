@@ -84,14 +84,12 @@ export function scanAppApprovalCards(
     return normalize(parts.join(" "));
   };
   const regionOf = (button: Element): Element | null => {
-    const region = button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main");
-    if (!region || region.matches(USER) || region.closest(PAGE_CHROME)) return null;
-    const dialog = region.matches(DIALOG);
-    for (let node = button.parentElement; node && node !== region; node = node.parentElement) {
-      if (node.matches(OFF_LIMITS)) return null;
-      if (!dialog && node.matches(PAGE_CHROME)) return null;
+    // The whole ancestry up to the document: an article inside prose or a user message must not
+    // end the check early.
+    for (let node = button.parentElement; node; node = node.parentElement) {
+      if (node.matches(OFF_LIMITS) || node.matches(PAGE_CHROME)) return null;
     }
-    return region;
+    return button.closest(`${DIALOG}, ${TURN}`) ?? button.closest("main");
   };
   const cardOf = (button: Element, region: Element): Element | null => {
     for (let node = button.parentElement; node; node = node.parentElement) {
@@ -100,46 +98,81 @@ export function scanAppApprovalCards(
     }
     return null;
   };
-  const textById = (ids: string | null): string =>
+  // Declared before use by titlesOf; the first rendered line of each labelling element.
+  const labelledLine = (ids: string | null): string =>
     normalize(
       String(ids ?? "")
         .split(/\s+/)
         .filter(Boolean)
-        .map((id) => {
-          const target = Array.from(doc.querySelectorAll("[id]")).find(
-            (node) => node.getAttribute("id") === id,
-          );
-          return target ? textOf(target, BUTTON) : "";
-        })
+        .map((id) =>
+          firstLineOf(
+            Array.from(doc.querySelectorAll("[id]")).find(
+              (node) => node.getAttribute("id") === id,
+            ) ?? null,
+          ),
+        )
         .join(" "),
     );
-  const firstLine = (card: Element): string => {
-    const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
-    const holders = [card, ...Array.from(card.querySelectorAll("*"))];
-    for (const element of holders) {
-      if (element.matches(skip) || element.closest(ARGUMENTS)) continue;
-      if (element.closest(BUTTON) && element !== card) continue;
-      const own = Array.from(element.childNodes)
-        .filter((child) => child.nodeType === 3)
-        .map((child) => normalize(child.nodeValue))
-        .join(" ")
-        .trim();
-      if (own) return textOf(element, skip);
-    }
-    return "";
+  // Rendered lines: inline pieces join, block elements (by computed display, or by tag where
+  // there is no layout) start new lines. Buttons, prose, user text and tool arguments are skipped.
+  const BLOCK_TAGS =
+    /^(address|article|aside|blockquote|br|dd|details|dialog|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table|tbody|td|tfoot|th|thead|tr|ul)$/i;
+  const isBlock = (element: Element): boolean => {
+    const display = doc.defaultView?.getComputedStyle?.(element)?.display;
+    if (display)
+      return !display.startsWith("inline") && display !== "contents" && display !== "none";
+    return BLOCK_TAGS.test(element.tagName);
   };
-  const titleOf = (card: Element, region: Element): string => {
+  const firstLineOf = (root: Element | null): string => {
+    if (!root) return "";
+    const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
+    const lines: string[] = [""];
+    const breakLine = () => {
+      if (lines[lines.length - 1].trim()) lines.push("");
+    };
+    const walk = (node: Node, top: boolean): void => {
+      if (node.nodeType === 3) {
+        // A newline in the text is a line break where CSS keeps it (or where nothing says).
+        const whiteSpace = node.parentElement
+          ? doc.defaultView?.getComputedStyle?.(node.parentElement)?.whiteSpace
+          : undefined;
+        const keepsBreaks = !whiteSpace || /pre|break-spaces/.test(whiteSpace);
+        const parts = keepsBreaks
+          ? String(node.nodeValue ?? "").split(/\r?\n/)
+          : [node.nodeValue ?? ""];
+        parts.forEach((part, index) => {
+          if (index > 0) breakLine();
+          lines[lines.length - 1] += part;
+        });
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const element = node as Element;
+      if (!top && (element.matches(skip) || element.getAttribute("aria-hidden") === "true")) return;
+      const block = !top && isBlock(element);
+      if (block) breakLine();
+      for (const child of Array.from(element.childNodes)) walk(child, false);
+      if (block) breakLine();
+    };
+    walk(root, true);
+    return lines.map((line) => normalize(line)).find(Boolean) ?? "";
+  };
+  /**
+   * Title candidates in order, each a single line and never merged with what follows: the
+   * heading, the aria-labelledby text, the aria-label (card, then dialog), the card's first
+   * rendered line. The card's title is the first one present.
+   */
+  const titlesOf = (card: Element, region: Element): string[] => {
     const heading = Array.from(
       card.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6'),
     ).find((node) => !node.closest(PROSE));
-    if (heading && textOf(heading, BUTTON)) return textOf(heading, BUTTON);
+    const candidates = [firstLineOf(heading ?? null)];
     for (const owner of region.matches(DIALOG) ? [card, region] : [card]) {
-      const labelled = textById(owner.getAttribute("aria-labelledby"));
-      if (labelled) return labelled;
-      const named = normalize(owner.getAttribute("aria-label"));
-      if (named) return named;
+      candidates.push(labelledLine(owner.getAttribute("aria-labelledby")));
+      candidates.push(normalize(owner.getAttribute("aria-label")));
     }
-    return firstLine(card);
+    candidates.push(firstLineOf(card));
+    return candidates.filter(Boolean);
   };
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const names = (text: string): string | null =>
@@ -164,7 +197,8 @@ export function scanAppApprovalCards(
   const cards: AppApprovalCard[] = [];
   const buttons: Element[] = [];
   for (const [card, { region, best, rank }] of byCard.entries()) {
-    const title = titleOf(card, region);
+    // The title is the first candidate present; a later line naming the app does not count.
+    const title = titlesOf(card, region)[0] ?? "";
     const text = textOf(card, `${BUTTON}, ${PROSE}, ${USER}`);
     buttons.push(best);
     cards.push({

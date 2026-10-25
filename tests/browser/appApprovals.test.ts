@@ -163,8 +163,81 @@ describe("app approval scope", () => {
           new DomNode("div", { "data-message-author-role": "user" }, [card]),
         ]),
     ],
+    // An article (a turn boundary) inside an excluded region must not end the check.
+    [
+      "an article inside assistant prose",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { class: "markdown prose" }, [
+            new DomNode("article", { "data-turn": "assistant" }, [card]),
+          ]),
+        ]),
+    ],
+    [
+      "an article inside a user message",
+      (card: DomNode) =>
+        new DomNode("main", {}, [
+          new DomNode("div", { "data-message-author-role": "user" }, [
+            new DomNode("article", {}, [card]),
+          ]),
+        ]),
+    ],
   ])("never treats an Allow button in %s as an approval card", (_where, wrap) => {
     expect(scan([wrap(allowCard("Allow CODEXish to run echo?"))])).toEqual([]);
+  });
+
+  const turn = (...children: DomNode[]) =>
+    new DomNode("main", {}, [new DomNode("article", { "data-turn": "assistant" }, children)]);
+
+  test("the title is one rendered line: what follows it never names the app", () => {
+    const [withBreak] = scan([
+      turn(
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow Gmail?", new DomNode("br"), "message: CODEXish"]),
+          button("Allow"),
+        ]),
+      ),
+    ]);
+    expect(withBreak).toMatchObject({ app: null, title: "Allow Gmail?" });
+    const [withNewline] = scan([
+      turn(
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow Gmail?\nmessage: CODEXish"]),
+          button("Allow"),
+        ]),
+      ),
+    ]);
+    expect(withNewline).toMatchObject({ app: null, title: "Allow Gmail?" });
+  });
+
+  test("inline pieces of the first line form one title", () => {
+    const [card] = scan([
+      turn(
+        new DomNode("div", {}, [
+          new DomNode("div", {}, [
+            new DomNode("span", {}, ["Allow "]),
+            new DomNode("strong", {}, ["CODEXish"]),
+            new DomNode("span", {}, [" to run bash?"]),
+          ]),
+          new DomNode("p", {}, ["shell: echo ready"]),
+          button("Allow once"),
+        ]),
+      ),
+    ]);
+    expect(card).toMatchObject({ app: "CODEXish", title: "Allow CODEXish to run bash?" });
+  });
+
+  test("a generic title is left for the user even when a later line names the app", () => {
+    const [card] = scan([
+      turn(
+        new DomNode("div", {}, [
+          new DomNode("h2", {}, ["Permission request"]),
+          new DomNode("p", {}, ["ChatGPT wants to use CODEXish"]),
+          button("Allow"),
+        ]),
+      ),
+    ]);
+    expect(card).toMatchObject({ app: null, title: "Permission request" });
   });
 
   test("tool arguments that name the allowed app do not approve another app's card", () => {
