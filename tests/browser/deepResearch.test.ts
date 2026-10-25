@@ -2878,6 +2878,25 @@ describe("waitForDeepResearchCompletion", () => {
     ).toBe(false);
   });
 
+  it("a titled frame of another app on a known research host is never the research", () => {
+    const frame = (attrs: Record<string, string>) =>
+      new FakeElement("iframe", attrs) as unknown as Element;
+    const host = "mcp-app-1.web-sandbox.oaiusercontent.com";
+    const src = `https://${host}/?app=skybridge`;
+    expect(
+      isDeepResearchFrameElement(frame({ title: "Gmail", src }), ["deep research"], [host]),
+    ).toBe(false);
+    expect(isDeepResearchFrameElement(frame({ src }), ["deep research"], [host])).toBe(true);
+    // The connector's own URL still names the research, whatever the frame is titled.
+    expect(
+      isDeepResearchFrameElement(
+        frame({ title: "Recherche", src: "https://connector_openai_deep_research.example/" }),
+        ["deep research"],
+        [],
+      ),
+    ).toBe(true);
+  });
+
   it("completes a frame on a localized banner, or structurally without one", () => {
     const expression = buildDeepResearchFrameStatusExpressionForTest();
     const run = (

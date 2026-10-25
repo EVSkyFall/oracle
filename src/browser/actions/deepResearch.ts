@@ -49,8 +49,9 @@ const DEEP_RESEARCH_FRAME_TITLES = [
 
 /**
  * Page function: whether an iframe hosts Deep Research: its title names it, its URL names the
- * connector, or its host is one already seen hosting it (the URL itself is the generic app
- * runtime, so it is only a hint).
+ * connector, or (untitled only) its host is one already seen hosting it. The URL itself is the
+ * generic app runtime that other apps share, so a titled iframe of another app on that host is
+ * never taken for the research.
  */
 export function isDeepResearchFrameElement(
   frame: Element,
@@ -65,7 +66,7 @@ export function isDeepResearchFrameElement(
   const src = String(frame.getAttribute("src") ?? "");
   const name = String(frame.getAttribute("name") ?? "");
   if (/connector_openai_deep_research|deep-research/i.test(`${src} ${name}`)) return true;
-  if (knownHosts.length === 0 || !src) return false;
+  if (title || knownHosts.length === 0 || !src) return false;
   try {
     return knownHosts.includes(new URL(src, frame.ownerDocument?.location?.href).host);
   } catch {
