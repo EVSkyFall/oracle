@@ -109,6 +109,7 @@ export function scanAppApprovalCards(
             Array.from(doc.querySelectorAll("[id]")).find(
               (node) => node.getAttribute("id") === id,
             ) ?? null,
+            null,
           ),
         )
         .join(" "),
@@ -135,8 +136,20 @@ export function scanAppApprovalCards(
     const rect = element.getBoundingClientRect?.();
     return Boolean(rect) && (rect.width === 0 || rect.height === 0);
   };
-  const firstLineOf = (root: Element | null): string => {
-    if (!root) return "";
+  // A title root counts only when shown: the root by every rule above, its ancestors up to
+  // `boundary` (the whole document when null) by the states that hide a subtree; a zero-size
+  // wrapper can still show children that overflow it.
+  const hiddenRoot = (root: Element, boundary: Element | null): boolean => {
+    if (hiddenElement(root)) return true;
+    for (let node = root.parentElement; node; node = node.parentElement) {
+      if (node.getAttribute("aria-hidden") === "true") return true;
+      if (doc.defaultView?.getComputedStyle?.(node)?.display === "none") return true;
+      if (node === boundary) break;
+    }
+    return false;
+  };
+  const firstLineOf = (root: Element | null, boundary: Element | null): string => {
+    if (!root || hiddenRoot(root, boundary)) return "";
     const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
     const lines: string[] = [""];
     const breakLine = () => {
@@ -182,13 +195,14 @@ export function scanAppApprovalCards(
   const titlesOf = (card: Element, region: Element): string[] => {
     const heading = Array.from(
       card.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6'),
-    ).find((node) => !node.closest(PROSE));
-    const candidates = [firstLineOf(heading ?? null)];
+    ).find((node) => !node.closest(PROSE) && !hiddenRoot(node, card));
+    const candidates = [firstLineOf(heading ?? null, card)];
     for (const owner of region.matches(DIALOG) ? [card, region] : [card]) {
+      if (hiddenRoot(owner, owner === card ? region : null)) continue;
       candidates.push(labelledLine(owner.getAttribute("aria-labelledby")));
       candidates.push(normalize(owner.getAttribute("aria-label")));
     }
-    candidates.push(firstLineOf(card));
+    candidates.push(firstLineOf(card, region));
     return candidates.filter(Boolean);
   };
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

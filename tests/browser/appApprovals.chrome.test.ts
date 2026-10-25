@@ -135,4 +135,45 @@ describe.runIf(enabled)("app approval monitor in real Chrome", () => {
       await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }, 60_000);
+
+  test("a hidden heading, labelling element or wrapper is never the title", async () => {
+    const visibleLine = "<p>Allow Gmail?</p><button>Allow</button>";
+    const html = `<!doctype html><html><body>
+      <div role="dialog"><h2 style="display:none">Allow CODEXish?</h2>${visibleLine}</div>
+      <div role="dialog"><h2 aria-hidden="true">Allow CODEXish?</h2>${visibleLine}</div>
+      <div role="dialog"><div style="display:none"><h2>Allow CODEXish?</h2></div>${visibleLine}</div>
+      <div role="dialog"><div aria-hidden="true"><h2>Allow CODEXish?</h2></div>${visibleLine}</div>
+      <div role="dialog" aria-labelledby="t-none"><span id="t-none" style="display:none">Allow CODEXish?</span>${visibleLine}</div>
+      <div role="dialog" aria-labelledby="t-aria"><span id="t-aria" aria-hidden="true">Allow CODEXish?</span>${visibleLine}</div>
+      <div role="dialog"><h2 style="display:none">Allow CODEXish?</h2><h2>Allow Gmail?</h2><button>Allow</button></div>
+      <div role="dialog"><h2>Allow CODEXish?</h2><p>message: echo</p><button>Allow</button></div>
+    </body></html>`;
+    const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-approval-fixture-"));
+    const chrome = await chromeLauncher.launch({
+      chromeFlags: ["--headless=new", "--window-size=900,1200", "--no-first-run"],
+      userDataDir,
+    });
+    let client: Awaited<ReturnType<typeof CDP>> | undefined;
+    try {
+      client = await CDP({ port: chrome.port });
+      await Promise.all([client.Page.enable(), client.Runtime.enable()]);
+      await client.Page.navigate({
+        url: `data:text/html;base64,${Buffer.from(html).toString("base64")}`,
+      });
+      await client.Page.loadEventFired();
+      const { result } = await client.Runtime.evaluate({
+        expression: buildAppApprovalScanExpression(["CODEXish"], "fixture"),
+        returnByValue: true,
+      });
+      const cards = result.value as Array<{ app: string | null; title: string }>;
+      expect(cards.map((entry) => [entry.title, entry.app])).toEqual([
+        ...Array.from({ length: 7 }, () => ["Allow Gmail?", null]),
+        ["Allow CODEXish?", "CODEXish"],
+      ]);
+    } finally {
+      await client?.close().catch(() => undefined);
+      chrome.kill();
+      await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }, 60_000);
 });
