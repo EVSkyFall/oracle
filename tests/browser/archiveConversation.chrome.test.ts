@@ -47,6 +47,31 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     list.append(item);
   }
   const currentChat = () => (location.pathname.match(/\\/c\\/([^/]+)/) || [])[1] || null;
+  const archiveRow = (chat) => {
+    document.querySelector('a[href="/c/' + chat + '"]')?.closest('[role="listitem"]')?.remove();
+    if (legacyLayout) {
+      const toast = document.createElement('div');
+      toast.setAttribute('role', 'status');
+      toast.textContent = 'Chat archived';
+      document.body.append(toast);
+    } else if (currentChat() === chat) {
+      history.pushState({}, '', '/');
+    }
+  };
+  // A confirmation dialog whose Archive button archives \`chat\`; named = it says which chat.
+  const openConfirm = (chat, named) => {
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.style.cssText = 'position: fixed; left: 450px; top: 200px; width: 320px; height: 120px; background: #fff; border: 1px solid #000;';
+    dialog.innerHTML = '<p>' + (named ? 'This will archive Chat ' + chat + '.' : 'Archive this chat?') + '</p><button type="button" style="width: 90px; height: 24px">Archive</button>';
+    dialog.querySelector('button').addEventListener('click', (event) => {
+      if (!event.isTrusted) return;
+      window.actions.push({ item: 'Confirm', chat });
+      dialog.remove();
+      archiveRow(chat);
+    });
+    document.body.append(dialog);
+  };
   let open = null;
   const closeMenu = () => {
     if (!open) return;
@@ -74,17 +99,13 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
         chat = chat ?? currentChat();
         window.actions.push({ item: label, chat });
         closeMenu();
-        if (label !== 'Archive' || mode === 'stuck') return;
+        if (label !== 'Archive' || mode === 'stuck' || mode === 'stale-confirm') return;
         if (mode === 'stuck-nav') { history.pushState({}, '', '/c/zzz'); return; }
-        document.querySelector('a[href="/c/' + chat + '"]')?.closest('[role="listitem"]')?.remove();
-        if (legacyLayout) {
-          const toast = document.createElement('div');
-          toast.setAttribute('role', 'status');
-          toast.textContent = 'Chat archived';
-          document.body.append(toast);
-        } else if (currentChat() === chat) {
-          history.pushState({}, '', '/');
-        }
+        if (mode === 'confirm') { openConfirm(chat, true); return; }
+        if (mode === 'unnamed-confirm') { openConfirm(chat, false); return; }
+        // Another chat's confirmation opens on the same page while we wait for ours.
+        if (mode === 'foreign-confirm') { setTimeout(() => openConfirm('bbb', true), 100); return; }
+        archiveRow(chat);
       });
       menu.append(item);
     }
@@ -120,6 +141,8 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     own.dataset.inert = 'true';
     openMenu(document.getElementById('trigger-bbb'), ['Rename', 'Archive', 'Delete'], 'bbb');
   }
+  // A confirmation that was already open before our click (it would archive bbb).
+  if (mode === 'stale-confirm') openConfirm('bbb', false);
 </script></body></html>`;
 
 describe.runIf(enabled)("conversation archive in real Chrome", () => {
@@ -246,6 +269,37 @@ describe.runIf(enabled)("conversation archive in real Chrome", () => {
     await expect(archive(url)).resolves.toMatchObject({ archived: false });
     expect((await pageState()).actions).toEqual([{ item: "Archive", chat: "aaa" }]);
   }, 60_000);
+
+  test.each([["confirm"], ["unnamed-confirm"]])(
+    "the confirmation that our Archive click opened is confirmed (%s)",
+    async (mode) => {
+      const url = await load("aaa", { rows: "bbb,aaa", mode });
+      await expect(archive(url)).resolves.toMatchObject({ archived: true });
+      const state = await pageState();
+      expect(state.actions).toEqual([
+        { item: "Archive", chat: "aaa" },
+        { item: "Confirm", chat: "aaa" },
+      ]);
+      expect(state.rows).toEqual(["/c/bbb"]);
+    },
+    60_000,
+  );
+
+  test.each([["foreign-confirm"], ["stale-confirm"]])(
+    "a confirmation that is not ours is never clicked (%s)",
+    async (mode) => {
+      const url = await load("aaa", { rows: "bbb,aaa", mode });
+      const logger = vi.fn();
+      await expect(archive(url, logger)).resolves.toMatchObject({
+        archived: false,
+        reason: "archive-not-confirmed",
+      });
+      const state = await pageState();
+      expect(state.actions).toEqual([{ item: "Archive", chat: "aaa" }]);
+      expect(state.rows).toEqual(["/c/bbb", "/c/aaa"]);
+    },
+    60_000,
+  );
 
   test("an Archive click that changes nothing is reported as not confirmed", async () => {
     const url = await load("aaa", { rows: "aaa", mode: "stuck" });

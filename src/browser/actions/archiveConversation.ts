@@ -348,33 +348,82 @@ export function menuOffersUnarchive(
   );
 }
 
-/** Page function: an Archive button in a confirmation dialog, if one is open. */
-export function findArchiveConfirmButton(
+/**
+ * Page function: the Archive button of the confirmation dialog that belongs to our Archive
+ * click. The dialog was not open before the click (`before`), and when it names a chat it names
+ * ours (by its sidebar title). More than one such dialog, or one that names only another chat,
+ * is ambiguous and nothing is chosen.
+ */
+export function inspectArchiveConfirm(
   doc: Document,
   labels: Pick<ArchiveLabelSet, "confirmButtonExact" | "confirmButtonContains" | "unarchive">,
-): Element | null {
-  const candidates = Array.from(
+  options: {
+    before?: { has(node: Element): boolean } | null;
+    conversationId?: string | null;
+  } = {},
+): { button: Element | null; ambiguous: string | null } {
+  const normalize = (value: unknown) =>
+    String(value ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  const visible = (node: Element) => {
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const isConfirm = (node: Element) => {
+    const label = normalize(node.getAttribute("aria-label") ?? node.textContent);
+    if (!label) return false;
+    if (labels.unarchive.some((entry) => label.includes(entry))) return false;
+    return (
+      labels.confirmButtonExact.includes(label) ||
+      labels.confirmButtonContains.some((entry) => label.includes(entry))
+    );
+  };
+  const dialogSelector = '[role="dialog"], [role="alertdialog"]';
+  const found = new Map<Element, Element>();
+  for (const node of Array.from(
     doc.querySelectorAll(
       '[role="dialog"] button, [role="dialog"] [role="button"], [role="alertdialog"] button, [role="alertdialog"] [role="button"]',
     ),
-  ).filter((node) => {
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  });
-  return (
-    candidates.find((node) => {
-      const label = String(node.getAttribute("aria-label") ?? node.textContent ?? "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-      if (!label) return false;
-      if (labels.unarchive.some((entry) => label.includes(entry))) return false;
-      return (
-        labels.confirmButtonExact.includes(label) ||
-        labels.confirmButtonContains.some((entry) => label.includes(entry))
-      );
-    }) ?? null
-  );
+  )) {
+    if (!visible(node) || !isConfirm(node)) continue;
+    const dialog = node.closest(dialogSelector);
+    if (!dialog || options.before?.has(dialog) || found.has(dialog)) continue;
+    found.set(dialog, node);
+  }
+  if (found.size === 0) return { button: null, ambiguous: null };
+  if (found.size > 1) {
+    return { button: null, ambiguous: `${found.size} new confirmation dialogs are open` };
+  }
+  const [dialog, button] = Array.from(found)[0]!;
+  if (options.conversationId) {
+    const idOf = (href: string | null) => {
+      const match = /\/c\/([^/?#]+)/.exec(String(href ?? ""));
+      if (!match) return null;
+      try {
+        return decodeURIComponent(match[1]);
+      } catch {
+        return match[1];
+      }
+    };
+    const titles = new Map<string, string>();
+    for (const link of Array.from(doc.querySelectorAll("a[href]"))) {
+      const id = idOf(link.getAttribute("href"));
+      if (!id || titles.has(id)) continue;
+      const title = normalize(link.textContent);
+      if (title) titles.set(id, title);
+    }
+    const text = normalize(dialog.textContent);
+    const ours = titles.get(options.conversationId);
+    if (ours && text.includes(ours)) return { button, ambiguous: null };
+    for (const [id, title] of titles) {
+      if (id !== options.conversationId && text.includes(title)) {
+        return { button: null, ambiguous: `the confirmation names another chat ("${title}")` };
+      }
+    }
+  }
+  return { button, ambiguous: null };
 }
 
 /** Page function: what the page shows about the archive right now. */
@@ -604,6 +653,11 @@ async function runArchive(
       continue;
     }
     const itemLocate = `() => (${findArchiveMenuItem.toString()})((${menuLocate(path)})(), ${labels})`;
+    // The confirmation that follows must be a dialog that was not open before this click.
+    await evaluateValue(
+      runtime,
+      `(() => { window.__oracleArchiveDialogsBefore = new WeakSet(Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))); return true; })()`,
+    );
     const item = await archiveClick(runtime, input, {
       locate: itemLocate,
       target: "The ChatGPT Archive menu item",
@@ -622,16 +676,21 @@ async function runArchive(
       await closeMenus(runtime, input);
       continue;
     }
-    if (
-      await waitForArchived(runtime, input, {
-        signalsExpression,
-        conversationId,
-        pageConversationId,
-        rowPresentBefore,
-        navigationUrl: path.navigationUrl,
-      })
-    ) {
-      return { status: "archived", conversationUrl: startUrl };
+    const outcome = await waitForArchived(runtime, input, {
+      signalsExpression,
+      conversationId,
+      pageConversationId,
+      rowPresentBefore,
+      navigationUrl: path.navigationUrl,
+    });
+    if (outcome.archived) return { status: "archived", conversationUrl: startUrl };
+    if (outcome.ambiguous) {
+      return {
+        status: "skipped",
+        reason: "archive-not-confirmed",
+        detail: `${path.name}: Archive clicked, but ${outcome.ambiguous}; nothing was confirmed`,
+        conversationUrl: startUrl,
+      };
     }
     // Earlier UIs keep the chat open and offer Unarchive in the same menu afterwards.
     if ((await openPathMenu(runtime, input, path)) === null) {
@@ -662,9 +721,13 @@ async function waitForArchived(
     rowPresentBefore: boolean;
     navigationUrl: string;
   },
-): Promise<boolean> {
-  const confirmLocate = `() => (${findArchiveConfirmButton.toString()})(document, ${JSON.stringify(ARCHIVE_LABELS)})`;
+): Promise<{ archived: boolean; ambiguous?: string }> {
+  // Only a dialog that appeared after our Archive click (snapshot taken right before it) counts.
+  const inspectCall = `(${inspectArchiveConfirm.toString()})(document, ${JSON.stringify(ARCHIVE_LABELS)}, { before, conversationId: ${JSON.stringify(options.conversationId)} })`;
+  const confirmLocate = `() => { const before = window.__oracleArchiveDialogsBefore; if (!before) return null; return ${inspectCall}.button; }`;
+  const inspect = `(() => { const before = window.__oracleArchiveDialogsBefore; if (!before) return { found: false, ambiguous: 'the dialogs open before the Archive click are unknown' }; const result = ${inspectCall}; return { found: Boolean(result.button), ambiguous: result.ambiguous }; })()`;
   let confirmed = false;
+  let ambiguous: string | undefined;
   const deadline = Date.now() + 6_000;
   for (;;) {
     const signals = await evaluateValue<ReturnType<typeof readArchiveSignals>>(
@@ -672,8 +735,8 @@ async function waitForArchived(
       options.signalsExpression,
     );
     if (signals) {
-      if (signals.toast) return true;
-      if (options.rowPresentBefore && !signals.rowPresent) return true;
+      if (signals.toast) return { archived: true };
+      if (options.rowPresentBefore && !signals.rowPresent) return { archived: true };
       // Leaving the chat counts only as the effect of our own Archive click on the open chat
       // (ChatGPT sends you home); a move to another conversation is not an archive.
       if (
@@ -681,19 +744,28 @@ async function waitForArchived(
         options.pageConversationId === options.conversationId &&
         signals.pageConversationId === null
       )
-        return true;
+        return { archived: true };
     }
-    if (!confirmed && (await evaluateValue<boolean>(runtime, `Boolean((${confirmLocate})())`))) {
-      const clicked = await archiveClick(runtime, input, {
-        locate: confirmLocate,
-        target: "The archive confirmation button",
-        navigationUrl: options.navigationUrl,
-        settleTimeoutMs: 1_000,
-      });
-      if (clicked.status === "conversation-changed") return false;
-      confirmed = clicked.status === "clicked";
+    if (!confirmed && !ambiguous) {
+      const state = await evaluateValue<{ found?: boolean; ambiguous?: string | null }>(
+        runtime,
+        inspect,
+      );
+      if (state?.ambiguous) {
+        // A confirmation Oracle cannot tie to this chat is never clicked.
+        ambiguous = state.ambiguous;
+      } else if (state?.found) {
+        const clicked = await archiveClick(runtime, input, {
+          locate: confirmLocate,
+          target: "The archive confirmation button",
+          navigationUrl: options.navigationUrl,
+          settleTimeoutMs: 1_000,
+        });
+        if (clicked.status === "conversation-changed") return { archived: false };
+        confirmed = clicked.status === "clicked";
+      }
     }
-    if (Date.now() >= deadline) return false;
+    if (Date.now() >= deadline) return { archived: false, ...(ambiguous ? { ambiguous } : {}) };
     await delay(150);
   }
 }

@@ -359,3 +359,46 @@ describe("archive locale label inventory", () => {
     }
   });
 });
+
+describe("archive confirmation ownership", () => {
+  const dialog = (text: string) =>
+    new FakeElement("div", { role: "dialog" }, [
+      new FakeElement("p", {}, [], text),
+      new FakeElement("button", {}, [], "Archive"),
+    ]);
+  const page = (...dialogs: FakeElement[]) =>
+    new FakeDocument([
+      new FakeElement("nav", {}, [
+        new FakeElement("a", { href: "/c/aaa" }, [], "Trip planning"),
+        new FakeElement("a", { href: "/c/bbb" }, [], "Budget review"),
+      ]),
+      ...dialogs,
+    ]);
+  const inspect = async (doc: FakeDocument, before: FakeElement[] = []) => {
+    const { inspectArchiveConfirm, ARCHIVE_LABELS } =
+      await import("../../src/browser/actions/archiveConversation.js");
+    return inspectArchiveConfirm(doc as unknown as Document, ARCHIVE_LABELS, {
+      before: new WeakSet(before as unknown as Element[]),
+      conversationId: "aaa",
+    });
+  };
+
+  test("only a dialog that appeared after our click, naming our chat or none, is ours", async () => {
+    const ours = dialog("This will archive Trip planning.");
+    expect((await inspect(page(ours))).button).toBe(ours.children[1]);
+    const unnamed = dialog("Archive this chat?");
+    expect((await inspect(page(unnamed))).button).toBe(unnamed.children[1]);
+    const old = dialog("Archive this chat?");
+    expect(await inspect(page(old), [old])).toEqual({ button: null, ambiguous: null });
+  });
+
+  test("another chat's confirmation, or two new ones, are ambiguous and nothing is chosen", async () => {
+    await expect(inspect(page(dialog("This will archive Budget review.")))).resolves.toEqual({
+      button: null,
+      ambiguous: 'the confirmation names another chat ("budget review")',
+    });
+    await expect(
+      inspect(page(dialog("Archive this chat?"), dialog("Archive this chat?"))),
+    ).resolves.toEqual({ button: null, ambiguous: "2 new confirmation dialogs are open" });
+  });
+});
