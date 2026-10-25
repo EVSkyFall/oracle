@@ -801,6 +801,166 @@ describe("app approval skips", () => {
   });
 });
 
+describe("app approval prompts split inside a role card", () => {
+  const scanAll = (children: DomNode[]) =>
+    scanAppApprovalCards(
+      new FakeDocument([new DomNode("main", {}, children)]) as unknown as Document,
+      ["CODEXish"],
+      APP_APPROVAL_VOCABULARY,
+    );
+  const block = (text: string, ...buttons: DomNode[]) =>
+    new DomNode("div", {}, [new DomNode("p", {}, [text]), ...buttons]);
+
+  test("blocks without an app name keep the role card's title and form one card", () => {
+    const { cards } = scanAll([
+      new DomNode("div", { role: "alert" }, [
+        new DomNode("h3", {}, ["CODEXish"]),
+        block("Use Fs Read?", button("Allow once")),
+        block("Use Host Capabilities?", button("Always allow")),
+      ]),
+    ]);
+    expect(cards.map((card) => [card.app, card.title, card.button.label])).toEqual([
+      ["CODEXish", "CODEXish", "Always allow"],
+    ]);
+  });
+
+  test("buttons with helper text of their own stay one CODEXish card", () => {
+    const { cards } = scanAll([
+      new DomNode("div", { role: "alert" }, [
+        new DomNode("h3", {}, ["CODEXish"]),
+        new DomNode("div", {}, [new DomNode("span", {}, ["Only this time"]), button("Allow once")]),
+        new DomNode("div", {}, [new DomNode("span", {}, ["Every chat"]), button("Always allow")]),
+        new DomNode("div", {}, [button("Deny")]),
+      ]),
+    ]);
+    expect(cards.map((card) => [card.app, card.title, card.button.label])).toEqual([
+      ["CODEXish", "CODEXish", "Always allow"],
+    ]);
+  });
+
+  test.each([
+    ["Allow Gmail to send an email?"],
+    ["Gmail wants to read your inbox"],
+    ["ChatGPT가 Gmail을(를) 사용하도록 허용할까요?"],
+  ])("a block whose title names another app (%j) stays that app's card", (title) => {
+    const { cards } = scanAll([
+      new DomNode("div", { role: "alert" }, [
+        new DomNode("h3", {}, ["CODEXish"]),
+        block("Use Fs Read?", button("Allow once")),
+        block(title, button("Always allow")),
+      ]),
+    ]);
+    expect(cards.map((card) => [card.app, card.title, card.button.label])).toEqual([
+      ["CODEXish", "CODEXish", "Allow once"],
+      [null, title, "Always allow"],
+    ]);
+  });
+
+  test("a container's first line that belongs to one prompt never titles the others", () => {
+    const { cards } = scanAll([
+      new DomNode("div", { role: "alert" }, [
+        block("Use Fs Read?", button("Allow once")),
+        block("Use Host Capabilities?", button("Always allow")),
+      ]),
+    ]);
+    // Nothing outside the blocks names the app, so nothing is approved.
+    expect(cards.map((card) => [card.app, card.button.label])).toEqual([[null, "Always allow"]]);
+  });
+});
+
+describe("app approval unknown buttons on every path", () => {
+  const scanAll = (children: DomNode[]) =>
+    scanAppApprovalCards(
+      new FakeDocument([new DomNode("main", {}, children)]) as unknown as Document,
+      ["CODEXish"],
+      APP_APPROVAL_VOCABULARY,
+    );
+
+  test.each([[["Continue", "Cancel"]], [["Continue"]], [["OK"]]])(
+    "an allowed app's prompt without a role whose buttons are %j is reported once",
+    (labels) => {
+      const { cards, skipped } = scanAll([
+        new DomNode("div", { class: "card" }, [
+          new DomNode("p", {}, ["Allow CODEXish to run echo?"]),
+          new DomNode(
+            "div",
+            {},
+            labels.map((text) => button(text)),
+          ),
+        ]),
+      ]);
+      expect(cards).toEqual([]);
+      expect(skipped).toEqual([
+        expect.objectContaining({
+          reason: "label",
+          labels,
+          title: "Allow CODEXish to run echo?",
+          app: "CODEXish",
+        }),
+      ]);
+    },
+  );
+
+  test("prompt-like buttons of a card that names no allowed app, and message actions, are not reported", () => {
+    const { skipped } = scanAll([
+      new DomNode("div", { class: "card" }, [
+        new DomNode("p", {}, ["Delete this chat?"]),
+        button("Cancel"),
+        button("Continue"),
+      ]),
+      new DomNode("div", { class: "turn" }, [
+        new DomNode("p", {}, ["I ran CODEXish for you."]),
+        new DomNode("div", {}, [button("Copy"), button("Good response")]),
+      ]),
+    ]);
+    expect(skipped).toEqual([]);
+  });
+
+  test("an unknown button of a prompt next to a taken one in the same alert is reported", () => {
+    const { cards, skipped } = scanAll([
+      new DomNode("div", { role: "alert" }, [
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow CODEXish to use Fs Read?"]),
+          button("Always allow"),
+        ]),
+        new DomNode("div", {}, [
+          new DomNode("p", {}, ["Allow CODEXish to use Fs Write?"]),
+          button("Approve"),
+        ]),
+      ]),
+    ]);
+    expect(cards.map((card) => [card.title, card.button.label])).toEqual([
+      ["Allow CODEXish to use Fs Read?", "Always allow"],
+    ]);
+    expect(skipped).toEqual([
+      expect.objectContaining({
+        reason: "label",
+        labels: ["Approve"],
+        title: "Allow CODEXish to use Fs Write?",
+        app: "CODEXish",
+      }),
+    ]);
+  });
+
+  test("several unknown buttons of one card, or allow buttons in one excluded row, give one report", () => {
+    const { skipped } = scanAll([
+      new DomNode("div", { class: "card" }, [
+        new DomNode("p", {}, ["Allow CODEXish to run echo?"]),
+        button("Approve once"),
+        button("Approve always"),
+      ]),
+      new DomNode("form", { class: "composer" }, [
+        new DomNode("div", {}, [button("Allow"), button("Always allow")]),
+        composerEditor(),
+      ]),
+    ]);
+    expect(skipped.map((skip) => [skip.reason, skip.labels])).toEqual([
+      ["excluded", ["Allow", "Always allow"]],
+      ["label", ["Approve once", "Approve always"]],
+    ]);
+  });
+});
+
 describe("app approval monitor reporting", () => {
   const codexishCard = {
     key: "codexish",

@@ -29,6 +29,12 @@ export interface AppApprovalVocabulary {
    * taken is reported (with why), so a renamed or moved prompt never goes unnoticed.
    */
   allowLike: readonly string[];
+  /**
+   * Whole labels (or beginnings followed by a non-letter) of a prompt's other actions. With a
+   * deny label they mark a card without a role as a prompt, so an allowed app's prompt whose
+   * buttons are all unknown (e.g. "Continue") is reported.
+   */
+  promptActions: readonly string[];
 }
 
 /** What counts as an allow button, compared case-folded with whitespace collapsed. */
@@ -42,6 +48,7 @@ export const APP_APPROVAL_VOCABULARY: AppApprovalVocabulary = {
   ],
   deny: ["don't", "do not", "deny", "not now", "cancel", "거부", "허용 안", "허용하지", "취소"],
   allowLike: ["allow", "always", "허용", "항상", "1회", "한 번만", "approve", "승인"],
+  promptActions: ["continue", "proceed", "confirm", "ok", "yes", "계속", "확인", "예"],
 };
 
 export interface AppApprovalCard {
@@ -166,6 +173,8 @@ export function scanAppApprovalCards(
     ...vocabulary.exact.map((entry) => entry.label),
     ...vocabulary.prefixes.map((entry) => entry.prefix),
     ...vocabulary.allowLike,
+    ...vocabulary.promptActions,
+    ...vocabulary.deny,
   ];
   const mayAllow = (button: Element): boolean => {
     const quick = `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""}`;
@@ -238,6 +247,14 @@ export function scanAppApprovalCards(
   const allowLike = (text: string): boolean => {
     const folded = fold(text);
     return !denied(folded) && vocabulary.allowLike.some((prefix) => folded.startsWith(prefix));
+  };
+  const startsWord = (folded: string, prefix: string): boolean =>
+    folded.startsWith(prefix) && !/^[\p{L}\p{N}]/u.test(folded.slice(prefix.length));
+  // A deny label or another action of a prompt ("Continue", "OK"): never clicked, only a sign
+  // that the card around it is a prompt.
+  const promptLike = (text: string): boolean => {
+    const folded = fold(text);
+    return denied(folded) || vocabulary.promptActions.some((action) => startsWord(folded, action));
   };
   const describe = (element: Element): string => {
     const classes = String(element.getAttribute("class") ?? "")
@@ -367,7 +384,11 @@ export function scanAppApprovalCards(
     }
     return false;
   };
-  const firstLineOf = (root: Element | null, boundary: Element | null): string => {
+  const firstLineOf = (
+    root: Element | null,
+    boundary: Element | null,
+    exclude: readonly Element[] = [],
+  ): string => {
     if (!root || hiddenRoot(root, boundary)) return "";
     const skip = `${BUTTON}, ${PROSE}, ${USER}, ${ARGUMENTS}`;
     const lines: string[] = [""];
@@ -397,7 +418,9 @@ export function scanAppApprovalCards(
         breakLine();
         return;
       }
-      if (!top && (element.matches(skip) || hiddenElement(element))) return;
+      if (!top && (exclude.includes(element) || element.matches(skip) || hiddenElement(element))) {
+        return;
+      }
       const block = !top && isBlock(element);
       if (block) breakLine();
       for (const child of Array.from(element.childNodes)) walk(child, false);
@@ -411,18 +434,23 @@ export function scanAppApprovalCards(
    * card's heading, its aria-labelledby text, its aria-label, its first rendered line. The card's
    * title is the first one present. A surrounding dialog's label is never the card's title: a
    * dialog that is a prompt is the card itself, and one that holds the chat is labelled with the
-   * chat's name.
+   * chat's name. `exclude` leaves out blocks of the card (the separate prompts of a role card).
    */
-  const titlesOf = (card: Element, region: Element): string[] => {
+  const titlesOf = (card: Element, region: Element, exclude: readonly Element[] = []): string[] => {
     const heading = Array.from(
       card.querySelectorAll('[role="heading"], h1, h2, h3, h4, h5, h6'),
-    ).find((node) => !node.closest(PROSE) && !hiddenRoot(node, card));
+    ).find(
+      (node) =>
+        !node.closest(PROSE) &&
+        !hiddenRoot(node, card) &&
+        !exclude.some((block) => block.contains(node)),
+    );
     const candidates = [firstLineOf(heading ?? null, card)];
     if (!hiddenRoot(card, region)) {
       candidates.push(labelledLine(card.getAttribute("aria-labelledby")));
       candidates.push(normalize(card.getAttribute("aria-label")));
     }
-    candidates.push(firstLineOf(card, region));
+    candidates.push(firstLineOf(card, region, exclude));
     return candidates.filter(Boolean);
   };
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -430,14 +458,24 @@ export function scanAppApprovalCards(
     allowApps.find((app) =>
       new RegExp(`(^|[^A-Za-z0-9_])${escape(app.trim())}($|[^A-Za-z0-9_])`, "i").test(text),
     ) ?? null;
+  // Whether a prompt title names some app (any name in the usual phrasings), so a prompt block
+  // that names another app is never covered by the title of the role card around it.
+  const namesSomeApp = (text: string): boolean =>
+    [
+      /\ballow\s+\S.*?\s+to\b/i,
+      /^\S.*?\s+(?:wants|would like|is asking)\s+to\b/i,
+      /\S\s*(?:을\(를\)|를\(을\)|을|를)\s*사용하도록/,
+    ].some((pattern) => pattern.test(text));
 
-  type Candidate = {
+  type Entry = {
     button: Element;
     rank: number;
     label: string;
     region: Element;
     role: boolean;
     textCard: Element;
+    /** accepted: an allow button; unknown: allow-looking, not in the list; prompt: a prompt's other action. */
+    kind: "accepted" | "unknown" | "prompt";
   };
   const enabled = (button: Element): boolean =>
     !button.hasAttribute("disabled") && button.getAttribute("aria-disabled") !== "true";
@@ -468,75 +506,111 @@ export function scanAppApprovalCards(
     }
     return null;
   };
-  const skipped: AppApprovalSkip[] = [];
-  // Allow-looking buttons outside any role card whose label is not in the list; reported below
-  // unless their card is taken through another button.
-  const unknown: Array<{ button: Element; label: string; region: Element; textCard: Element }> = [];
-  const candidates: Candidate[] = [];
+  // Buttons that are not taken because of where they sit, one report per subject and place.
+  const placeSkips: AppApprovalSkip[] = [];
+  const skipPlace = (
+    reason: "excluded" | "no-card",
+    text: string,
+    detail: string,
+    subject: number,
+  ) => {
+    const same = placeSkips.find(
+      (skip) => skip.subject === subject && skip.reason === reason && skip.detail === detail,
+    );
+    if (same) {
+      if (!same.labels.includes(text)) same.labels.push(text);
+      return;
+    }
+    placeSkips.push({ reason, labels: [text], title: "", app: null, detail, subject });
+  };
+  const entries: Entry[] = [];
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
     if (!mayAllow(button) || !visible(button) || !enabled(button)) continue;
     const text = label(button);
     const rank = rankOf(button, text);
-    if (rank < 0 && !allowLike(text)) continue;
+    const kind =
+      rank >= 0 ? "accepted" : allowLike(text) ? "unknown" : promptLike(text) ? "prompt" : null;
+    if (!kind) continue;
     const { region, role, excludedBy } = placeOf(button);
     if (!region) {
+      if (kind === "prompt") continue;
       // Never above the excluding ancestor: the role card, else a text card below it.
       const around = roleCardOf(button) ?? (excludedBy ? cardBelow(button, excludedBy) : null);
-      skipped.push({
-        reason: excludedBy ? "excluded" : "no-card",
-        labels: [text],
-        title: "",
-        app: null,
-        detail: excludedBy ? describe(excludedBy) : "",
-        subject: subjectFor(around, button),
-      });
+      skipPlace(
+        excludedBy ? "excluded" : "no-card",
+        text,
+        excludedBy ? describe(excludedBy) : "",
+        subjectFor(around, button),
+      );
       continue;
     }
     // The nearest ancestor with text of its own; a role card counts even with only a label.
     const textCard = cardOf(button, region) ?? (role ? region : null);
     if (!textCard) {
-      skipped.push({
-        reason: "no-card",
-        labels: [text],
-        title: "",
-        app: null,
-        detail: "",
-        subject: subjectFor(button.parentElement, button),
-      });
+      if (kind !== "prompt")
+        skipPlace("no-card", text, "", subjectFor(button.parentElement, button));
       continue;
     }
-    if (rank < 0) {
-      // Role cards are reported whole by the pass over role cards below.
-      if (!role) unknown.push({ button, label: text, region, textCard });
-      continue;
-    }
-    candidates.push({ button, rank, label: text, region, role, textCard });
+    entries.push({ button, rank, label: text, region, role, textCard, kind });
   }
-  // A role element holding several prompts (buttons under different text blocks) is a container:
-  // each prompt is its own card there, so one prompt's title never covers another's button.
+
+  // A role element whose allow-looking buttons sit under different text blocks holds several
+  // prompts, so one prompt's title never covers another prompt's button.
   const promptsIn = new Map<Element, Set<Element>>();
-  for (const { region, role, textCard } of candidates) {
-    if (!role || textCard === region) continue;
+  for (const { region, role, textCard, kind } of entries) {
+    if (!role || kind === "prompt" || textCard === region) continue;
     const set = promptsIn.get(region) ?? new Set<Element>();
     set.add(textCard);
     promptsIn.set(region, set);
   }
+  const titleCache = new Map<Element, string>();
+  const titleOf = (card: Element, region: Element, exclude: readonly Element[] = []): string => {
+    const cached = titleCache.get(card);
+    if (cached !== undefined) return cached;
+    const title = titlesOf(card, region, exclude)[0] ?? "";
+    titleCache.set(card, title);
+    return title;
+  };
+  /**
+   * The card an entry belongs to and its title. In a role element holding several prompts, a
+   * block whose own title names an app (an allowed one or any other) is its own card; the other
+   * blocks are parts of the role element's prompt, titled by what lies outside the blocks.
+   */
+  const cardOfEntry = (entry: Entry): { card: Element; title: string } => {
+    if (!entry.role) return { card: entry.textCard, title: titleOf(entry.textCard, entry.region) };
+    const blocks = promptsIn.get(entry.region);
+    if (!blocks || blocks.size < 2) {
+      return { card: entry.region, title: titleOf(entry.region, entry.region) };
+    }
+    if (entry.textCard !== entry.region) {
+      const own = titleOf(entry.textCard, entry.region);
+      if (names(own) || namesSomeApp(own)) return { card: entry.textCard, title: own };
+    }
+    return { card: entry.region, title: titleOf(entry.region, entry.region, [...blocks]) };
+  };
+
   const byCard = new Map<
     Element,
-    { region: Element; best: Element; rank: number; label: string }
+    { region: Element; title: string; best: Element; rank: number; label: string }
   >();
-  for (const { button, rank, label: text, region, role, textCard } of candidates) {
-    const card = role && (promptsIn.get(region)?.size ?? 0) < 2 ? region : textCard;
+  for (const entry of entries) {
+    if (entry.kind !== "accepted") continue;
+    const { card, title } = cardOfEntry(entry);
     const current = byCard.get(card);
-    if (!current || rank < current.rank) {
-      byCard.set(card, { region, best: button, rank, label: text });
+    if (!current || entry.rank < current.rank) {
+      byCard.set(card, {
+        region: entry.region,
+        title,
+        best: entry.button,
+        rank: entry.rank,
+        label: entry.label,
+      });
     }
   }
   const cards: AppApprovalCard[] = [];
   const buttons: Element[] = [];
-  for (const [card, { region, best, rank, label: bestLabel }] of byCard.entries()) {
+  for (const [card, { title, best, rank, label: bestLabel }] of byCard.entries()) {
     // The title is the first candidate present; a later line naming the app does not count.
-    const title = titlesOf(card, region)[0] ?? "";
     const text = textOf(card, `${BUTTON}, ${PROSE}, ${USER}`);
     buttons.push(best);
     cards.push({
@@ -548,10 +622,12 @@ export function scanAppApprovalCards(
       subject: subjectFor(card, best),
     });
   }
+
+  const skipped: AppApprovalSkip[] = [...placeSkips];
   // Role cards with no allow button: reported when their title names an allowed app (its
   // buttons were renamed, e.g. "Continue") or when one of them looks like an allow button.
   const takenRegions = new Set(
-    candidates.filter((entry) => entry.role).map((entry) => entry.region),
+    entries.filter((entry) => entry.role && entry.kind === "accepted").map((entry) => entry.region),
   );
   // A role element inside a taken card (the approval card's text-only alert) is part of it.
   const takenCards = Array.from(byCard.keys());
@@ -581,16 +657,33 @@ export function scanAppApprovalCards(
       subject: subjectFor(role, own[0] ?? role),
     });
   }
-  for (const { button, label: text, region, textCard } of unknown) {
-    if (byCard.has(textCard)) continue;
-    const title = titlesOf(textCard, region)[0] ?? "";
+  // Every other card that is not taken, one report each: one with an allow-looking button that
+  // is not in the list, or an allowed app's prompt (by its title) whose buttons are all unknown.
+  const untaken = new Map<
+    Element,
+    { title: string; labels: string[]; unknown: boolean; button: Element }
+  >();
+  for (const entry of entries) {
+    if (entry.kind === "accepted") continue;
+    // A role element nothing was taken from is reported whole above.
+    if (entry.role && !takenRegions.has(entry.region)) continue;
+    const { card, title } = cardOfEntry(entry);
+    if (byCard.has(card)) continue;
+    const group = untaken.get(card) ?? { title, labels: [], unknown: false, button: entry.button };
+    if (!group.labels.includes(entry.label)) group.labels.push(entry.label);
+    group.unknown ||= entry.kind === "unknown";
+    untaken.set(card, group);
+  }
+  for (const [card, { title, labels, unknown, button }] of untaken.entries()) {
+    const app = names(title);
+    if (!unknown && !app) continue;
     skipped.push({
       reason: "label",
-      labels: [text],
+      labels,
       title: title.slice(0, 200),
-      app: names(title),
+      app,
       detail: "",
-      subject: subjectFor(textCard, button),
+      subject: subjectFor(card, button),
     });
   }
   return { cards, buttons, skipped, subjects, labelOf: label };
