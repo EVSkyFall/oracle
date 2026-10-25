@@ -9,6 +9,7 @@ import {
   buildComposerNavigationValidationExpression,
 } from "./attachmentContext.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { findComposerEditor } from "./composerEditor.js";
 import { COMPOSER_TOKEN_SELECTOR, readComposerPromptText } from "./composerTools.js";
 
 /** Bind editing commands and fallback writes to the original renderer and editor. */
@@ -36,7 +37,8 @@ export async function stageAttachmentPrompt(
         ${buildClickDispatcher()}
         const selectors = ${JSON.stringify(INPUT_SELECTORS)};
         const visible = node => { const r = node?.getBoundingClientRect(); return r && r.width > 0 && r.height > 0; };
-        const resolveEditor = () => selectors.map(s => document.querySelector(s)).find(visible);
+        // The visible composer, never a hidden one an in-page move left first in the page.
+        const resolveEditor = () => { const found = (${findComposerEditor.toString()})(document, selectors); return found && visible(found) ? found : undefined; };
         const editor = resolveEditor();
         const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
         const readPrompt = ${readComposerPromptText.toString()};

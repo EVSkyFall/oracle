@@ -7,6 +7,7 @@ import {
   PROMPT_FALLBACK_SELECTOR,
   SEND_BUTTON_SELECTORS,
   STOP_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
 import {
@@ -28,6 +29,7 @@ import { BrowserAutomationError } from "../../oracle/errors.js";
 import { buildAttachmentEvidenceExpression } from "./attachmentEvidence.js";
 import { buildAttachmentProgressExpression } from "./attachmentProgress.js";
 import { buildActiveComposerRootExpression } from "./composerRoot.js";
+import { findComposerEditor } from "./composerEditor.js";
 import { buildInstallCompletionAnnouncementExpression } from "./completionAnnouncement.js";
 import { activateWebSearch } from "./webSearch.js";
 import {
@@ -87,7 +89,8 @@ export function buildMultilinePasteExpression(prompt: string): string {
   return `(() => {
         const selectors = ${JSON.stringify(INPUT_SELECTORS)};
         const visible = (node) => { const r = node?.getBoundingClientRect?.(); return Boolean(r && r.width > 0 && r.height > 0); };
-        const editor = selectors.map((s) => document.querySelector(s)).find((n) => n && visible(n));
+        const found = (${findComposerEditor.toString()})(document, selectors);
+        const editor = found && visible(found) ? found : null;
         if (editor instanceof HTMLTextAreaElement) return { used: false };
         if (!editor?.isContentEditable) return { used: true, complete: false };
         const text = ${JSON.stringify(prompt)};
@@ -202,14 +205,8 @@ export async function submitPrompt(
         return true;
       };
 
-      const candidates = [];
-      for (const selector of SELECTORS) {
-        const node = document.querySelector(selector);
-        if (node) {
-          candidates.push(node);
-        }
-      }
-      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
+      // The visible composer, never a hidden one an in-page move left behind.
+      const preferred = (${findComposerEditor.toString()})(document, SELECTORS);
       if (preferred && focusNode(preferred)) {
         return { focused: true };
       }
@@ -266,7 +263,7 @@ export async function submitPrompt(
     const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
     const verification = await runtime.evaluate({
       expression: `(() => {
-      const editor = document.querySelector(${primarySelectorLiteral});
+      const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
       const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
@@ -284,7 +281,7 @@ export async function submitPrompt(
         return rect.width > 0 && rect.height > 0;
       };
       const candidates = inputSelectors
-        .map((selector) => document.querySelector(selector))
+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
         .filter((node) => Boolean(node));
       const active = candidates.find((node) => isVisible(node)) || candidates[0] || null;
       return {
@@ -312,7 +309,7 @@ export async function submitPrompt(
           fallback.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
           fallback.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        const editor = document.querySelector(${primarySelectorLiteral});
+        const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
         if (editor && editor.querySelector(${JSON.stringify(COMPOSER_TOKEN_SELECTOR)})) {
           // Replacing textContent would drop the staged mentions; insert after them instead.
           editor.focus();
@@ -334,7 +331,7 @@ export async function submitPrompt(
 
     const postVerification = await runtime.evaluate({
       expression: `(() => {
-      const editor = document.querySelector(${primarySelectorLiteral});
+      const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
       const tokenSelector = ${JSON.stringify(COMPOSER_TOKEN_SELECTOR)};
@@ -352,7 +349,7 @@ export async function submitPrompt(
         return rect.width > 0 && rect.height > 0;
       };
       const candidates = inputSelectors
-        .map((selector) => document.querySelector(selector))
+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
         .filter((node) => Boolean(node));
       const active = candidates.find((node) => isVisible(node)) || candidates[0] || null;
       return {
@@ -464,7 +461,7 @@ export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logg
     expression: `(() => {
       const SELECTORS = ${inputSelectorsLiteral};
       const fallback = document.querySelector(${fallbackSelectorLiteral});
-      const editor = document.querySelector(${primarySelectorLiteral});
+      const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
       const readValue = (node) => {
         if (!node) return '';
         if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
@@ -509,9 +506,11 @@ export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logg
         return false;
       };
       let cleared = false;
-      const nodes = SELECTORS
-        .map((selector) => document.querySelector(selector))
-        .filter((node) => Boolean(node));
+      // The visible composer too: an in-page move can leave a hidden one first in the page.
+      const nodes = [
+        (${findComposerEditor.toString()})(document, SELECTORS),
+        ...SELECTORS.map((selector) => document.querySelector(selector)),
+      ].filter((node) => Boolean(node));
       for (const node of Array.from(new Set([fallback, editor, ...nodes])).filter(Boolean)) {
         cleared = clearEditable(node) || cleared;
       }
@@ -807,7 +806,16 @@ async function attemptSendButton(
     const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;`;
   const script = `(() => {
     ${findButton}
-    if (!button) return { status: 'missing' };
+    if (!button) {
+      // What the composer shows instead, for the log: a disabled or hidden send button, the stop
+      // button of a reply that is still finishing, or nothing Oracle knows.
+      const stopVisible = ${JSON.stringify(STOP_BUTTON_SELECTORS)}.some((selector) =>
+        Array.from(document.querySelectorAll(selector)).some(isVisible));
+      const why = candidates.some((node) => isVisible(node)) ? 'disabled'
+        : stopVisible ? 'stop'
+        : candidates.length > 0 ? 'hidden' : 'none';
+      return { status: 'missing', why };
+    }
     const rect = button.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
       const x = rect.left + rect.width / 2;
@@ -838,11 +846,21 @@ async function attemptSendButton(
   // settle slowly for multi-file uploads, but plain text sends should keep the
   // shorter historical deadline.
   const timeoutMs = sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs);
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   let previousPoint: { x: number; y: number } | undefined;
   let activated = false;
   let foundButton = false;
   let attachmentMenuChecked = !needAttachment;
+  // Right after a reply ChatGPT can show the send button disabled, or the stop button, for a
+  // moment while the text is already in the editor; Enter does nothing then. Wait for it.
+  const missingSeen = new Set<string>();
+  const noteWait = () => {
+    if (missingSeen.size === 0) return;
+    logger?.(
+      `Send button ready after ${((Date.now() - startedAt) / 1000).toFixed(1)}s (the composer showed: ${[...missingSeen].join(", ")})`,
+    );
+  };
   while (Date.now() < deadline) {
     if (needAttachment) {
       const ready = await Runtime.evaluate({
@@ -888,7 +906,12 @@ async function attemptSendButton(
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "missing" | "point" | "settling" | "synthetic"; x?: number; y?: number }
+      | {
+          status?: "missing" | "point" | "settling" | "synthetic";
+          x?: number;
+          y?: number;
+          why?: string;
+        }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
@@ -909,22 +932,36 @@ async function attemptSendButton(
         continue;
       }
       await beforeSend?.();
+      noteWait();
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }
     if (status === "synthetic") {
       await beforeSend?.();
       const clicked = await Runtime.evaluate({ expression: syntheticClick, returnByValue: true });
-      if (clicked?.result?.value?.syntheticClicked === true) return true;
+      if (clicked?.result?.value?.syntheticClicked === true) {
+        noteWait();
+        return true;
+      }
       previousPoint = undefined;
       await delay(100);
       continue;
     }
     if (status === "missing") {
-      break;
+      missingSeen.add(
+        typeof value === "object" && typeof value.why === "string" ? value.why : "no send button",
+      );
+      previousPoint = undefined;
+      await delay(150);
+      continue;
     }
     previousPoint = undefined;
     await delay(100);
+  }
+  if (!foundButton && missingSeen.size > 0) {
+    logger?.(
+      `No ready send button within ${Math.ceil(timeoutMs / 1000)}s (the composer showed: ${[...missingSeen].join(", ")})`,
+    );
   }
   if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
     throw new BrowserAutomationError(
@@ -1265,7 +1302,7 @@ async function verifyPromptCommitted(
   const baselineLiteral = baseline ?? -1;
   // Learned: ChatGPT can echo/format text; normalize markdown and use prefix matches to detect the sent prompt.
   const script = `(() => {
-		    const editor = document.querySelector(${primarySelectorLiteral});
+		    const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
 		    const fallback = document.querySelector(${fallbackSelectorLiteral});
 		    const inputSelectors = ${inputSelectorsLiteral};
 	    const normalize = (value) => {
@@ -1291,7 +1328,7 @@ async function verifyPromptCommitted(
 	      return rect.width > 0 && rect.height > 0;
 	    };
 	    const inputs = inputSelectors
-	      .map((selector) => document.querySelector(selector))
+	      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
 	      .filter((node) => Boolean(node));
 	    const visibleInputs = inputs.filter((node) => isVisible(node));
 	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;

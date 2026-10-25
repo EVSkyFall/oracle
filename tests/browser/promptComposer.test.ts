@@ -932,7 +932,13 @@ describe("promptComposer", () => {
     const run = (
       buttonText: (reads: number, steps: string[]) => string | null,
       maxThinkingTime?: "extra-high",
-      measure: { status: string; x?: number; y?: number } = { status: "point", x: 10, y: 20 },
+      measure:
+        | { status: string; x?: number; y?: number; why?: string }
+        | ((calls: number) => { status: string; x?: number; y?: number; why?: string }) = {
+        status: "point",
+        x: 10,
+        y: 20,
+      },
     ) => {
       const steps: string[] = [];
       let reads = 0;
@@ -961,7 +967,8 @@ describe("promptComposer", () => {
           }
           if (expression.includes("button.scrollIntoView")) {
             steps.push("measure");
-            return { result: { value: measure } };
+            const calls = steps.filter((step) => step === "measure").length;
+            return { result: { value: typeof measure === "function" ? measure(calls) : measure } };
           }
           throw new Error(`unexpected expression: ${expression.slice(0, 80)}`);
         }),
@@ -1025,15 +1032,28 @@ describe("promptComposer", () => {
       expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
     });
 
+    // A missing send button is waited for (up to the 20 s send-button timeout) before Enter.
+    const withFakeTimers = async (check: () => Promise<void>) => {
+      vi.useFakeTimers();
+      try {
+        await check();
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
     test("the fallback Enter is checked right before it is pressed", async () => {
-      const { outcome, steps, input } = run(
-        (_reads, seen) => (seen.includes("measure") ? "Thinking effort\nPro" : "Thinking effort"),
-        "extra-high",
-        { status: "missing" },
-      );
-      await expect(outcome).resolves.toMatchObject(refusal);
-      expect(steps.at(-1)).toBe("button");
-      expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+      await withFakeTimers(async () => {
+        const { outcome, steps, input } = run(
+          (_reads, seen) => (seen.includes("measure") ? "Thinking effort\nPro" : "Thinking effort"),
+          "extra-high",
+          { status: "missing" },
+        );
+        await vi.advanceTimersByTimeAsync(21_000);
+        await expect(outcome).resolves.toMatchObject(refusal);
+        expect(steps.at(-1)).toBe("button");
+        expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+      });
     });
 
     test("the last-resort synthetic click is checked right before it fires", async () => {
@@ -1054,11 +1074,42 @@ describe("promptComposer", () => {
     );
 
     test("a composer button within the cap lets the fallback Enter through", async () => {
-      const { outcome, steps } = run(() => "Thinking effort\nMedium", "extra-high", {
-        status: "missing",
+      await withFakeTimers(async () => {
+        const { outcome, steps, logger } = run(() => "Thinking effort\nMedium", "extra-high", {
+          status: "missing",
+          why: "none",
+        });
+        await vi.advanceTimersByTimeAsync(21_000);
+        await expect(outcome).resolves.toBe(SEND_REACHED);
+        expect(steps.filter((step) => step !== "measure")).toEqual(["button", "enter"]);
+        expect(logger).toHaveBeenCalledWith(
+          "No ready send button within 20s (the composer showed: none)",
+        );
       });
-      await expect(outcome).resolves.toBe(SEND_REACHED);
-      expect(steps).toEqual(["measure", "button", "enter"]);
+    });
+
+    test("a send button that is disabled or missing for a while is waited for and clicked, not Entered", async () => {
+      await withFakeTimers(async () => {
+        const { outcome, steps, input, logger } = run(
+          () => "Thinking effort\nExtra High",
+          "extra-high",
+          (calls) =>
+            calls <= 4
+              ? { status: "missing", why: "disabled" }
+              : calls <= 8
+                ? { status: "missing", why: "stop" }
+                : { status: "point", x: 10, y: 20 },
+        );
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(outcome).resolves.toBe(SEND_REACHED);
+        expect(steps.filter((step) => step !== "measure")).toEqual(["button", "click"]);
+        expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
+        expect(logger).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^Send button ready after \d+\.\ds \(the composer showed: disabled, stop\)$/,
+          ),
+        );
+      });
     });
 
     test("without a maximum the button is not read", async () => {
@@ -1243,7 +1294,8 @@ describe("promptComposer", () => {
         "hello",
         logger as never,
       );
-      await vi.advanceTimersByTimeAsync(1_000);
+      // The send button is waited for (20 s) before the Enter fallback.
+      await vi.advanceTimersByTimeAsync(21_000);
 
       await expect(result).resolves.toBe(1);
       expect(input.dispatchKeyEvent).toHaveBeenCalledTimes(2);
