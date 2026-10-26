@@ -102,6 +102,7 @@ export interface AssistantRecheckEnv {
   /** Runs the wait; it may abort an attempt to reload a stalled conversation and run it again. */
   waitWithThinkingMonitor: <T>(
     operation: (attempt?: TurnResyncAttempt) => Promise<T>,
+    timeoutMs?: number,
   ) => Promise<T>;
   onRecheckDelayElapsed?: () => Promise<unknown>;
   onConversationUrlResolved?: (url: string) => void;
@@ -167,8 +168,10 @@ export function createAttemptAssistantRecheck(
     }
     await env.onRecheckReady?.();
     const timeoutMs = env.recheckTimeoutMs > 0 ? env.recheckTimeoutMs : env.fallbackTimeoutMs;
-    const rechecked = await env.waitWithThinkingMonitor((attempt) =>
-      env.waitResponse(attempt ? attempt.remainingMs(timeoutMs) : timeoutMs, attempt?.signal),
+    const rechecked = await env.waitWithThinkingMonitor(
+      (attempt) =>
+        env.waitResponse(attempt ? attempt.remainingMs(timeoutMs) : timeoutMs, attempt?.signal),
+      timeoutMs,
     );
     env.logger("Recovered assistant response after delayed recheck");
     return rechecked;

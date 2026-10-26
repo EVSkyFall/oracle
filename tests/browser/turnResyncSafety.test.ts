@@ -339,3 +339,90 @@ describe("approval clicks and conversation reloads", () => {
     expect(records).toHaveLength(2);
   });
 });
+
+describe("a conversation reload within the run's time", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("a CDP call that never answers during the reload ends the wait at the run's timeout, as a timeout", async () => {
+    // The renderer hangs as the reload starts: marking the page never answers.
+    const tab = fakePage({
+      scan: () => ({ cards: [], skipped: [], hidden: [] }),
+      hang: (expression) => expression.includes("window.__oracleResyncMark = "),
+    });
+    const logger = quietLogger();
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: { reload: vi.fn(), navigate: vi.fn() } as unknown as ChromeClient["Page"],
+      logger,
+      conversationUrl: () => CONVERSATION,
+      stallMs: MINUTE,
+    });
+    const attempts: TurnResyncAttempt[] = [];
+    let settled: unknown = "pending";
+    // The stall comes at 60 s; the run has 70 s, less than one step's own 15 s limit after it.
+    const runMs = 70_000;
+    const waiting = resync.run(timedWait(attempts, runMs), { timeoutMs: runMs });
+    waiting.then(
+      (value) => {
+        settled = value;
+      },
+      (error: unknown) => {
+        settled = error;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(runMs - 1_000);
+    expect(settled).toBe("pending");
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(settled).toBeInstanceOf(Error);
+    expect((settled as Error).message).toBe("Response timeout");
+    expect(attempts).toHaveLength(2);
+    expect(lines(logger)).toContain(
+      "[browser] The run's time for the answer ran out during the conversation reload; the wait ends as it would at its timeout.",
+    );
+  });
+
+  test("a reload that waits on an approval poll that never finishes ends at the run's timeout too", async () => {
+    let scans = 0;
+    // The first poll reads the page; the second one never gets an answer and keeps the page.
+    const tab = fakePage({
+      scan: () => ({ cards: [], skipped: [], hidden: [] }),
+      hang: (expression) =>
+        expression.includes("window.__oracleApprovalButtons = {") && ++scans > 1,
+    });
+    const reload = vi.fn(async () => ({}));
+    const logger = quietLogger();
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: { reload, navigate: vi.fn() } as unknown as ChromeClient["Page"],
+      logger,
+      conversationUrl: () => CONVERSATION,
+      stallMs: MINUTE,
+    });
+    const attempts: TurnResyncAttempt[] = [];
+    let settled: unknown = "pending";
+    void withAppApprovalMonitor(
+      tab.Runtime,
+      undefined,
+      { allowApps: ["CODEXish"], logger, gate: resync.gate },
+      () => resync.run(timedWait(attempts, 5 * MINUTE), { timeoutMs: 5 * MINUTE }),
+    ).then(
+      (value) => {
+        settled = value;
+      },
+      (error: unknown) => {
+        settled = error;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(5 * MINUTE + 5_000);
+    // The run ended; its monitor is still stuck on the page read, as it would be today.
+    expect(reload).not.toHaveBeenCalled();
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]!.remainingMs(5 * MINUTE)).toBe(0);
+    expect(settled).toBe("pending");
+  });
+});

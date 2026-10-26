@@ -141,8 +141,14 @@ export interface TurnResync {
    * and the thread is quiet, the attempt is aborted, the conversation is reloaded (or navigated
    * to when the reload fails or the tab shows another page), and a new attempt waits on the
    * reloaded page. Never a stop condition: the wait ends only as the operation ends.
+   * `timeoutMs` is the run's time for the whole wait: every step of a reload (waiting for an
+   * approval click to finish included) stops when it is spent, and the next attempt, with no time
+   * left, ends the wait as its own timeout would.
    */
-  run<T>(operation: (attempt: TurnResyncAttempt) => Promise<T>): Promise<T>;
+  run<T>(
+    operation: (attempt: TurnResyncAttempt) => Promise<T>,
+    options?: { timeoutMs?: number },
+  ): Promise<T>;
 }
 
 type Trigger = { url: string; reason: string };
@@ -151,6 +157,13 @@ const idle = (ms: number) =>
   new Promise<void>((resolve) => {
     setTimeout(resolve, ms).unref?.();
   });
+
+/** The run's time ran out during a reload step. */
+class RunTimeSpent extends Error {}
+/** The reload was given up (its time ran out while it waited its turn). */
+class ReloadAbandoned extends Error {}
+const endsReload = (error: unknown) =>
+  error instanceof RunTimeSpent || error instanceof ReloadAbandoned;
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> =>
   new Promise<T>((resolve, reject) => {
@@ -197,6 +210,26 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   let waiter: ((trigger: Trigger) => void) | null = null;
   const reportedNoUrl = new Set<string>();
   const gate = createPageGate();
+  // When the run's time for the wait is spent (set by run).
+  let deadline = Number.POSITIVE_INFINITY;
+
+  /**
+   * `start()` raced against `capMs` and the run's remaining time; once that time is spent it
+   * rejects with RunTimeSpent, so no step of a reload outlives the run.
+   */
+  const bounded = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> => {
+    const left = deadline - Date.now();
+    if (left <= 0) return Promise.reject(new RunTimeSpent(what));
+    const byRunTime = left <= capMs;
+    return withTimeout(
+      (async () => start())(),
+      Math.max(1, Math.floor(byRunTime ? left : capMs)),
+      what,
+    ).catch((error: unknown) => {
+      if (byRunTime && Date.now() >= deadline) throw new RunTimeSpent(what);
+      throw error;
+    });
+  };
 
   const progressed = (now: number) => {
     lastChangeAt = now;
@@ -232,10 +265,11 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     const known = options.conversationUrl?.();
     if (known && conversationIdFromUrl(known)) return known;
     try {
-      const { result } = await Runtime.evaluate({
-        expression: "location.href",
-        returnByValue: true,
-      });
+      const { result } = await bounded(
+        "reading the page URL",
+        () => Runtime.evaluate({ expression: "location.href", returnByValue: true }),
+        PAGE_COMMAND_MS,
+      );
       const href = typeof result?.value === "string" ? result.value : "";
       if (conversationIdFromUrl(href)) return href;
     } catch {
@@ -245,7 +279,8 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   };
 
   const decide = async (): Promise<void> => {
-    if (reloading || deciding || !waiter) return;
+    // With the run's time spent the attempt ends on its own timeout; a reload would not help.
+    if (reloading || deciding || !waiter || Date.now() >= deadline) return;
     deciding = true;
     try {
       const now = Date.now();
@@ -298,42 +333,81 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     return result?.value;
   };
 
-  /** Reloads the conversation and waits (bounded) until the new page shows its turns. */
-  const reload = async ({ url }: Trigger): Promise<void> => {
+  /**
+   * Reloads the conversation and waits until the new page shows its turns. Every step is bounded
+   * by the run's remaining time and stops once `abandoned()` (RunTimeSpent / ReloadAbandoned).
+   */
+  const reload = async ({ url }: Trigger, abandoned: () => boolean): Promise<void> => {
+    const step = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
+      abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
+    // A step that fails on its own is skipped with `fallback`; one that ends the reload is not.
+    const orElse = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
+      promise.catch((error: unknown) => {
+        if (endsReload(error)) throw error;
+        return fallback;
+      });
     const mark = randomUUID();
-    await readPage(`window.__oracleResyncMark = ${JSON.stringify(mark)}`).catch(() => undefined);
-    const current = await readPage("location.href").catch(() => null);
+    await orElse(
+      step(
+        "marking the page",
+        () => readPage(`window.__oracleResyncMark = ${JSON.stringify(mark)}`),
+        PAGE_COMMAND_MS,
+      ),
+      undefined,
+    );
+    const current = await orElse(
+      step("reading the page URL", () => readPage("location.href"), PAGE_COMMAND_MS),
+      null,
+    );
     const sameConversation =
       typeof current === "string" && conversationIdFromUrl(current) === conversationIdFromUrl(url);
     let how = "reloaded";
     try {
       if (!sameConversation) throw new Error("the tab shows another page");
-      await withTimeout(Page.reload({}), PAGE_COMMAND_MS, "Page.reload");
+      await step("Page.reload", () => Page.reload({}), PAGE_COMMAND_MS);
     } catch (reloadError) {
+      if (endsReload(reloadError)) throw reloadError;
       how = "opened again";
       try {
-        await withTimeout(Page.navigate({ url }), PAGE_COMMAND_MS, "Page.navigate");
+        await step("Page.navigate", () => Page.navigate({ url }), PAGE_COMMAND_MS);
       } catch (navigateError) {
+        if (endsReload(navigateError)) throw navigateError;
         logger(
           `[browser] Conversation reload failed (${message(reloadError)}; ${message(navigateError)}); waiting on the page as it is.`,
         );
         return;
       }
     }
-    const deadline = Date.now() + settleMs;
+    const settleBy = Date.now() + settleMs;
+    const settleLeft = () => Math.max(1, settleBy - Date.now());
     // The new document: the mark is gone and the page has parsed.
-    while (Date.now() < deadline) {
-      const state = await readPage(
-        `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`,
-      ).catch(() => "old");
+    while (Date.now() < settleBy) {
+      const state = await orElse(
+        step(
+          "reading the new page",
+          () =>
+            readPage(
+              `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`,
+            ),
+          settleLeft(),
+        ),
+        "old",
+      );
       if (state === "interactive" || state === "complete") break;
       await idle(250);
     }
     // Its turns: the count holds for three reads in a row.
     let turns = -1;
     let steady = 0;
-    while (Date.now() < deadline && steady < 3) {
-      const count = await readPage(buildConversationTurnCountExpression()).catch(() => -1);
+    while (Date.now() < settleBy && steady < 3) {
+      const count = await orElse(
+        step(
+          "counting the turns",
+          () => readPage(buildConversationTurnCountExpression()),
+          settleLeft(),
+        ),
+        -1,
+      );
       const next = typeof count === "number" ? count : -1;
       steady = next > 0 && next === turns ? steady + 1 : 0;
       turns = next;
@@ -344,14 +418,37 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     );
   };
 
-  /** The reload, after any approval click in flight has finished (the gate). */
+  /**
+   * The reload, after any approval click in flight has finished (the gate). Waiting for the gate
+   * counts against the run's time too: when it is spent the reload is given up, and if its turn
+   * comes later it does nothing.
+   */
   const reloadInTurn = async (trigger: Trigger): Promise<void> => {
+    let abandoned = false;
+    const job = gate.exclusive(() =>
+      abandoned ? Promise.resolve() : reload(trigger, () => abandoned),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const runTime = Number.isFinite(deadline)
+      ? new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new RunTimeSpent("the reload")),
+            Math.max(0, deadline - Date.now()),
+          );
+        })
+      : null;
     try {
-      await gate.exclusive(() => reload(trigger));
+      await (runTime ? Promise.race([job, runTime]) : job);
     } catch (error) {
       logger(
-        `[browser] Conversation reload failed (${message(error)}); waiting on the page as it is.`,
+        endsReload(error)
+          ? "[browser] The run's time for the answer ran out during the conversation reload; the wait ends as it would at its timeout."
+          : `[browser] Conversation reload failed (${message(error)}); waiting on the page as it is.`,
       );
+    } finally {
+      abandoned = true;
+      if (timer) clearTimeout(timer);
+      job.catch(() => undefined);
     }
   };
 
@@ -363,9 +460,17 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       hidden = { app: surface.app, state: surface.state, at: Date.now() };
       void decide();
     },
-    async run<T>(operation: (attempt: TurnResyncAttempt) => Promise<T>): Promise<T> {
+    async run<T>(
+      operation: (attempt: TurnResyncAttempt) => Promise<T>,
+      runOptions: { timeoutMs?: number } = {},
+    ): Promise<T> {
       const startedAt = Date.now();
       progressed(startedAt);
+      const timeoutMs = runOptions.timeoutMs;
+      deadline =
+        typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+          ? startedAt + Math.max(0, timeoutMs)
+          : Number.POSITIVE_INFINITY;
       let stopped = false;
       const loop = (async () => {
         while (!stopped) {

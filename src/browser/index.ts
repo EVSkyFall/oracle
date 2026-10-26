@@ -2028,6 +2028,7 @@ async function runBrowserModeInternal(
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
       operation: (attempt: TurnResyncAttempt) => Promise<T>,
+      timeoutMs?: number,
     ): Promise<T> => {
       const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
       stopThinkingMonitor?.();
@@ -2036,7 +2037,7 @@ async function runBrowserModeInternal(
         progress: resync,
       });
       try {
-        return await watchAppApprovals(() => resync.run(operation), {
+        return await watchAppApprovals(() => resync.run(operation, { timeoutMs }), {
           onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
           gate: resync.gate,
         });
@@ -2100,28 +2101,30 @@ async function runBrowserModeInternal(
       let turnAnswer: AssistantAnswer;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor((attempt) =>
-          raceWithDisconnect(
-            waitForAssistantOrGeneratedImageResponse({
-              Runtime,
-              waitForText: () =>
-                waitForAssistantResponseWithReload(
-                  Runtime,
-                  Page,
-                  attempt.remainingMs(config.timeoutMs),
-                  logger,
-                  baselineTurns ?? undefined,
-                  expectedConversationId(),
-                  attempt.signal,
-                ),
-              timeoutMs: attempt.remainingMs(config.timeoutMs),
-              logger,
-              minTurnIndex: baselineTurns ?? undefined,
-              expectedConversationId: expectedConversationId(),
-              imageOutputRequested,
-              signal: attempt.signal,
-            }),
-          ),
+        turnAnswer = await waitWithThinkingMonitor(
+          (attempt) =>
+            raceWithDisconnect(
+              waitForAssistantOrGeneratedImageResponse({
+                Runtime,
+                waitForText: () =>
+                  waitForAssistantResponseWithReload(
+                    Runtime,
+                    Page,
+                    attempt.remainingMs(config.timeoutMs),
+                    logger,
+                    baselineTurns ?? undefined,
+                    expectedConversationId(),
+                    attempt.signal,
+                  ),
+                timeoutMs: attempt.remainingMs(config.timeoutMs),
+                logger,
+                minTurnIndex: baselineTurns ?? undefined,
+                expectedConversationId: expectedConversationId(),
+                imageOutputRequested,
+                signal: attempt.signal,
+              }),
+            ),
+          config.timeoutMs,
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
@@ -3668,6 +3671,7 @@ async function runRemoteBrowserMode(
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
       operation: (attempt: TurnResyncAttempt) => Promise<T>,
+      timeoutMs?: number,
     ): Promise<T> => {
       const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
       stopThinkingMonitor?.();
@@ -3676,7 +3680,7 @@ async function runRemoteBrowserMode(
         progress: resync,
       });
       try {
-        return await watchAppApprovals(() => resync.run(operation), {
+        return await watchAppApprovals(() => resync.run(operation, { timeoutMs }), {
           onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
           gate: resync.gate,
         });
@@ -3738,26 +3742,28 @@ async function runRemoteBrowserMode(
       let turnAnswer: AssistantAnswer;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor((attempt) =>
-          waitForAssistantOrGeneratedImageResponse({
-            Runtime,
-            waitForText: () =>
-              waitForAssistantResponseWithReload(
-                Runtime,
-                Page,
-                attempt.remainingMs(config.timeoutMs),
-                logger,
-                baselineTurns ?? undefined,
-                expectedConversationId(),
-                attempt.signal,
-              ),
-            timeoutMs: attempt.remainingMs(config.timeoutMs),
-            logger,
-            minTurnIndex: baselineTurns ?? undefined,
-            expectedConversationId: expectedConversationId(),
-            imageOutputRequested,
-            signal: attempt.signal,
-          }),
+        turnAnswer = await waitWithThinkingMonitor(
+          (attempt) =>
+            waitForAssistantOrGeneratedImageResponse({
+              Runtime,
+              waitForText: () =>
+                waitForAssistantResponseWithReload(
+                  Runtime,
+                  Page,
+                  attempt.remainingMs(config.timeoutMs),
+                  logger,
+                  baselineTurns ?? undefined,
+                  expectedConversationId(),
+                  attempt.signal,
+                ),
+              timeoutMs: attempt.remainingMs(config.timeoutMs),
+              logger,
+              minTurnIndex: baselineTurns ?? undefined,
+              expectedConversationId: expectedConversationId(),
+              imageOutputRequested,
+              signal: attempt.signal,
+            }),
+          config.timeoutMs,
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {

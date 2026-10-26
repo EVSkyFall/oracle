@@ -332,15 +332,17 @@ async function resumeBrowserSessionInternal(
             gate: resync.gate,
           },
           () =>
-            resync.run((attempt) =>
-              waitForResponse(
-                Runtime,
-                attempt.remainingMs(timeoutMs),
-                logger,
-                minTurnIndex ?? undefined,
-                undefined,
-                attempt.signal,
-              ),
+            resync.run(
+              (attempt) =>
+                waitForResponse(
+                  Runtime,
+                  attempt.remainingMs(timeoutMs),
+                  logger,
+                  minTurnIndex ?? undefined,
+                  undefined,
+                  attempt.signal,
+                ),
+              { timeoutMs },
             ),
         ),
       ),
@@ -631,15 +633,17 @@ async function resumeBrowserSessionViaNewChrome(
           gate: resync.gate,
         },
         () =>
-          resync.run((attempt) =>
-            waitForResponse(
-              Runtime,
-              attempt.remainingMs(timeoutMs),
-              logger,
-              minTurnIndex ?? undefined,
-              undefined,
-              attempt.signal,
-            ),
+          resync.run(
+            (attempt) =>
+              waitForResponse(
+                Runtime,
+                attempt.remainingMs(timeoutMs),
+                logger,
+                minTurnIndex ?? undefined,
+                undefined,
+                attempt.signal,
+              ),
+            { timeoutMs },
           ),
       ),
     );
