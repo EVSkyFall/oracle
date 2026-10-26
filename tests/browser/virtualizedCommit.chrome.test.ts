@@ -6,7 +6,9 @@ import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
 import { chatgptDomProvider } from "../../src/browser/providers/chatgptDomProvider.js";
 import { buildConversationTurnCountExpression } from "../../src/browser/conversationTurns.js";
-import { readUserMessageIds, waitForSentUserTurn } from "../../src/browser/promptFingerprint.js";
+import { readUserMessageIds } from "../../src/browser/promptFingerprint.js";
+import { waitAtSentTurn } from "../../src/browser/sentTurnScope.js";
+import { waitForAssistantResponse } from "../../src/browser/actions/assistantResponse.js";
 
 // Real-Chrome fixture of sends in a long conversation (2026-10-26: session
 // ask-20261026-152910-ixje, a --followup resume, and window-tall-build, in-run follow-up 4 of a
@@ -186,7 +188,7 @@ describe.runIf(enabled)(
 
     test("an exchange that mounts after the commit window: the answer wait finds the sent turn by id", async () => {
       await open({ ids: true, window: 4, initial: earlier(4), lateMs: 65_000 });
-      const { ctx, state, logger, previousUserMessageIds } = await send(PROMPT);
+      const { state, logger, previousUserMessageIds } = await send(PROMPT);
       // Unproven: no new turn by id within the window, and no older turn stands in for it.
       expect(state.commitUnproven).toBe(true);
       expect(state.unprovenCommitTurn).toBeNull();
@@ -194,13 +196,37 @@ describe.runIf(enabled)(
       expect(logger).toHaveBeenCalledWith(
         expect.stringMatching(/^\[browser\] Prompt commit not proven \(.*\); treating it as sent/),
       );
-      // The run's scope at the start of the answer wait (index.ts scopeAnswerToSentTurn).
-      const index = await waitForSentUserTurn(client.Runtime, previousUserMessageIds!, {
-        timeoutMs: 30_000,
-      });
-      expect(index).toBe(3);
-      state.baselineTurns = index;
-      expect(await answerOf(ctx)).toBe(answerTo(PROMPT));
+      // The run's answer-wait attempt (index.ts scopedToSentTurn): it starts at once at the old
+      // scope (4), and is restarted at the sent turn when the exchange mounts at 3.
+      const moves: number[] = [];
+      const scopes: number[] = [];
+      const answer = await waitAtSentTurn(
+        client.Runtime,
+        {
+          previousUserMessageIds: previousUserMessageIds!,
+          current: () => state.baselineTurns as number,
+          moveTo: (index) => {
+            moves.push(index);
+            state.baselineTurns = index;
+          },
+        },
+        { signal: new AbortController().signal, remainingMs: (total) => total },
+        60_000,
+        (inner) => {
+          scopes.push(state.baselineTurns as number);
+          return waitForAssistantResponse(
+            client.Runtime,
+            inner.remainingMs(60_000),
+            logger,
+            state.baselineTurns as number,
+            undefined,
+            inner.signal,
+          );
+        },
+      );
+      expect(scopes).toEqual([4, 3]);
+      expect(moves).toEqual([3]);
+      expect(answer.text.trim()).toBe(answerTo(PROMPT));
     }, 180_000);
 
     test("without ids, an unproven windowed send goes on but never lowers the scope onto an older turn", async () => {

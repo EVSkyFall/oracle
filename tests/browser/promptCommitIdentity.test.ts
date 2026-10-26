@@ -245,7 +245,7 @@ describe("the run decides by id on every send, local and remote, initial and in-
     expect(count("providerState.previousUserMessageIds = previousUserMessageIds;")).toBe(2);
     // Each answer wait attempt, the recheck included, starts at the sent turn found by id.
     expect(count("resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs })")).toBe(2);
-    expect(count("await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());")).toBe(2);
+    expect(count("await scopeAnswerToSentTurn();")).toBe(2);
     // Initial sends and in-run follow-ups (local and remote) record their scope and prompt index.
     expect(count("sentTurnUserIds = submission.presendUserTurnIds ?? null;")).toBe(4);
     expect(count("pendingPromptIndex = 0;") - count("let pendingPromptIndex = 0;")).toBe(2);

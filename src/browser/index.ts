@@ -2,9 +2,9 @@ import {
   fingerprintOfUserTurn,
   readSubmittedPromptFingerprint,
   readUserMessageIds,
-  waitForSentUserTurn,
   type PageUserTurn,
 } from "./promptFingerprint.js";
+import { scopeToSentTurnNow, waitAtSentTurn, type SentTurnScope } from "./sentTurnScope.js";
 import {
   createAttemptAssistantRecheck,
   createBlockingUiWarningCheck,
@@ -1989,25 +1989,30 @@ async function runBrowserModeInternal(
     let deepResearchTargetBaselineCaptured = false;
     let sentTurnUserIds: readonly string[] | null = null;
     let imageArtifactMinTurnIndex: number | null = null;
-    // The answer follows the user turn this run sent, found by its identity at every attempt: it
-    // can mount after the commit window, and a reload renders a different window of turns.
-    const scopeAnswerToSentTurn = async (signal?: AbortSignal, timeoutMs?: number) => {
-      if (!sentTurnUserIds) return;
-      const index = await waitForSentUserTurn(Runtime, sentTurnUserIds, { signal, timeoutMs });
-      if (index === null || index === baselineTurns) return;
-      logger(`[browser] The sent turn is at turn ${index}; waiting for its answer after it.`);
-      baselineTurns = index;
-      if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+    // The answer follows the user turn this run sent, found by its identity (sentTurnScope.ts):
+    // each attempt starts there, and a turn that mounts late restarts the wait there.
+    const sentTurnScope = (): SentTurnScope | null =>
+      sentTurnUserIds
+        ? {
+            previousUserMessageIds: sentTurnUserIds,
+            current: () => baselineTurns,
+            moveTo: (index) => {
+              logger(
+                `[browser] The sent turn is at turn ${index}; waiting for its answer after it.`,
+              );
+              baselineTurns = index;
+              if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+            },
+          }
+        : null;
+    const scopeAnswerToSentTurn = async () => {
+      const scope = sentTurnScope();
+      if (scope) await scopeToSentTurnNow(Runtime, scope).catch(() => false);
     };
     const scopedToSentTurn =
       <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
-      async (attempt: TurnResyncAttempt): Promise<T> => {
-        await scopeAnswerToSentTurn(
-          attempt.signal,
-          attempt.remainingMs(timeoutMs ?? config.timeoutMs),
-        );
-        return operation(attempt);
-      };
+      (attempt: TurnResyncAttempt): Promise<T> =>
+        waitAtSentTurn(Runtime, sentTurnScope(), attempt, timeoutMs ?? config.timeoutMs, operation);
     await acquireProfileLockIfNeeded();
     try {
       pendingPromptIndex = 0;
@@ -2035,7 +2040,7 @@ async function runBrowserModeInternal(
     imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
-      await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());
+      await scopeAnswerToSentTurn();
       // No call of the plan wait outlives its own time (deepResearchWait.ts).
       const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
       runClient?.setDeadline(planWaitUntil);
@@ -3770,25 +3775,30 @@ async function runRemoteBrowserMode(
     let deepResearchTargetBaselineCaptured = false;
     let sentTurnUserIds: readonly string[] | null = null;
     let imageArtifactMinTurnIndex: number | null = null;
-    // The answer follows the user turn this run sent, found by its identity at every attempt: it
-    // can mount after the commit window, and a reload renders a different window of turns.
-    const scopeAnswerToSentTurn = async (signal?: AbortSignal, timeoutMs?: number) => {
-      if (!sentTurnUserIds) return;
-      const index = await waitForSentUserTurn(Runtime, sentTurnUserIds, { signal, timeoutMs });
-      if (index === null || index === baselineTurns) return;
-      logger(`[browser] The sent turn is at turn ${index}; waiting for its answer after it.`);
-      baselineTurns = index;
-      if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+    // The answer follows the user turn this run sent, found by its identity (sentTurnScope.ts):
+    // each attempt starts there, and a turn that mounts late restarts the wait there.
+    const sentTurnScope = (): SentTurnScope | null =>
+      sentTurnUserIds
+        ? {
+            previousUserMessageIds: sentTurnUserIds,
+            current: () => baselineTurns,
+            moveTo: (index) => {
+              logger(
+                `[browser] The sent turn is at turn ${index}; waiting for its answer after it.`,
+              );
+              baselineTurns = index;
+              if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+            },
+          }
+        : null;
+    const scopeAnswerToSentTurn = async () => {
+      const scope = sentTurnScope();
+      if (scope) await scopeToSentTurnNow(Runtime, scope).catch(() => false);
     };
     const scopedToSentTurn =
       <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
-      async (attempt: TurnResyncAttempt): Promise<T> => {
-        await scopeAnswerToSentTurn(
-          attempt.signal,
-          attempt.remainingMs(timeoutMs ?? config.timeoutMs),
-        );
-        return operation(attempt);
-      };
+      (attempt: TurnResyncAttempt): Promise<T> =>
+        waitAtSentTurn(Runtime, sentTurnScope(), attempt, timeoutMs ?? config.timeoutMs, operation);
     pendingPromptIndex = 0;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
@@ -3810,7 +3820,7 @@ async function runRemoteBrowserMode(
     imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
-      await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());
+      await scopeAnswerToSentTurn();
       // No call of the plan wait outlives its own time (deepResearchWait.ts).
       const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
       runClient?.setDeadline(planWaitUntil);
