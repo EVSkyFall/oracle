@@ -130,7 +130,10 @@ describe("Deep Research waits on a page that stops answering", () => {
     const runClient = createRunClient(tabA as unknown as ChromeClient);
     const { Runtime, Page, Input } = runClient.client;
     const logger = quietLogger();
-    const calls: Array<{ target: string; options: unknown }> = [];
+    const calls: Array<{ target: string; options: unknown; minTurnIndex: unknown }> = [];
+    // The sent turn as each attempt finds it: index 2 on the first tab, 1 in the new tab's window.
+    const sentTurnIndexes = [2, 1];
+    const resolveMinTurnIndex = vi.fn(async () => sentTurnIndexes.shift());
     const box = track(
       waitForDeepResearchWithRecovery({
         Runtime,
@@ -153,12 +156,15 @@ describe("Deep Research waits on a page that stops answering", () => {
             moved: () => {},
           }),
         timeoutMs: 30 * 60_000,
-        minTurnIndex: 1,
+        // The scope the run had before the plan wait; the recovery must not reuse it.
+        minTurnIndex: 3,
+        resolveMinTurnIndex,
         options: { ignoredTargetKeys: ["old"], targetBaselineCaptured: true },
         wait: (runtime, waitLogger, timeoutMs, minTurnIndex, page, client, options) => {
           calls.push({
             target: runClient.current() === (tabB as unknown) ? "B" : "A",
             options,
+            minTurnIndex,
           });
           return waitForDeepResearchCompletion(
             runtime,
@@ -185,6 +191,9 @@ describe("Deep Research waits on a page that stops answering", () => {
     expect(box.state).toBe("resolved");
     expect(box.value?.text).toBe(report);
     expect(calls.map((call) => call.target)).toEqual(["A", "B"]);
+    // Each attempt, the recovery included, starts at the sent turn as that page renders it.
+    expect(resolveMinTurnIndex).toHaveBeenCalledTimes(2);
+    expect(calls.map((call) => call.minTurnIndex)).toEqual([2, 1]);
     expect(calls[0]!.options).toMatchObject({ targetBaselineCaptured: true });
     expect(calls[0]!.options).not.toHaveProperty("requireScopedTargetOwner");
     // After the move the target baseline no longer holds: the report must belong to this prompt.
@@ -244,6 +253,36 @@ describe("Deep Research waits on a page that stops answering", () => {
     expect(box.error).toMatchObject({ details: { code: "deep-research-timeout" } });
   });
 
+  test("a sent-turn read that fails or finds nothing leaves the attempt at the run's scope", async () => {
+    const raw = {
+      Runtime: { evaluate: vi.fn(async () => ({ result: { value: null } })) },
+      Page: { reload: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+    } as unknown as ChromeClient;
+    const runClient = createRunClient(raw);
+    const seen: unknown[] = [];
+    const run = (resolveMinTurnIndex: () => Promise<number | null | undefined>) =>
+      waitForDeepResearchWithRecovery({
+        Runtime: runClient.client.Runtime,
+        Page: runClient.client.Page,
+        client: runClient.client,
+        logger: quietLogger(),
+        conversationUrl: () => CONVERSATION,
+        timeoutMs: 60_000,
+        minTurnIndex: 3,
+        resolveMinTurnIndex,
+        watch: (operation) => operation(),
+        wait: async (_runtime, _logger, _timeoutMs, minTurnIndex) => {
+          seen.push(minTurnIndex);
+          return { text: "report" } as never;
+        },
+      });
+    await run(async () => {
+      throw new Error("page gone");
+    });
+    await run(async () => null);
+    expect(seen).toEqual([3, 3]);
+  });
+
   test("every Deep Research wait of the runs and both reattach paths goes through the recovery", async () => {
     const { readFile } = await import("node:fs/promises");
     const index = await readFile(new URL("../../src/browser/index.ts", import.meta.url), "utf8");
@@ -259,6 +298,12 @@ describe("Deep Research waits on a page that stops answering", () => {
       for (const block of source.split("waitForDeepResearchWithRecovery({").slice(1)) {
         expect(block.slice(0, block.indexOf("}),"))).toContain("replaceTab: replaceFrozenTab");
       }
+    }
+    // The runs' waits find the sent turn again for every attempt, recovery included.
+    for (const block of index.split("waitForDeepResearchWithRecovery({").slice(1)) {
+      expect(block.slice(0, block.indexOf("watch:"))).toMatch(
+        /resolveMinTurnIndex: async \(\) => \{\s*await scopeAnswerToSentTurn\(\);\s*return baselineTurns;\s*\},/,
+      );
     }
   });
 });

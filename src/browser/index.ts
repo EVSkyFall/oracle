@@ -2089,6 +2089,10 @@ async function runBrowserModeInternal(
           replaceTab: replaceFrozenTab,
           timeoutMs: config.timeoutMs,
           minTurnIndex: baselineTurns,
+          resolveMinTurnIndex: async () => {
+            await scopeAnswerToSentTurn();
+            return baselineTurns;
+          },
           options: {
             ignoredTargetKeys: deepResearchTargetKeys,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
@@ -3874,6 +3878,10 @@ async function runRemoteBrowserMode(
         replaceTab: replaceFrozenTab,
         timeoutMs: config.timeoutMs,
         minTurnIndex: baselineTurns,
+        resolveMinTurnIndex: async () => {
+          await scopeAnswerToSentTurn();
+          return baselineTurns;
+        },
         options: {
           ignoredTargetKeys: deepResearchTargetKeys,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,

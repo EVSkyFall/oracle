@@ -25,7 +25,9 @@ export function deepResearchPlanWaitBoundMs(
  * quiet for many minutes, so a quiet thread or a hidden prompt never reloads it). After a
  * recovery the wait starts again scoped like a reattach: a report frame counts only when it
  * belongs to a turn of this prompt, since the target baseline taken before the submission does
- * not survive a reload. Never resubmits or types.
+ * not survive a reload. Each attempt, recovery included, starts at the sent turn as the page
+ * renders it then (resolveMinTurnIndex): a reload or a new tab can render another window of turns.
+ * Never resubmits or types.
  */
 export function waitForDeepResearchWithRecovery(params: {
   Runtime: ChromeClient["Runtime"];
@@ -37,6 +39,8 @@ export function waitForDeepResearchWithRecovery(params: {
   replaceTab?: TurnResyncOptions["replaceTab"];
   timeoutMs: number;
   minTurnIndex?: number | null;
+  /** Resolved again for every attempt; minTurnIndex when it is not given or fails. */
+  resolveMinTurnIndex?: () => Promise<number | null | undefined>;
   options?: Omit<DeepResearchOptions, "signal">;
   /** Runs the wait with the approval monitor, which shares the page with the recovery. */
   watch: <T>(
@@ -59,13 +63,16 @@ export function waitForDeepResearchWithRecovery(params: {
   return params.watch(
     () =>
       resync.run(
-        (attempt) => {
+        async (attempt) => {
           attempts += 1;
+          const minTurnIndex = params.resolveMinTurnIndex
+            ? await params.resolveMinTurnIndex().catch(() => params.minTurnIndex)
+            : params.minTurnIndex;
           return wait(
             params.Runtime,
             params.logger,
             attempt.remainingMs(params.timeoutMs),
-            params.minTurnIndex,
+            minTurnIndex ?? params.minTurnIndex,
             params.Page,
             params.client,
             {

@@ -322,7 +322,8 @@ describe("the run decides by id on every send, local and remote, initial and in-
     expect(count("providerState.previousUserMessageIds = previousUserMessageIds;")).toBe(2);
     // Each answer wait attempt, the recheck included, starts at the sent turn found by id.
     expect(count("resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs })")).toBe(2);
-    expect(count("await scopeAnswerToSentTurn();")).toBe(2);
+    // Before the Deep Research plan wait, and for every Deep Research wait attempt.
+    expect(count("await scopeAnswerToSentTurn();")).toBe(4);
     // The sent turn's record: the pre-send ids, its id once the commit check found it, the prompt.
     expect(
       count("? { previousUserMessageIds, messageId: sentUserTurn?.messageId ?? null, prompt }"),
