@@ -1409,6 +1409,9 @@ export function startAppApprovalMonitor(
             );
           }
           silent = true;
+        } else if (silent) {
+          // The page still does not answer, or its tab was replaced and closed under the probe;
+          // the page is checked again without a report.
         } else if (!(error instanceof ApprovalCheckAbandoned)) {
           const message = error instanceof Error ? error.message : String(error);
           if (!reportedErrors.has(message)) {

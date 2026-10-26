@@ -476,3 +476,49 @@ describe("a page that stops answering while the answer is awaited", () => {
     }
   });
 });
+
+describe("an approval check waiting for a frozen page", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("a probe that fails because the frozen tab was closed under it is not reported as a failed check", async () => {
+    // The page stops answering; then its tab is replaced and closed, so the probe still waiting
+    // on it fails; the replacement tab answers.
+    let state: "frozen" | "closed" | "answers" = "frozen";
+    const pending: Array<(error: Error) => void> = [];
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (state === "frozen") {
+        return new Promise((_, reject) => {
+          pending.push(reject);
+        });
+      }
+      if (expression.includes("window.__oracleApprovalButtons = {")) {
+        return { result: { value: { cards: [], skipped: [], hidden: [] } } };
+      }
+      return { result: { value: 1 } };
+    });
+    const logger = quietLogger();
+    const stop = startAppApprovalMonitor(
+      { evaluate } as unknown as ChromeClient["Runtime"],
+      undefined,
+      { allowApps: ["CODEXish"], logger, frozenMs: 10_000 },
+    );
+    // The check is given up after 10 s; the probe that follows waits on the frozen page.
+    await vi.advanceTimersByTimeAsync(15_000);
+    state = "closed";
+    for (const reject of pending.splice(0)) reject(new Error("WebSocket connection closed"));
+    state = "answers";
+    await vi.advanceTimersByTimeAsync(5_000);
+    const stopped = track(stop());
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stopped.state).toBe("resolved");
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    expect(lines.filter((line) => line.includes("got no answer from the page"))).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("App approval check failed"))).toEqual([]);
+    expect(lines).toContain("[browser] App approval check: the page answers again.");
+  });
+});
