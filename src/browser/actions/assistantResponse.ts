@@ -777,14 +777,26 @@ async function refreshAssistantSnapshot(
   return null;
 }
 
+// Stopping the page's leftover observer is cleanup: a frozen page may never answer it.
+const TERMINATE_CLEANUP_WAIT_MS = 1_000;
+
 async function terminateRuntimeExecution(Runtime: ChromeClient["Runtime"]): Promise<void> {
   if (typeof Runtime.terminateExecution !== "function") {
     return;
   }
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Runtime.terminateExecution();
-  } catch {
-    // ignore termination failures
+    await Promise.race([
+      Promise.resolve()
+        .then(() => Runtime.terminateExecution())
+        .catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, TERMINATE_CLEANUP_WAIT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

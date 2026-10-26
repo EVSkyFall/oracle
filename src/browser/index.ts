@@ -68,6 +68,7 @@ import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { createTurnResync, type TurnResyncAttempt } from "./turnResync.js";
+import { createRunClient, type RunClient } from "./runClient.js";
 import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
@@ -1171,6 +1172,8 @@ async function runBrowserModeInternal(
   }
 
   let client: ChromeClient | null = null;
+  // The run's client: its calls are bounded by the wait's time, and it can move to a new tab.
+  let runClient: RunClient | null = null;
   let isolatedTargetId: string | null = null;
   let ownsTarget = true;
   const startedAt = Date.now();
@@ -1252,6 +1255,10 @@ async function runBrowserModeInternal(
         logger(hint);
       }
       throw error;
+    }
+    if (client) {
+      runClient = createRunClient(client);
+      client = runClient.client;
     }
     const disconnectPromise = new Promise<never>((_, reject) => {
       client?.on("disconnect", () => {
@@ -2030,7 +2037,13 @@ async function runBrowserModeInternal(
       operation: (attempt: TurnResyncAttempt) => Promise<T>,
       timeoutMs?: number,
     ): Promise<T> => {
-      const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
+      const resync = createTurnResync({
+        Runtime,
+        Page,
+        logger,
+        conversationUrl: () => lastUrl,
+        timeLimit: runClient ?? undefined,
+      });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,
@@ -3031,6 +3044,8 @@ async function runRemoteBrowserMode(
   logger(`Connecting to remote Chrome at ${host}:${port}`);
 
   let client: ChromeClient | null = null;
+  // The run's client: its calls are bounded by the wait's time, and it can move to a new tab.
+  let runClient: RunClient | null = null;
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
@@ -3181,6 +3196,10 @@ async function runRemoteBrowserMode(
           claimId: targetClaimId,
         };
       }
+    }
+    if (client) {
+      runClient = createRunClient(client);
+      client = runClient.client;
     }
     if (tabLease && remoteTargetId) {
       await tabLease.update({
@@ -3673,7 +3692,13 @@ async function runRemoteBrowserMode(
       operation: (attempt: TurnResyncAttempt) => Promise<T>,
       timeoutMs?: number,
     ): Promise<T> => {
-      const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
+      const resync = createTurnResync({
+        Runtime,
+        Page,
+        logger,
+        conversationUrl: () => lastUrl,
+        timeLimit: runClient ?? undefined,
+      });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,

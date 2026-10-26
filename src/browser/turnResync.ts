@@ -126,6 +126,11 @@ export interface TurnResyncOptions {
   pollMs?: number;
   hiddenQuietMs?: number;
   settleMs?: number;
+  /**
+   * The run's CDP client (runClient.ts): while the wait runs, its calls are raced against the
+   * time left, so no call holds the run past it; cleared when the answer is in.
+   */
+  timeLimit?: { setDeadline(at: number | null): void };
 }
 
 export interface TurnResync {
@@ -133,6 +138,8 @@ export interface TurnResync {
   gate: PageGate;
   /** When the thread last changed (also the heartbeat's "last change"). */
   lastChangedAt(): number;
+  /** When the run's time for this wait is spent (Infinity until run starts or with no limit). */
+  deadlineAt(): number;
   /** The approval monitor found an allowed app's pending prompt hidden in the page. */
   reportHiddenApproval(surface: { app: string; state: string }): void;
   /**
@@ -455,6 +462,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   const resync: TurnResync = {
     gate,
     lastChangedAt: () => lastChangeAt,
+    deadlineAt: () => deadline,
     reportHiddenApproval(surface) {
       if (reloading) return;
       hidden = { app: surface.app, state: surface.state, at: Date.now() };
@@ -471,6 +479,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
           ? startedAt + Math.max(0, timeoutMs)
           : Number.POSITIVE_INFINITY;
+      options.timeLimit?.setDeadline(Number.isFinite(deadline) ? deadline : null);
       let stopped = false;
       const loop = (async () => {
         while (!stopped) {
@@ -499,7 +508,11 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
             next.then((trigger) => ({ kind: "resync" as const, trigger })),
           ]);
           waiter = null;
-          if (outcome.kind === "done") return outcome.value;
+          if (outcome.kind === "done") {
+            // The answer is in: what follows (its markdown, artifacts) is not bound by the wait.
+            options.timeLimit?.setDeadline(null);
+            return outcome.value;
+          }
           if (outcome.kind === "failed") throw outcome.error;
           controller.abort();
           pending.catch(() => undefined);

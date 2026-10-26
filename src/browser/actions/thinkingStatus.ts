@@ -49,8 +49,16 @@ export function startThinkingStatusMonitor(
       return;
     }
     pending = true;
+    let readTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const snapshot = await readThinkingStatus(Runtime);
+      // A page that does not answer (a frozen renderer) skips beats instead of ending them.
+      const snapshot = await Promise.race([
+        readThinkingStatus(Runtime),
+        new Promise<never>((_, reject) => {
+          readTimer = setTimeout(() => reject(new Error("no answer")), intervalMs);
+          readTimer.unref?.();
+        }),
+      ]);
       if (stopped) {
         return;
       }
@@ -72,6 +80,7 @@ export function startThinkingStatusMonitor(
     } catch {
       // ignore DOM polling errors
     } finally {
+      if (readTimer) clearTimeout(readTimer);
       pending = false;
     }
   }, intervalMs);

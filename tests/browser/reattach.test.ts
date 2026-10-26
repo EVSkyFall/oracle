@@ -591,7 +591,7 @@ describe("resumeBrowserSession", () => {
 
     expect(result.answerMarkdown).toBe("Deep report body");
     expect(waitForDeepResearchCompletion).toHaveBeenCalledWith(
-      expect.objectContaining({ evaluate }),
+      expect.anything(),
       logger,
       2000,
       1,
@@ -601,6 +601,13 @@ describe("resumeBrowserSession", () => {
         requireScopedTargetOwner: true,
       },
     );
+    // The Runtime it gets is the run's (bounded, movable) client: it acts on the connected tab.
+    const passed = (waitForDeepResearchCompletion.mock.calls[0] as unknown[])[0] as {
+      evaluate: (params: unknown) => Promise<unknown>;
+    };
+    evaluate.mockClear();
+    await passed.evaluate({ expression: "1+1", returnByValue: true });
+    expect(evaluate).toHaveBeenCalledWith({ expression: "1+1", returnByValue: true });
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();
   });

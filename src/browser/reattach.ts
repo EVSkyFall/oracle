@@ -50,6 +50,7 @@ import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
 import { createTurnResync } from "./turnResync.js";
+import { createRunClient } from "./runClient.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
@@ -188,7 +189,8 @@ async function resumeBrowserSessionInternal(
     );
     closeAttachedConnection = () => connection.close();
 
-    const client = cancellation.client(connection.client);
+    const runClient = createRunClient(cancellation.client(connection.client));
+    const client = runClient.client;
     const { Runtime, DOM, Page } = client;
     const captureIdentity = async (): Promise<BrowserRecoveryCapture | undefined> => {
       const targetId = target?.targetId ?? target?.id;
@@ -320,6 +322,7 @@ async function resumeBrowserSessionInternal(
       Page,
       logger,
       conversationUrl: () => expectedConversationUrl,
+      timeLimit: runClient,
     });
     const answer = await withTimeout(
       cancellation.call(() =>
@@ -501,7 +504,8 @@ async function resumeBrowserSessionViaNewChrome(
       await cleanupProfile();
     }
   };
-  const client = cancellation.client(rawClient);
+  const runClient = createRunClient(cancellation.client(rawClient));
+  const client = runClient.client;
   const { Network, Page, Runtime, DOM, Target } = client;
   try {
     if (Runtime?.enable) {
@@ -622,6 +626,7 @@ async function resumeBrowserSessionViaNewChrome(
       Page,
       logger,
       conversationUrl: () => conversationUrl,
+      timeLimit: runClient,
     });
     const answer = await cancellation.call(() =>
       withAppApprovalMonitor(
