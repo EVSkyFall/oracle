@@ -682,7 +682,7 @@ describe("ensureChatMode", () => {
     expect(logger).toHaveBeenCalledWith("ChatGPT conversation mode unresolved; opening a new Chat");
   });
 
-  test("fails closed after persistent ambiguity on an explicit resume", async () => {
+  test("resumes after persistent ambiguity on an explicit resume, logging it", async () => {
     const runtime = {
       evaluate: vi
         .fn()
@@ -690,10 +690,13 @@ describe("ensureChatMode", () => {
     } as unknown as ChromeClient["Runtime"];
     const input = { dispatchMouseEvent: vi.fn() } as unknown as ChromeClient["Input"];
 
-    await expect(ensureChatMode(runtime, input, 0, logger, { pollMs: 0 })).rejects.toThrow(
-      /cannot safely resume/i,
+    await expect(ensureChatMode(runtime, input, 0, logger, { pollMs: 0 })).resolves.toBe(
+      "unavailable",
     );
     expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringContaining("ChatGPT conversation mode could not be read"),
+    );
   });
 
   test("aggregates responsive duplicates for the exact conversation id", () => {

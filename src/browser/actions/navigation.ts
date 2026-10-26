@@ -311,10 +311,13 @@ export async function ensureChatMode(
         await delay(pollMs);
         continue;
       }
-      throw new BrowserAutomationError(
-        "Oracle could not verify whether the selected ChatGPT conversation uses Chat or Work mode, so it cannot safely resume that conversation.",
-        { stage: "chat-mode-selection", details: { mode: "conversation-unresolved" } },
+      // The mode is read from the conversation's sidebar row, which disappears once newer chats
+      // push it out of the loaded history. An explicit resume continues the conversation it was
+      // asked to; refusing here only loses the turn.
+      logger(
+        "ChatGPT conversation mode could not be read (the conversation is not in the visible sidebar history); resuming it as requested",
       );
+      return "unavailable";
     }
     if (probe?.status === "controls-absent") {
       if (changedFromWork) {
