@@ -98,7 +98,8 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   setOracleHomeDirOverrideForTest(null);
-  await fs.rm(root, { recursive: true, force: true });
+  // Windows: session files can still be pending deletion under load (ENOTEMPTY seen).
+  await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("derives the exact owned recovery capture from runtime metadata", () => {

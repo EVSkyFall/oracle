@@ -33,7 +33,8 @@ describe("harvest capture identity", () => {
   });
   afterEach(async () => {
     setOracleHomeDirOverrideForTest(null);
-    await fs.rm(home, { recursive: true, force: true });
+    // Windows: session files can still be pending deletion under load (as in recoveryTarget.test.ts).
+    await fs.rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   async function seed(recordedId: string, transcriptId = recordedId) {
