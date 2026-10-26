@@ -36,6 +36,11 @@ const ACTIVITY_ROW = `<div class="activity-row">Searching for "Connection interr
 // Round 8c (Astra r16): ChatGPT's activity captions are nested spans next to a disclosure.
 const NESTED_ROW = `<div class="activity-row">Searching for "<span>Connection interrupted</span>"</div>`;
 const DISCLOSURE = `<button type="button" aria-expanded="false"><span>Connection interrupted</span></button>`;
+// Round 8d (Astra r17): the caption and its disclosure button are siblings in one row, as in
+// tests/fixtures/chatgpt-dom-2026-09/streaming.html.
+const DISCLOSURE_BUTTON = `<button type="button" aria-expanded="false"><span>Show more</span></button>`;
+const NESTED_ROW_WITH_DISCLOSURE = `<div class="activity-row">Searching for "<span>Connection interrupted</span>"${DISCLOSURE_BUTTON}</div>`;
+const FLEX_ROW_WITH_DISCLOSURE = `<div style="display:flex;gap:4px"><span>Searching for</span><span>Connection interrupted</span>${DISCLOSURE_BUTTON}</div>`;
 const APPROVAL_CARD = `<div class="rounded-3xl border" data-codex-approval-surface="true"><div role="alert"><div>Connection interrupted</div><div>Allow ChatGPT to use CODEXish?</div></div><form><button type="button">Allow once</button></form></div>`;
 
 type Story = "banner-then-cleared" | "quoted" | "decoys" | "inside-markdown";
@@ -81,7 +86,7 @@ ${decoys ? SIDEBAR_TITLE : ""}
   <div data-testid="conversation-turn-1"><div data-message-author-role="user"><div>Earlier question</div></div></div>
   <div data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="m2"><div class="markdown"><p>Earlier answer that is never the answer.</p></div></div>${ACTIONS}${decoys ? BANNER : ""}</div>
   <div data-testid="conversation-turn-3">${userTurn}</div>
-  <div data-testid="conversation-turn-4" id="turn">${decoys ? ACTIVITY_ROW + NESTED_ROW + DISCLOSURE : ""}<div data-message-author-role="assistant" data-message-id="m4"><div class="markdown">${answer}</div></div>${finished ? ACTIONS : ""}${decoys ? APPROVAL_CARD : ""}</div>
+  <div data-testid="conversation-turn-4" id="turn">${decoys ? ACTIVITY_ROW + NESTED_ROW + NESTED_ROW_WITH_DISCLOSURE + FLEX_ROW_WITH_DISCLOSURE + DISCLOSURE : ""}<div data-message-author-role="assistant" data-message-id="m4"><div class="markdown">${answer}</div></div>${finished ? ACTIONS : ""}${decoys ? APPROVAL_CARD : ""}</div>
   ${story === "banner-then-cleared" && load === 1 ? BANNER : ""}
   ${story === "quoted" ? `<div class="sr-only" aria-live="polite">${BANNER_TEXT}</div>` : ""}
 </main>
@@ -155,6 +160,49 @@ const PLACEMENTS: Array<[string, string, boolean]> = [
   ["a sidebar inside the thread area", thread(`<aside><div>${BANNER_TEXT}</div></aside>`), false],
   ["an activity row that quotes it", thread(ACTIVITY_ROW), false],
   ["an activity row with the words in a nested span", thread(NESTED_ROW), false],
+  ["the nested activity row with its disclosure button", thread(NESTED_ROW_WITH_DISCLOSURE), false],
+  [
+    "the nested caption next to its disclosure button",
+    thread(
+      `<div class="activity-row"><div class="caption">Searching for "<span>Connection interrupted</span>"</div>${DISCLOSURE_BUTTON}</div>`,
+    ),
+    false,
+  ],
+  ["the flex row of spans with its disclosure button", thread(FLEX_ROW_WITH_DISCLOSURE), false],
+  [
+    "a caption that opens with the words, next to its disclosure button",
+    thread(
+      `<div class="activity-row"><span>Connection interrupted</span>${DISCLOSURE_BUTTON}</div>`,
+    ),
+    false,
+  ],
+  [
+    "the banner in a status row with a plain Retry button (a guess at the real banner)",
+    thread(
+      '<div role="status"><span>Connection interrupted.</span> <span>Waiting for the complete answer</span><button type="button">Retry</button></div>',
+    ),
+    true,
+  ],
+  [
+    "the banner without a status role, with a plain Retry button (a guess)",
+    thread(
+      '<div class="banner"><span>Connection interrupted.</span> <span>Waiting for the complete answer</span><button type="button">Retry</button></div>',
+    ),
+    true,
+  ],
+  [
+    "the banner above the composer, next to its model picker (a guess)",
+    thread(
+      `<form><div class="banner">${BANNER_TEXT}</div><div contenteditable="true" role="textbox"></div><button type="button" aria-expanded="false" data-composer-navigation-target="reasoning">Pro</button></form>`,
+    ),
+    true,
+  ],
+  [
+    "a thread marked only as the app shell's main area",
+    `<div data-app-shell-focus-area="main">${USER_TURN}${BANNER}</div>`,
+    true,
+  ],
+  ["a page with no thread marker (the body is read)", `<div>${USER_TURN}${BANNER}</div>`, true],
   [
     "a quoted caption with the words in a nested span",
     thread('<div class="caption">“<span>Connection interrupted</span>”</div>'),

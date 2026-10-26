@@ -102,7 +102,7 @@ export function createInterruptedBannerTracker(): InterruptedBannerTracker {
 
 /** Where on the page the banner may count, as selectors (see readInterruptedBanner). */
 export interface InterruptedBannerSurfaces {
-  /** The conversation thread. */
+  /** The conversation thread (the page's body when none of these is there). */
   thread: string;
   /** User turns: the banner belongs below the latest one. */
   user: string;
@@ -110,6 +110,15 @@ export interface InterruptedBannerSurfaces {
   body: string;
   /** Never the banner: those, editors, and surfaces whose text stays across reloads. */
   excluded: string;
+  /**
+   * A banner's row never holds these: disclosure controls, activity and reasoning surfaces,
+   * approval cards, dialogs and page chrome.
+   */
+  disqualifying: string;
+  /** Editors; a form that holds one is the composer. */
+  editable: string;
+  /** The composer: its own controls (model picker, attachments) are not disclosures of a row. */
+  composer: string;
 }
 
 const MESSAGE_BODY_SELECTOR = [
@@ -123,8 +132,19 @@ const MESSAGE_BODY_SELECTOR = [
   "blockquote",
 ].join(", ");
 
+const DISQUALIFYING_SELECTOR = [
+  "[aria-expanded]",
+  "details",
+  "summary",
+  PANEL_SELECTOR,
+  APPROVAL_CARD_SELECTOR,
+  DIALOG_SELECTOR,
+  PAGE_CHROME_SELECTOR,
+  '[role="navigation"]',
+].join(", ");
+
 export const INTERRUPTED_BANNER_SURFACES: InterruptedBannerSurfaces = {
-  thread: "main",
+  thread: 'main, [role="main"], [data-app-shell-focus-area="main"]',
   user: `${USER_TURN_SELECTOR}, ${USER_MESSAGE_SELECTOR}`,
   body: MESSAGE_BODY_SELECTOR,
   excluded: [
@@ -145,6 +165,10 @@ export const INTERRUPTED_BANNER_SURFACES: InterruptedBannerSurfaces = {
     "noscript",
     "template",
   ].join(", "),
+  disqualifying: DISQUALIFYING_SELECTOR,
+  editable: EDITABLE_SELECTOR,
+  composer:
+    '[data-testid*="composer" i], [data-composer-overlay-floating-ui], [data-composer-navigation-target]',
 };
 
 /**
@@ -181,7 +205,7 @@ export function readInterruptedBanner(
       check.call(node, { visibilityProperty: true, opacityProperty: true })
     );
   };
-  const root = doc.querySelector(surfaces.thread);
+  const root = doc.querySelector(surfaces.thread) ?? doc.body;
   if (!root || typeof doc.createTreeWalker !== "function") return null;
   const users = root.querySelectorAll(surfaces.user);
   const latestUser = users.length > 0 ? users[users.length - 1]! : null;
@@ -206,6 +230,27 @@ export function readInterruptedBanner(
     !node.contains(latestUser) &&
     !node.querySelector(surfaces.excluded);
   const REGION = '[role="status"], [role="alert"], [aria-live]';
+  const composerControl = (node: Element) =>
+    Boolean(node.closest(surfaces.composer)) ||
+    Boolean(node.closest("form")?.querySelector(surfaces.editable));
+  // A banner's row holds no disclosure control, activity or reasoning surface, approval card or
+  // dialog (the composer's own controls do not count): an activity caption with its disclosure
+  // button is never the banner. A plain button (Retry) is fine.
+  const disqualified = (node: Element) =>
+    Array.from(node.querySelectorAll(surfaces.disqualifying)).some(
+      (found) => !composerControl(found),
+    );
+  // Its text without what a user or the model wrote, editors and disclosures.
+  const ownText = (node: Element) => {
+    let out = "";
+    const inner = doc.createTreeWalker(node, 4);
+    for (let part = inner.nextNode(); part; part = inner.nextNode()) {
+      const skipped = part.parentElement?.closest(surfaces.excluded);
+      if (skipped && node.contains(skipped)) continue;
+      out += String((part as Text).data ?? "");
+    }
+    return fold(out);
+  };
   // 4: NodeFilter.SHOW_TEXT
   const walker = doc.createTreeWalker(root, 4);
   for (let text = walker.nextNode(); text; text = walker.nextNode()) {
@@ -225,18 +270,18 @@ export function readInterruptedBanner(
       const verdict = opens(folded);
       if (verdict === null) continue;
       if (!verdict) break;
-      // Its row too: every element around it up to the banner's size must open with the words,
-      // so a caption that mentions them in nested spans ('Searching for "<span>Connection
-      // interrupted</span>"') is not the banner. A status or alert region is the banner's own
-      // box: nothing above it is read.
+      // Its row too: every element around it up to the banner's size (or its status or alert
+      // region, the banner's own box) must hold no disclosure or activity surface and, without
+      // what a user or the model wrote, open with the words. So a caption that mentions them in
+      // nested spans ('Searching for "<span>Connection interrupted</span>"'), with or without its
+      // disclosure button next to it, is not the banner. The check is never skipped.
       let row: Element = holder;
       let isBanner = true;
       while (!row.matches(REGION)) {
         const up: Element | null = row.parentElement;
-        if (!up || !inScope(up)) break;
-        const around = fold(up.textContent);
-        if (around.length > 300) break;
-        if (opens(around) === false) {
+        if (!up || up === root || !root.contains(up) || up.contains(latestUser)) break;
+        if (fold(up.textContent).length > 300) break;
+        if (disqualified(up) || opens(ownText(up)) === false) {
           isBanner = false;
           break;
         }
