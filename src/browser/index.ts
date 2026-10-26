@@ -2163,6 +2163,7 @@ async function runBrowserModeInternal(
       buildRuntimeDiagnostics,
       readConversationUrl,
       validateChatGPTSession,
+      timeLimit: runClient ?? undefined,
     });
     const imageOutputRequested = Boolean(
       options.generateImagePath ||
@@ -3879,6 +3880,7 @@ async function runRemoteBrowserMode(
       buildRuntimeDiagnostics,
       readConversationUrl,
       validateChatGPTSession,
+      timeLimit: runClient ?? undefined,
     });
     const imageOutputRequested = Boolean(
       options.generateImagePath ||

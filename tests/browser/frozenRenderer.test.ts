@@ -5,6 +5,7 @@ import {
   withAppApprovalMonitor,
 } from "../../src/browser/actions/appApprovals.js";
 import { createRunClient, RunTimeExpiredError } from "../../src/browser/runClient.js";
+import { createAttemptAssistantRecheck } from "../../src/browser/assistantResponseRuntime.js";
 import { moveRunToNewTab } from "../../src/browser/tabReplacement.js";
 import { createTurnResync } from "../../src/browser/turnResync.js";
 import type { ChromeClient } from "../../src/browser/types.js";
@@ -476,6 +477,16 @@ describe("a page that stops answering while the answer is awaited", () => {
       }
     }
   });
+
+  test("the delayed recheck of both runs gets the run client for its fresh bound", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL("../../src/browser/index.ts", import.meta.url), "utf8");
+    const blocks = source.split("createAttemptAssistantRecheck({").slice(1);
+    expect(blocks).toHaveLength(2);
+    for (const block of blocks) {
+      expect(block.slice(0, block.indexOf("});"))).toContain("timeLimit: runClient");
+    }
+  });
 });
 
 describe("an approval check waiting for a frozen page", () => {
@@ -592,5 +603,74 @@ describe("a frozen page that a browser-side reload brings back", () => {
     expect(
       lines.some((line) => /it answers again \(6 turns on the page\); waiting/.test(line)),
     ).toBe(true);
+  });
+});
+
+describe("the delayed recheck after a timed-out wait", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const recheckOn = (tab: { navigateMs: number | null }) => {
+    const raw = {
+      Runtime: {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression === "location.href") return { result: { value: CONVERSATION } };
+          if (expression.endsWith(".length")) return { result: { value: 4 } };
+          return { result: { value: null } };
+        }),
+      },
+      Page: {
+        navigate: vi.fn(() =>
+          tab.navigateMs === null
+            ? never()
+            : new Promise((resolve) => setTimeout(() => resolve({}), tab.navigateMs!)),
+        ),
+      },
+    } as unknown as ChromeClient;
+    const runClient = createRunClient(raw);
+    // The wait timed out: its deadline is spent and one call already went unanswered after it.
+    runClient.setDeadline(Date.now() - 1);
+    void runClient.client.Runtime.evaluate({ expression: "never" }).catch(() => undefined);
+    const waited = vi.fn(async () => ({ text: "rechecked", meta: {} }));
+    const recheck = createAttemptAssistantRecheck({
+      Runtime: runClient.client.Runtime,
+      Page: runClient.client.Page,
+      logger: quietLogger(),
+      recheckDelayMs: 1_000,
+      recheckTimeoutMs: 10_000,
+      fallbackTimeoutMs: 60_000,
+      raceWithDisconnect: (operation) => operation,
+      waitResponse: async () => ({ text: "", meta: {} }),
+      waitWithThinkingMonitor: waited as never,
+      onSessionInvalid: async () => undefined,
+      lastUrl: () => CONVERSATION,
+      buildRuntimeDiagnostics: () => ({}),
+      readConversationUrl: async (runtime) =>
+        String((await runtime.evaluate({ expression: "location.href" })).result.value),
+      validateChatGPTSession: async () => ({ valid: true }),
+      timeLimit: runClient,
+    });
+    return { recheck, waited };
+  };
+
+  test("its steps before the next wait do not inherit the spent deadline: a 3 s navigation goes through", async () => {
+    const { recheck, waited } = recheckOn({ navigateMs: 3_000 });
+    const box = track(recheck());
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(box.state).toBe("resolved");
+    expect(waited).toHaveBeenCalledTimes(1);
+  });
+
+  test("a page that does not answer the recheck still ends it, within the recheck's own bound", async () => {
+    const { recheck, waited } = recheckOn({ navigateMs: null });
+    const box = track(recheck());
+    await vi.advanceTimersByTimeAsync(1_000 + 10_000 + 60_000 + 1_000);
+    expect(box.state).toBe("rejected");
+    expect(String((box.error as Error).message)).toContain("assistant-response-watchdog-timeout");
+    expect(waited).not.toHaveBeenCalled();
   });
 });

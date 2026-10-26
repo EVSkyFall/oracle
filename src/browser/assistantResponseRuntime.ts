@@ -115,7 +115,20 @@ export interface AssistantRecheckEnv {
     Runtime: ChromeClient["Runtime"],
     logger: BrowserLogger,
   ) => Promise<{ valid: boolean; reason?: string }>;
+  /**
+   * The run client (runClient.ts). The timed-out wait leaves its spent deadline in place so the
+   * timeout path stays bounded; the recheck gives its own steps before the next wait a fresh one.
+   */
+  timeLimit?: { setDeadline(at: number | null): void };
 }
+
+/**
+ * What the recheck may spend before its wait starts: the conversation hint (15 s), opening the
+ * conversation, its hydration (at most 30 s) and the session check, each answered in seconds on
+ * a healthy page. A page that does not answer within it ends the recheck as a timeout.
+ */
+const recheckPrepareMs = (recheckTimeoutMs: number) =>
+  Math.min(recheckTimeoutMs || 30_000, 30_000) + 60_000;
 
 export function createAttemptAssistantRecheck(
   env: AssistantRecheckEnv,
@@ -126,6 +139,7 @@ export function createAttemptAssistantRecheck(
       `[browser] Assistant response timed out; waiting ${formatElapsed(env.recheckDelayMs)} before rechecking conversation.`,
     );
     await env.raceWithDisconnect(delay(env.recheckDelayMs));
+    env.timeLimit?.setDeadline(Date.now() + recheckPrepareMs(env.recheckTimeoutMs));
     await env.onRecheckDelayElapsed?.();
     const conversationUrl = await env.readConversationUrl(env.Runtime);
     if (conversationUrl && isConversationUrl(conversationUrl)) {
