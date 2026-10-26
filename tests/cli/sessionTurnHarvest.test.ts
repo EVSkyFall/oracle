@@ -94,10 +94,18 @@ function mockSession(harvests: unknown[], config: Record<string, unknown> = {}) 
     mode: "browser",
     cwd,
     browser: {
-      config: { manualLogin: true, timeoutMs: 10 * 60_000, inputTimeoutMs: 3_000, ...config },
+      // A throwaway profile: nothing here may ever reach ~/.oracle/browser-profile.
+      config: {
+        manualLogin: true,
+        manualLoginProfileDir: path.join(cwd, "browser-profile"),
+        timeoutMs: 10 * 60_000,
+        inputTimeoutMs: 3_000,
+        ...config,
+      },
       runtime: {
         chromeHost: "127.0.0.1",
         chromePort: 9223,
+        userDataDir: path.join(cwd, "browser-profile"),
         tabUrl: "https://chatgpt.com/c/saved-conversation",
         conversationId: "saved-conversation",
         submittedPromptHash: browserPromptFingerprint(PROMPT, "current-message"),
@@ -398,7 +406,11 @@ describe("a reattach saves only this session's own turn", () => {
       expect(takeHarvestSlot).toHaveBeenCalledTimes(2);
       expect(releaseHarvestSlot.mock.calls.at(-1)?.slice(0, 3)).toEqual([null, "sess-turn", true]);
     } finally {
-      vi.doUnmock("../../src/cli/harvestChromeRelease.js");
+      // Back to the file's guard (never doUnmock: that drops the top-level mock too).
+      vi.doMock("../../src/cli/harvestChromeRelease.js", () => ({
+        takeHarvestSlot: vi.fn(async () => null),
+        releaseHarvestSlot: vi.fn(async () => false),
+      }));
     }
   });
 
@@ -421,7 +433,11 @@ describe("a reattach saves only this session's own turn", () => {
         [slot, "sess-turn", false],
       ]);
     } finally {
-      vi.doUnmock("../../src/cli/harvestChromeRelease.js");
+      // Back to the file's guard (never doUnmock: that drops the top-level mock too).
+      vi.doMock("../../src/cli/harvestChromeRelease.js", () => ({
+        takeHarvestSlot: vi.fn(async () => null),
+        releaseHarvestSlot: vi.fn(async () => false),
+      }));
     }
   });
 });
