@@ -1379,3 +1379,143 @@ describe("app approval monitor", () => {
     expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 });
+
+describe("app approval monitor and hidden prompts", () => {
+  const hiddenPrompt = {
+    app: "CODEXish",
+    title: "Allow ChatGPT to use CODEXish?",
+    state: "collapsed (zero-size ancestor)",
+    pending: true,
+    subject: 0,
+    id: 7,
+  };
+  const page = (scan: () => unknown) => ({
+    evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.__oracleApprovalButtons = {")) {
+        return { result: { value: scan() } };
+      }
+      if (expression.includes("store.subjects")) return { result: { value: null } };
+      if (expression.includes("__oracleTrustedClickGuards ??=")) {
+        return { result: { value: { ready: true, contextMatches: true } } };
+      }
+      if (expression.includes("const summary = { reached")) {
+        return { result: { value: { reached: true, blocked: null } } };
+      }
+      return { result: { value: { status: "ready", x: 50, y: 60 } } };
+    }),
+  });
+  const stopAfterPoll = async (stop: () => Promise<void>) => {
+    const stopping = stop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await stopping;
+  };
+  const clicks = (runtime: ReturnType<typeof page>) =>
+    runtime.evaluate.mock.calls.filter(
+      ([call]) =>
+        call.expression.includes("__oracleTrustedClickGuards ??=") ||
+        call.expression.includes("target.click()"),
+    ).length;
+
+  test("a pending prompt that stays hidden is reported once, diagnosed, never clicked, and the run is told on every poll", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = page(() => ({ cards: [], skipped: [], hidden: [hiddenPrompt] }));
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      const saveDiagnostic = vi.fn(async () => "diag-1.html");
+      const onHiddenSurface = vi.fn();
+      const stop = startAppApprovalMonitor(
+        runtime as never,
+        { dispatchMouseEvent: vi.fn() } as never,
+        {
+          allowApps: ["CODEXish"],
+          logger,
+          intervalMs: 1_000,
+          saveDiagnostic,
+          onHiddenSurface,
+        },
+      );
+      // It may be a card that mounts hidden and fades in: nothing for the first 5 seconds.
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(onHiddenSurface).not.toHaveBeenCalled();
+      expect(logger).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(onHiddenSurface).toHaveBeenCalledWith(hiddenPrompt);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await stopAfterPoll(stop);
+      const lines = logger.mock.calls.map(([line]) => String(line));
+      expect(lines.filter((line) => line.includes("hidden"))).toEqual([
+        '[browser] App approval for CODEXish is in the page but hidden (collapsed (zero-size ancestor)): "Allow ChatGPT to use CODEXish?". Hidden buttons are never clicked; the conversation will be reloaded so it renders.',
+      ]);
+      expect(saveDiagnostic).toHaveBeenCalledTimes(1);
+      expect(onHiddenSurface.mock.calls.length).toBeGreaterThanOrEqual(10);
+      expect(clicks(runtime)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("without a reload hook it is left for the user; an answered prompt never asks for a reload", async () => {
+    vi.useFakeTimers();
+    try {
+      const answered = { ...hiddenPrompt, id: 8, pending: false, state: "display: none" };
+      const runtime = page(() => ({ cards: [], skipped: [], hidden: [hiddenPrompt, answered] }));
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      const stop = startAppApprovalMonitor(runtime as never, undefined, {
+        allowApps: ["CODEXish"],
+        logger,
+        intervalMs: 1_000,
+      });
+      await vi.advanceTimersByTimeAsync(8_000);
+      await stopAfterPoll(stop);
+      const lines = logger.mock.calls.map(([line]) => String(line));
+      expect(lines).toEqual([
+        '[browser] App approval for CODEXish is in the page but hidden (collapsed (zero-size ancestor)): "Allow ChatGPT to use CODEXish?". Hidden buttons are never clicked; left for the user.',
+        '[browser] App approval for CODEXish is in the page but hidden (display: none) and shows no allow button: "Allow ChatGPT to use CODEXish?".',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a card this monitor approved that stays in the page hidden is answered, not reported", async () => {
+    vi.useFakeTimers();
+    try {
+      const card = {
+        key: "codexish",
+        app: "CODEXish",
+        title: "CODEXish",
+        toolText: "Allow ChatGPT to use CODEXish? ChatGPT will call CODEXish's Shell Run tool.",
+        button: { label: "Always allow", rank: 0, index: 0 },
+        subject: 0,
+        id: 3,
+      };
+      let polls = 0;
+      const runtime = page(() =>
+        ++polls === 1
+          ? { cards: [card], skipped: [], hidden: [] }
+          : { cards: [], skipped: [], hidden: [{ ...hiddenPrompt, id: 3 }] },
+      );
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      const onHiddenSurface = vi.fn();
+      const onApproval = vi.fn();
+      const stop = startAppApprovalMonitor(
+        runtime as never,
+        { dispatchMouseEvent: vi.fn() } as never,
+        {
+          allowApps: ["CODEXish"],
+          logger,
+          intervalMs: 1_000,
+          onApproval,
+          onHiddenSurface,
+        },
+      );
+      await vi.advanceTimersByTimeAsync(12_000);
+      await stopAfterPoll(stop);
+      expect(onApproval).toHaveBeenCalledTimes(1);
+      expect(onHiddenSurface).not.toHaveBeenCalled();
+      expect(logger.mock.calls.some(([line]) => String(line).includes("hidden"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

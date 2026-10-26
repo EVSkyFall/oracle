@@ -90,6 +90,23 @@ export interface AppApprovalSkip {
   id?: number;
 }
 
+/**
+ * An approval prompt of an allowed app that is in the page but not shown: zero-size, collapsed,
+ * display: none, visibility: hidden, content-visibility-skipped, inside a closed details, or with
+ * its allow buttons hidden. Never clicked; the run reloads the conversation so it renders.
+ */
+export interface AppApprovalHidden {
+  app: string;
+  /** Its question ("Allow ChatGPT to use CODEXish?") or else its first line, hidden text included. */
+  title: string;
+  /** Why it is not shown, e.g. "display: none" or "collapsed (zero-size ancestor)". */
+  state: string;
+  /** True when it holds an enabled allow button: a prompt that waits for an answer. */
+  pending: boolean;
+  subject: number;
+  id?: number;
+}
+
 /** What a diagnostic file holds about a card that was not taken or not clicked. */
 export interface AppApprovalDiagnosticPage {
   url: string;
@@ -138,6 +155,7 @@ export function scanAppApprovalCards(
   cards: AppApprovalCard[];
   buttons: Element[];
   skipped: AppApprovalSkip[];
+  hidden: AppApprovalHidden[];
   subjects: Element[];
   labelOf: (button: Element) => string;
 } {
@@ -150,6 +168,61 @@ export function scanAppApprovalCards(
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   };
+  const styleOf = (node: Element) => doc.defaultView?.getComputedStyle?.(node) ?? null;
+  /**
+   * Why a reader cannot see the element, or "" when it is shown. A box alone is not enough: a
+   * visibility: hidden button keeps its box, a card collapsed into a zero-size ancestor that
+   * hides overflow keeps its own size, and the contents of a closed details or of a
+   * content-visibility: hidden element are not rendered. `skippedCounts` also counts contents that
+   * content-visibility: auto skips because they are off screen (scrolling brings those back).
+   */
+  const hiddenState = (node: Element, skippedCounts: boolean): string => {
+    let child: Element = node;
+    for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (
+        ancestor.tagName === "DETAILS" &&
+        !ancestor.hasAttribute("open") &&
+        child.tagName !== "SUMMARY"
+      ) {
+        return "inside a closed details";
+      }
+      child = ancestor;
+    }
+    for (let current: Element | null = node; current; current = current.parentElement) {
+      const style = styleOf(current);
+      if (!style) continue;
+      if (style.display === "none") return "display: none";
+      if (current === node && /^(hidden|collapse)$/.test(style.visibility)) {
+        return `visibility: ${style.visibility}`;
+      }
+      if (current === node) continue;
+      const contentVisibility = style.getPropertyValue?.("content-visibility") ?? "";
+      if (contentVisibility === "hidden") return "content-visibility: hidden";
+      const clips = /hidden|clip|auto|scroll/.test(`${style.overflowX} ${style.overflowY}`);
+      // A display: contents wrapper has no box of its own and clips nothing.
+      if (
+        clips &&
+        style.display !== "contents" &&
+        typeof current.getBoundingClientRect === "function"
+      ) {
+        const box = current.getBoundingClientRect();
+        if (box.width <= 0 || box.height <= 0) return "collapsed (zero-size ancestor)";
+      }
+    }
+    if (!visible(node)) return "zero-size";
+    const check = (node as { checkVisibility?: (options: object) => boolean }).checkVisibility;
+    if (typeof check === "function") {
+      // checkVisibilityCSS is the older name of visibilityProperty; unknown options are ignored.
+      const options = { visibilityProperty: true, checkVisibilityCSS: true };
+      if (!check.call(node, options)) return "not rendered";
+      if (skippedCounts && !check.call(node, { ...options, contentVisibilityAuto: true })) {
+        return "content-visibility: auto (skipped)";
+      }
+    }
+    return "";
+  };
+  /** A button the user can see (or scroll to): only such a button is ever clicked. */
+  const shown = (button: Element): boolean => hiddenState(button, false) === "";
   const BUTTON = 'button, [role="button"]';
   const DIALOG = '[role="dialog"], [role="alertdialog"]';
   // Elements that announce themselves as a prompt; such an element is the card wherever it sits.
@@ -529,7 +602,7 @@ export function scanAppApprovalCards(
   };
   const entries: Entry[] = [];
   for (const button of Array.from(doc.querySelectorAll(BUTTON))) {
-    if (!mayAllow(button) || !visible(button) || !enabled(button)) continue;
+    if (!mayAllow(button) || !enabled(button) || !shown(button)) continue;
     const text = label(button);
     const rank = rankOf(button, text);
     const kind =
@@ -627,6 +700,108 @@ export function scanAppApprovalCards(
     });
   }
 
+  const takenCards = Array.from(byCard.keys());
+  const related = (a: Element, b: Element) => a === b || a.contains(b) || b.contains(a);
+
+  // Approval prompts that are in the page but not shown. ChatGPT has left a pending prompt
+  // hidden (or never rendered it) while its server waited for the answer; a reload renders it.
+  // Found by the approval-surface marker, a class that names an approval card, or an alert or
+  // dialog that asks "Allow ChatGPT to use <app>?"; text is read whether it renders or not.
+  const SURFACE = '[data-codex-approval-surface="true"], [class*="approval-card"]';
+  const QUESTIONS = [
+    /\ballow\s+chatgpt\s+to\s+use\s+\S.*\?/i,
+    /chatgpt\s*가\s*\S.*?(?:을\(를\)|를\(을\)|을|를)\s*사용하도록/i,
+  ];
+  const rawLines = (root: Element): string[] => {
+    const lines: string[] = [""];
+    const walk = (node: Node): void => {
+      if (node.nodeType === 3) {
+        lines[lines.length - 1] += node.nodeValue ?? "";
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const element = node as Element;
+      if (
+        element !== root &&
+        element.matches(`${BUTTON}, ${NOT_LABEL}, ${ARGUMENTS}, script, style`)
+      ) {
+        return;
+      }
+      const block = element !== root && BLOCK_TAGS.test(element.tagName);
+      if (block) lines.push("");
+      for (const child of Array.from(element.childNodes)) walk(child);
+      if (block) lines.push("");
+    };
+    walk(root);
+    return lines.map((line) => normalize(line)).filter(Boolean);
+  };
+  /** A button's label from its text whether it renders or not (no computed styles). */
+  const rawLabel = (button: Element): string => {
+    const parts: string[] = [];
+    const walk = (node: Node): void => {
+      if (node.nodeType === 3) {
+        parts.push(node.nodeValue ?? "");
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const element = node as Element;
+      if (element !== button && element.matches(NOT_LABEL)) return;
+      for (const child of Array.from(element.childNodes)) walk(child);
+    };
+    walk(button);
+    return (
+      withoutShortcut(normalize(parts.join(""))) || normalize(button.getAttribute("aria-label"))
+    );
+  };
+  const asksForApp = (role: Element): boolean =>
+    rawLines(role).some((line) => QUESTIONS.some((question) => question.test(line)));
+  const surfaces = [
+    ...Array.from(doc.querySelectorAll(SURFACE)),
+    ...Array.from(doc.querySelectorAll(ROLE_CARD)).filter(
+      (role) => !role.matches(SURFACE) && asksForApp(role),
+    ),
+  ].filter((surface) => {
+    if (chatSurface(surface)) return false;
+    for (let node: Element | null = surface; node; node = node.parentElement) {
+      if (node.matches(USER) || node.matches(EDITABLE)) return false;
+    }
+    return true;
+  });
+  const hidden: AppApprovalHidden[] = [];
+  const hiddenSurfaces: Element[] = [];
+  for (const surface of surfaces) {
+    // The outermost surface speaks for the ones inside it (the card's text-only alert).
+    if (surfaces.some((other) => other !== surface && other.contains(surface))) continue;
+    if (takenCards.some((card) => related(card, surface))) continue;
+    const allowButtons = Array.from(surface.querySelectorAll(BUTTON)).filter(
+      (button) => enabled(button) && rankOf(button, rawLabel(button)) >= 0,
+    );
+    // A shown allow button is the scan's own business above (taken, or reported as a skip).
+    if (allowButtons.some(shown)) continue;
+    const surfaceState = hiddenState(surface, true);
+    // A shown surface without allow buttons (an answered prompt) is not hidden.
+    if (!surfaceState && allowButtons.length === 0) continue;
+    const lines = rawLines(surface);
+    const title =
+      lines.find((line) => QUESTIONS.some((question) => question.test(line))) ??
+      lines[0] ??
+      normalize(surface.getAttribute("aria-label"));
+    const app = names(title);
+    if (!app) continue;
+    const state =
+      surfaceState ||
+      (allowButtons[0] ? hiddenState(allowButtons[0], true) : "") ||
+      "its allow buttons are not shown";
+    hiddenSurfaces.push(surface);
+    hidden.push({
+      app,
+      title: title.slice(0, 200),
+      state,
+      pending: allowButtons.length > 0,
+      subject: subjectFor(surface, allowButtons[0] ?? surface),
+    });
+  }
+
   const skipped: AppApprovalSkip[] = [...placeSkips];
   // Role cards with no allow button: reported when their title names an allowed app (its
   // buttons were renamed, e.g. "Continue") or when one of them looks like an allow button.
@@ -634,17 +809,18 @@ export function scanAppApprovalCards(
     entries.filter((entry) => entry.role && entry.kind === "accepted").map((entry) => entry.region),
   );
   // A role element inside a taken card (the approval card's text-only alert) is part of it.
-  const takenCards = Array.from(byCard.keys());
   for (const role of Array.from(doc.querySelectorAll(ROLE_CARD))) {
     if (takenRegions.has(role) || !visible(role) || chatSurface(role)) continue;
     if (takenCards.some((card) => card !== role && card.contains(role))) continue;
+    // A prompt that is in the page but hidden is reported as hidden, not as a card.
+    if (hiddenSurfaces.some((surface) => related(surface, role))) continue;
     let placeable = true;
     for (let node: Element | null = role; node; node = node.parentElement) {
       if (node.matches(USER) || node.matches(EDITABLE)) placeable = false;
     }
     if (!placeable) continue;
     const own = Array.from(role.querySelectorAll(BUTTON)).filter(
-      (button) => button.closest(ROLE_CARD) === role && visible(button) && enabled(button),
+      (button) => button.closest(ROLE_CARD) === role && shown(button) && enabled(button),
     );
     // An allowed app's prompt with no enabled button at all is reported too: its controls may be
     // links or plain elements now, and the diagnostic shows which.
@@ -690,7 +866,7 @@ export function scanAppApprovalCards(
       subject: subjectFor(card, button),
     });
   }
-  return { cards, buttons, skipped, subjects, labelOf: label };
+  return { cards, buttons, skipped, hidden, subjects, labelOf: label };
 }
 
 export function buildAppApprovalScanExpression(
@@ -699,7 +875,7 @@ export function buildAppApprovalScanExpression(
 ): string {
   return `(() => {
     const scan = ${scanAppApprovalCards.toString()};
-    const { cards, buttons, skipped, subjects, labelOf } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
+    const { cards, buttons, skipped, hidden, subjects, labelOf } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
     window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons, subjects, labelOf };
     // A card's identity across polls, kept beside the page (the DOM is never marked).
     const ids = window.__oracleApprovalIds || (window.__oracleApprovalIds = { map: new WeakMap(), next: 1 });
@@ -711,6 +887,7 @@ export function buildAppApprovalScanExpression(
     return {
       cards: cards.map((card) => ({ ...card, id: idOf(subjects[card.subject]) })),
       skipped: skipped.map((skip) => ({ ...skip, id: idOf(subjects[skip.subject]) })),
+      hidden: hidden.map((surface) => ({ ...surface, id: idOf(subjects[surface.subject]) })),
     };
   })()`;
 }
@@ -801,6 +978,8 @@ export function buildAppApprovalInPageClickExpression(
     const target = locate();
     if (!target) return { status: 'missing' };
     if (target.hasAttribute('disabled') || target.getAttribute('aria-disabled') === 'true') return { status: 'disabled' };
+    // Never a button the user cannot see, even one the scan still takes (skipped off-screen).
+    if (typeof target.checkVisibility === 'function' && !target.checkVisibility({ visibilityProperty: true, checkVisibilityCSS: true, contentVisibilityAuto: true })) return { status: 'hidden' };
     if (typeof target.click === 'function') target.click();
     else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
     return { status: 'clicked' };
@@ -819,7 +998,16 @@ export interface AppApprovalMonitorOptions {
   saveDiagnostic?: (diagnostic: AppApprovalDiagnostic) => Promise<string | undefined | void>;
   /** Run-level set of stop functions, so the run's cleanup can stop a monitor it raced past. */
   registry?: Set<() => Promise<void>>;
+  /**
+   * Told on every poll while an allowed app's pending prompt has stayed hidden for
+   * `hiddenSettleMs`; the response wait reloads the conversation so the prompt renders.
+   */
+  onHiddenSurface?: (surface: AppApprovalHidden) => void;
+  /** How long a prompt must stay hidden before it counts (a card may mount hidden and fade in). */
+  hiddenSettleMs?: number;
 }
+
+const HIDDEN_SETTLE_MS = 5_000;
 
 const quote = (labels: readonly string[]) =>
   labels.map((label) => `"${label.slice(0, 80)}"`).join(", ") || "(no label)";
@@ -866,6 +1054,10 @@ export function startAppApprovalMonitor(
   const lastClick = new Map<string, number>();
   const failures = new Map<string, { attempts: number; outcome: string }>();
   const reportedErrors = new Set<string>();
+  // Cards this monitor approved: a card that stays in the page hidden afterwards is answered.
+  const approved = new Set<string>();
+  const hiddenSince = new Map<string, number>();
+  const hiddenSettleMs = Math.max(0, options.hiddenSettleMs ?? HIDDEN_SETTLE_MS);
   let stopped = false;
 
   const reportOnce = (key: string, line: string): boolean => {
@@ -943,10 +1135,34 @@ export function startAppApprovalMonitor(
     }
     const value = evaluated?.result?.value as
       | AppApprovalCard[]
-      | { cards?: AppApprovalCard[]; skipped?: AppApprovalSkip[] }
+      | { cards?: AppApprovalCard[]; skipped?: AppApprovalSkip[]; hidden?: AppApprovalHidden[] }
       | undefined;
     const cards = Array.isArray(value) ? value : Array.isArray(value?.cards) ? value.cards : [];
     const skipped = !Array.isArray(value) && Array.isArray(value?.skipped) ? value.skipped : [];
+    const hidden = !Array.isArray(value) && Array.isArray(value?.hidden) ? value.hidden : [];
+    // A hidden prompt is never clicked. Once it has stayed hidden for a moment it is reported
+    // once (with a diagnostic) and, while it waits for an answer, the run is told so it can
+    // reload the conversation, after which the prompt renders and is taken as usual.
+    const hiddenNow = new Set<string>();
+    for (const surface of hidden) {
+      const identity = surface.id !== undefined ? `card:${surface.id}` : `hidden\n${surface.title}`;
+      if (approved.has(identity)) continue;
+      hiddenNow.add(identity);
+      const since = hiddenSince.get(identity) ?? Date.now();
+      hiddenSince.set(identity, since);
+      if (Date.now() - since < hiddenSettleMs) continue;
+      const title = surface.title.slice(0, 160);
+      const line = !surface.pending
+        ? `[browser] App approval for ${surface.app} is in the page but hidden (${surface.state}) and shows no allow button: "${title}".`
+        : options.onHiddenSurface
+          ? `[browser] App approval for ${surface.app} is in the page but hidden (${surface.state}): "${title}". Hidden buttons are never clicked; the conversation will be reloaded so it renders.`
+          : `[browser] App approval for ${surface.app} is in the page but hidden (${surface.state}): "${title}". Hidden buttons are never clicked; left for the user.`;
+      if (reportOnce(`${identity}\nhidden\n${surface.state}\n${surface.pending}`, line)) {
+        await diagnose(`${identity}\nhidden`, line, token, surface.subject);
+      }
+      if (surface.pending) options.onHiddenSurface?.(surface);
+    }
+    for (const key of hiddenSince.keys()) if (!hiddenNow.has(key)) hiddenSince.delete(key);
     // Cards are told apart by their identity in the page (two cards with the same text, or two
     // places with no title, stay two); without one, by their text.
     const cardIdentity = (card: AppApprovalCard) =>
@@ -1035,6 +1251,7 @@ export function startAppApprovalMonitor(
         continue;
       }
       failures.delete(identity);
+      approved.add(identity);
       const record: BrowserAppApprovalRecord = {
         app: card.app,
         button: card.button.label,

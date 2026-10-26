@@ -475,4 +475,79 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     });
     expect(picks).toEqual(["once"]);
   }, 60_000);
+
+  // Round 6: a pending prompt that is in the page but not shown is seen, never clicked, reported
+  // once with a diagnostic, and the run is told so it can reload the conversation.
+  const askingAlert = `<div role="alert" data-card="asking"><p>Allow ChatGPT to use CODEXish?</p><p>ChatGPT will call CODEXish's Fs Read tool.</p><div>${pick("always", "Always allow")}${pick("once", "Allow once")}</div></div>`;
+  test.each([
+    ["display: none", `<div style="display:none">${capturedCard(true)}</div>`, "display: none"],
+    [
+      "collapsed into a zero-height box",
+      `<div style="height:0;overflow:hidden">${capturedCard(true)}</div>`,
+      "collapsed (zero-size ancestor)",
+    ],
+    [
+      "visibility: hidden",
+      `<div style="visibility:hidden">${capturedCard(true)}</div>`,
+      "visibility: hidden",
+    ],
+    [
+      "content-visibility: hidden",
+      `<div style="content-visibility:hidden">${capturedCard(true)}</div>`,
+      "content-visibility: hidden",
+    ],
+    [
+      "inside a closed details",
+      `<details><summary>Approval</summary>${capturedCard(true)}</details>`,
+      "inside a closed details",
+    ],
+    [
+      "an unmarked alert that asks, in a zero-size box",
+      `<div style="width:0;height:0;overflow:hidden">${askingAlert}</div>`,
+      "collapsed (zero-size ancestor)",
+    ],
+  ])(
+    "a hidden prompt (%s) is never clicked, is reported once and asks for a reload",
+    async (_how, hiddenCard, state) => {
+      const onHiddenSurface = vi.fn();
+      const saveDiagnostic = vi.fn(async () => "diag.html");
+      const { picks, records, lines } = await run(
+        todayPage({ thread: `<div class="block-BQZwFn"><div>${hiddenCard}</div></div>` }),
+        { watchMs: 4_000, monitor: { hiddenSettleMs: 600, onHiddenSurface, saveDiagnostic } },
+      );
+      expect(picks).toEqual([]);
+      expect(records).toEqual([]);
+      const hiddenLines = lines.filter((line) => line.includes("is in the page but hidden"));
+      expect(hiddenLines).toHaveLength(1);
+      expect(hiddenLines[0]).toContain(
+        `App approval for CODEXish is in the page but hidden (${state})`,
+      );
+      expect(hiddenLines[0]).toContain('"Allow ChatGPT to use CODEXish?"');
+      expect(hiddenLines[0]).toContain("the conversation will be reloaded");
+      expect(onHiddenSurface).toHaveBeenCalledWith(
+        expect.objectContaining({ app: "CODEXish", pending: true, state }),
+      );
+      expect(saveDiagnostic).toHaveBeenCalledTimes(1);
+      expect(lines.filter((line) => line.includes("left for the user"))).toEqual([]);
+    },
+    60_000,
+  );
+
+  test("another app's hidden prompt is not reported; a hidden answered card does not ask for a reload", async () => {
+    const gmail = capturedCard(true).replaceAll("CODEXish", "Gmail");
+    const answered = `<div data-codex-approval-surface="true" data-card="answered"><p>Allow ChatGPT to use CODEXish?</p><p>Allowed</p></div>`;
+    const onHiddenSurface = vi.fn();
+    const { picks, lines } = await run(
+      todayPage({
+        thread: `<div style="display:none">${gmail}</div><div style="display:none">${answered}</div>`,
+      }),
+      { watchMs: 2_500, monitor: { hiddenSettleMs: 300, onHiddenSurface } },
+    );
+    expect(picks).toEqual([]);
+    expect(onHiddenSurface).not.toHaveBeenCalled();
+    expect(lines.filter((line) => line.includes("Gmail"))).toEqual([]);
+    expect(lines.filter((line) => line.includes("is in the page but hidden"))).toEqual([
+      '[browser] App approval for CODEXish is in the page but hidden (display: none) and shows no allow button: "Allow ChatGPT to use CODEXish?".',
+    ]);
+  }, 60_000);
 });
