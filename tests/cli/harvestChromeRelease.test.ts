@@ -23,7 +23,8 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.doUnmock("../../src/sessionStore.js");
   vi.doUnmock("../../src/browser/recoveryTarget.js");
-  await rm(profileDir, { recursive: true, force: true });
+  // Windows: the registry's lock and temp files can still be pending deletion under load.
+  await rm(profileDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 function session(overrides: Record<string, unknown> = {}, config: Record<string, unknown> = {}) {
