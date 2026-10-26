@@ -169,6 +169,17 @@ export function scanAppApprovalCards(
     return rect.width > 0 && rect.height > 0;
   };
   const styleOf = (node: Element) => doc.defaultView?.getComputedStyle?.(node) ?? null;
+  // A fixed or absolute element can escape a box that clips: the point at its centre hits it.
+  const hitsItself = (node: Element): boolean => {
+    const view = doc.defaultView;
+    const rect = node.getBoundingClientRect?.();
+    if (!view || !rect || typeof doc.elementFromPoint !== "function") return false;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) return false;
+    const hit = doc.elementFromPoint(x, y);
+    return Boolean(hit) && (hit === node || node.contains(hit));
+  };
   /**
    * Why a reader cannot see the element, or "" when it is shown. A box alone is not enough: a
    * visibility: hidden button keeps its box, a card collapsed into a zero-size ancestor that
@@ -206,7 +217,9 @@ export function scanAppApprovalCards(
         typeof current.getBoundingClientRect === "function"
       ) {
         const box = current.getBoundingClientRect();
-        if (box.width <= 0 || box.height <= 0) return "collapsed (zero-size ancestor)";
+        if ((box.width <= 0 || box.height <= 0) && !hitsItself(node)) {
+          return "collapsed (zero-size ancestor)";
+        }
       }
     }
     if (!visible(node)) return "zero-size";
@@ -758,7 +771,8 @@ export function scanAppApprovalCards(
   const surfaces = [
     ...Array.from(doc.querySelectorAll(SURFACE)),
     ...Array.from(doc.querySelectorAll(ROLE_CARD)).filter(
-      (role) => !role.matches(SURFACE) && asksForApp(role),
+      // A chat surface (the chat frame holds the whole thread) is never read for its question.
+      (role) => !role.matches(SURFACE) && !chatSurface(role) && asksForApp(role),
     ),
   ].filter((surface) => {
     if (chatSurface(surface)) return false;

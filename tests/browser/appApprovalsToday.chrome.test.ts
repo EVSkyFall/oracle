@@ -533,6 +533,23 @@ describe.runIf(enabled)("app approvals on today's ChatGPT layout (real Chrome)",
     60_000,
   );
 
+  test("a card that escapes a zero-size clipping box (fixed positioning) is shown and approved", async () => {
+    const onHiddenSurface = vi.fn();
+    const escaping = `<div style="height:0;overflow:hidden"><div style="position:fixed;left:240px;top:120px;width:560px;background:#fff;z-index:5">${capturedCard(true)}</div></div>`;
+    const { picks, records, lines } = await run(
+      todayPage({ thread: `<div class="block-BQZwFn"><div>${escaping}</div></div>` }),
+      {
+        done: (list) => list.length === 1,
+        watchMs: 1_500,
+        monitor: { hiddenSettleMs: 300, onHiddenSurface },
+      },
+    );
+    expect(picks).toEqual(["always"]);
+    expect(records).toEqual([expect.objectContaining({ app: "CODEXish", button: "Always allow" })]);
+    expect(onHiddenSurface).not.toHaveBeenCalled();
+    expect(lines.filter((line) => line.includes("hidden"))).toEqual([]);
+  }, 60_000);
+
   test("another app's hidden prompt is not reported; a hidden answered card does not ask for a reload", async () => {
     const gmail = capturedCard(true).replaceAll("CODEXish", "Gmail");
     const answered = `<div data-codex-approval-surface="true" data-card="answered"><p>Allow ChatGPT to use CODEXish?</p><p>Allowed</p></div>`;
