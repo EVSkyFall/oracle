@@ -145,6 +145,11 @@ export async function acquireBrowserTabLease(
     chromePort?: number;
     staleMs?: number;
     signal?: AbortSignal;
+    /**
+     * Takes over the slots of this session whose controller is proven gone (pid and start time),
+     * fresh or not: a harvest after the session's worker died holds the slot that worker held.
+     */
+    takeOverDeadSessionId?: string;
   },
   deps: BrowserTabLeaseDeps = {},
 ): Promise<BrowserTabLease> {
@@ -169,6 +174,9 @@ export async function acquireBrowserTabLease(
     options.signal?.throwIfAborted();
     // Identity probes are slow on Windows; run them before taking the lock so it stays short.
     const probes = await probeStaleLeases(profileDir, { nowMs: now(), staleMs, ...liveness });
+    const deadSessionLeases = options.takeOverDeadSessionId
+      ? await findDeadSessionLeases(profileDir, options.takeOverDeadSessionId, liveness)
+      : new Set<string>();
     let acquired: BrowserTabLeaseRecord | null;
     try {
       acquired = await withRegistryLock(
@@ -176,7 +184,11 @@ export async function acquireBrowserTabLease(
         async () => {
           options.signal?.throwIfAborted();
           const registry = await readRegistry(profileDir);
-          const active = pruneStaleLeases(registry.leases, { nowMs: now(), staleMs, probes });
+          const active = pruneStaleLeases(registry.leases, {
+            nowMs: now(),
+            staleMs,
+            probes,
+          }).filter((lease) => !deadSessionLeases.has(lease.id));
           if (active.length >= maxConcurrentTabs) {
             if (active.length !== registry.leases.length) {
               await writeRegistry(profileDir, { version: 1, leases: active });
@@ -407,47 +419,23 @@ export async function hasOtherActiveBrowserTabLeases(
   });
 }
 
-/**
- * Whether anything other than `sessionId`'s own dead controller holds a slot on the profile,
- * for a reattach that harvested that session after its worker died. The session's own leases
- * count only while their process lives (checked by pid and start time); they are removed once
- * proven dead. Other leases follow the usual rule: a lease is dropped only when it missed its
- * heartbeat past the grace and its process is proven gone.
- */
-export async function hasOtherBrowserTabUsers(
+/** The ids of `sessionId`'s slots whose controller is proven gone (pid and start time). */
+async function findDeadSessionLeases(
   profileDir: string,
   sessionId: string,
-  options: {
-    staleMs?: number;
-    now?: () => number;
-    isProcessAlive?: (pid: number) => boolean;
-    readProcessStartTimeMs?: (pid: number) => Promise<number | null>;
-  } = {},
-): Promise<boolean> {
-  const now = options.now ?? Date.now;
-  const staleMs = Math.max(60_000, options.staleMs ?? DEFAULT_STALE_MS);
-  const liveness = {
-    isProcessAlive: options.isProcessAlive ?? isProcessAlive,
-    readProcessStartTimeMs: options.readProcessStartTimeMs ?? readProcessStartTimeMs,
-  };
-  const probes = await probeStaleLeases(profileDir, { nowMs: now(), staleMs, ...liveness });
-  const ownDead = new Set<string>();
-  const before = await readRegistry(profileDir).catch(() => null);
-  for (const lease of before?.leases ?? []) {
+  liveness: {
+    isProcessAlive: (pid: number) => boolean;
+    readProcessStartTimeMs: (pid: number) => Promise<number | null>;
+  },
+): Promise<Set<string>> {
+  const dead = new Set<string>();
+  const registry = await readRegistry(profileDir).catch(() => null);
+  for (const lease of registry?.leases ?? []) {
     if (lease.sessionId === sessionId && !(await isRegistryLockOwnerAlive(lease, liveness))) {
-      ownDead.add(lease.id);
+      dead.add(lease.id);
     }
   }
-  return withRegistryLock(profileDir, async () => {
-    const registry = await readRegistry(profileDir);
-    const active = pruneStaleLeases(registry.leases, { nowMs: now(), staleMs, probes }).filter(
-      (lease) => !ownDead.has(lease.id),
-    );
-    if (active.length !== registry.leases.length) {
-      await writeRegistry(profileDir, { version: 1, leases: active });
-    }
-    return active.length > 0;
-  });
+  return dead;
 }
 
 export async function hasActiveBrowserTargetLease(

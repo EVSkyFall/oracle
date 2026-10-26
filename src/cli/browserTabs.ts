@@ -23,7 +23,7 @@ import {
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { persistBrowserHarvest } from "./harvestIntegrity.js";
 import { completeOwnedBrowserHarvest } from "./recoveredBrowserHarvest.js";
-import { releaseHarvestedSessionChrome } from "./harvestChromeRelease.js";
+import { releaseHarvestSlot, takeHarvestSlot } from "./harvestChromeRelease.js";
 import type { BrowserHarvestIntegrity } from "../sessionManager.js";
 
 const LIVE_POLL_MS = 2000;
@@ -399,8 +399,12 @@ export async function harvestSessionBrowserOutput(
   };
   const ref = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
+  const log = (line: string) => console.log(line);
 
   let releaseRecoveredChrome: ((close?: boolean) => Promise<void>) | null = null;
+  // Reading the session's tab uses its Chrome like a run does: hold a slot on the profile.
+  const slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
+  let saved = false;
   try {
     let harvested: ChatGptTabSummary;
     try {
@@ -450,14 +454,15 @@ export async function harvestSessionBrowserOutput(
     if (!options.quietOutput && output) {
       process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
     }
-    await completeOwnedBrowserHarvest(sessionId, harvested, integrity, (line) => console.log(line));
-    if (!options.browserTabRef && !releaseRecoveredChrome) {
-      await releaseHarvestedSessionChrome(sessionId, (line) => console.log(line)).catch(
-        () => false,
-      );
-    }
+    await completeOwnedBrowserHarvest(sessionId, harvested, integrity, log);
+    saved = true;
     return harvested;
   } finally {
+    // A relaunched Chrome follows closeAfterRecover; the session's own Chrome is released only
+    // after its answer was saved, and only like its run's end would (harvestChromeRelease.ts).
+    await releaseHarvestSlot(slot, sessionId, saved && !releaseRecoveredChrome, log).catch(
+      () => false,
+    );
     await releaseRecoveredChrome?.(options.closeAfterRecover).catch(() => undefined);
   }
 }
@@ -487,6 +492,10 @@ export async function liveTailSessionBrowserOutput(
   let lastTurnState: SessionTurnState | null = null;
   let requireRecoveredContent = false;
   let recoveredContentDeadlineMs = 0;
+  const log = (line: string) => console.log(line);
+  // Tailing the session's tab uses its Chrome like a run does: hold a slot on the profile.
+  const slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
+  let saved = false;
 
   try {
     // Probe once to see if the live tab is still alive; recover if not.
@@ -586,17 +595,14 @@ export async function liveTailSessionBrowserOutput(
       if (output) {
         process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
       }
-      await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, (line) =>
-        console.log(line),
-      );
-      if (!options.browserTabRef && !releaseRecoveredChrome) {
-        await releaseHarvestedSessionChrome(sessionId, (line) => console.log(line)).catch(
-          () => false,
-        );
-      }
+      await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, log);
+      saved = true;
       return finalHarvest;
     }
   } finally {
+    await releaseHarvestSlot(slot, sessionId, saved && !releaseRecoveredChrome, log).catch(
+      () => false,
+    );
     await releaseRecoveredChrome?.(options.closeAfterRecover).catch(() => undefined);
   }
 }

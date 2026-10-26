@@ -5,6 +5,12 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
+// Never take a browser slot on a real profile in tests (the default is ~/.oracle/browser-profile).
+vi.mock("../../src/cli/harvestChromeRelease.js", () => ({
+  takeHarvestSlot: vi.fn(async () => null),
+  releaseHarvestSlot: vi.fn(async () => false),
+}));
+
 const getPaths = async () => ({
   dir: path.join(os.tmpdir(), `oracle-recovery-mock-${randomUUID()}`),
 });

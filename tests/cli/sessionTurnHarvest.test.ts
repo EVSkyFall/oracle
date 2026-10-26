@@ -6,6 +6,12 @@ import { randomUUID } from "node:crypto";
 import { browserPromptFingerprint } from "../../src/browser/promptFingerprint.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
+// Never take a browser slot on a real profile in tests (the default is ~/.oracle/browser-profile).
+vi.mock("../../src/cli/harvestChromeRelease.js", () => ({
+  takeHarvestSlot: vi.fn(async () => null),
+  releaseHarvestSlot: vi.fn(async () => false),
+}));
+
 // The game session's 13:00 reattach: a follow-up conversation whose earlier turns are complete,
 // and this session's Pro turn still being generated with no assistant message yet.
 const PROMPT = "CODEXish Next round: W5sub2 fix round 2";
@@ -246,10 +252,13 @@ describe("a reattach saves only this session's own turn", () => {
     expect(savedTexts()).not.toContain(PREVIOUS);
   });
 
-  test("after saving this turn's answer, the session's Chrome is released like a run's end; never for an explicit tab", async () => {
-    const release = vi.fn(async () => true);
+  test("--live and --harvest hold a slot while reading; the session's Chrome may be released only after its answer was saved, never for an explicit tab", async () => {
+    const slot = { lease: { id: "slot" }, userDataDir: "/profiles/oracle" };
+    const takeHarvestSlot = vi.fn(async () => slot);
+    const releaseHarvestSlot = vi.fn(async () => false);
     vi.doMock("../../src/cli/harvestChromeRelease.js", () => ({
-      releaseHarvestedSessionChrome: release,
+      takeHarvestSlot,
+      releaseHarvestSlot,
     }));
     try {
       mockSession([finished]);
@@ -257,13 +266,40 @@ describe("a reattach saves only this session's own turn", () => {
         await import("../../src/cli/browserTabs.js");
       await liveTailSessionBrowserOutput("sess-turn");
       await harvestSessionBrowserOutput("sess-turn", { quietOutput: true });
-      expect(release).toHaveBeenCalledTimes(2);
-      expect(release).toHaveBeenCalledWith("sess-turn", expect.any(Function));
+      expect(takeHarvestSlot).toHaveBeenCalledTimes(2);
+      expect(releaseHarvestSlot.mock.calls.map((call) => call.slice(0, 3))).toEqual([
+        [slot, "sess-turn", true],
+        [slot, "sess-turn", true],
+      ]);
       await harvestSessionBrowserOutput("sess-turn", {
         quietOutput: true,
         browserTabRef: "target-x",
       });
-      expect(release).toHaveBeenCalledTimes(2);
+      expect(takeHarvestSlot).toHaveBeenCalledTimes(2);
+      expect(releaseHarvestSlot.mock.calls.at(-1)?.slice(0, 3)).toEqual([null, "sess-turn", true]);
+    } finally {
+      vi.doUnmock("../../src/cli/harvestChromeRelease.js");
+    }
+  });
+
+  test("a harvest that saves nothing gives its slot back without releasing the Chrome", async () => {
+    const slot = { lease: { id: "slot" }, userDataDir: "/profiles/oracle" };
+    const releaseHarvestSlot = vi.fn(async () => false);
+    vi.doMock("../../src/cli/harvestChromeRelease.js", () => ({
+      takeHarvestSlot: vi.fn(async () => slot),
+      releaseHarvestSlot,
+    }));
+    try {
+      mockSession([generatingPartial]);
+      const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+      const settled = harvestSessionBrowserOutput("sess-turn", { quietOutput: true }).catch(
+        (error: unknown) => error,
+      );
+      await advance(4_000);
+      expect(await settled).toBeInstanceOf(Error);
+      expect(releaseHarvestSlot.mock.calls.map((call) => call.slice(0, 3))).toEqual([
+        [slot, "sess-turn", false],
+      ]);
     } finally {
       vi.doUnmock("../../src/cli/harvestChromeRelease.js");
     }

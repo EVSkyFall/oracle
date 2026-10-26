@@ -179,11 +179,17 @@ the session's browser timeout, and `--harvest` reports that the turn has no
 finished answer and saves nothing. Neither ever saves an earlier turn. An
 explicit `--browser-tab` harvest still snapshots that tab's paired answer.
 
+While `--harvest` or `--live` reads the session's tab on Oracle's persistent
+manual-login profile, it holds a browser slot there like a run does, taking
+over the slot of the session's own worker once that worker is proven gone.
 When the session's worker died before its run ended, a harvest that saves its
 answer releases the Chrome Oracle launched for it as the run's own end would:
 only Oracle's persistent manual-login profile, only when the session does not
-keep its browser, and only when no other run holds a browser slot on that
-profile. A Chrome you attached (attach-running, remote Chrome) is never closed.
+keep its browser, and only when its slot was the last one on that profile. The
+last-slot decision and the close happen together under the slot registry's
+lock, so a run that starts meanwhile either keeps the Chrome or waits for the
+close and launches its own. A Chrome you attached (attach-running, remote
+Chrome) is never closed.
 
 Older sessions without a fingerprint retain their existing recovery behavior,
 with a warning that only latest user/assistant pairing can be checked. Their
