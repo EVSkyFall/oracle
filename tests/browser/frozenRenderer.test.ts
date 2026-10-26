@@ -372,6 +372,7 @@ describe("a page that stops answering while the answer is awaited", () => {
           return { result: { value: { active: false, strong: false } } };
         }
         if (expression === "1") return { result: { value: 1 } };
+        if (expression === "document.readyState") return { result: { value: "complete" } };
         if (expression.endsWith(").length")) return { result: { value: 6 } };
         return { result: { value: null } };
       },
@@ -520,5 +521,76 @@ describe("an approval check waiting for a frozen page", () => {
     expect(lines.filter((line) => line.includes("got no answer from the page"))).toHaveLength(1);
     expect(lines.filter((line) => line.includes("App approval check failed"))).toEqual([]);
     expect(lines).toContain("[browser] App approval check: the page answers again.");
+  });
+});
+
+describe("a frozen page that a browser-side reload brings back", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("the wait starts again only once the reloaded page has parsed and its turns hold", async () => {
+    // Stopping the script does not help; the browser-side reload does. The reloaded document
+    // parses for 2 s and shows its turns after 5 s.
+    let frozen = false;
+    let reloadedAt: number | null = null;
+    const since = () => (reloadedAt === null ? 0 : Date.now() - reloadedAt);
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (frozen) return never();
+      if (expression.includes("readTurnProgress")) {
+        return { result: { value: { key: `k${Date.now()}`, length: 9, url: CONVERSATION } } };
+      }
+      if (expression === "document.readyState") {
+        return {
+          result: { value: reloadedAt !== null && since() < 2_000 ? "loading" : "complete" },
+        };
+      }
+      if (expression.endsWith(").length")) {
+        return { result: { value: reloadedAt !== null && since() < 5_000 ? 0 : 6 } };
+      }
+      return { result: { value: 1 } };
+    });
+    const reload = vi.fn(async () => {
+      frozen = false;
+      reloadedAt = Date.now();
+      return {};
+    });
+    const logger = quietLogger();
+    const resync = createTurnResync({
+      Runtime: { evaluate, terminateExecution: vi.fn(never) } as unknown as ChromeClient["Runtime"],
+      Page: { reload, navigate: vi.fn(never) } as unknown as ChromeClient["Page"],
+      logger,
+      conversationUrl: () => CONVERSATION,
+      pollMs: 1_000,
+      frozenMs: 10_000,
+    });
+    const restartedAfterReload: number[] = [];
+    let attempts = 0;
+    void resync
+      .run(
+        (attempt) => {
+          attempts += 1;
+          if (attempts > 1) restartedAfterReload.push(since());
+          return new Promise<string>((_, reject) => {
+            attempt.signal.addEventListener("abort", () => reject(attempt.signal.reason));
+          });
+        },
+        { timeoutMs: 10 * 60_000 },
+      )
+      .catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(2_000);
+    frozen = true;
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(restartedAfterReload).toHaveLength(1);
+    // Turns show 5 s after the reload and must hold for three more reads.
+    expect(restartedAfterReload[0]).toBeGreaterThanOrEqual(5_000);
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    expect(
+      lines.some((line) => /it answers again \(6 turns on the page\); waiting/.test(line)),
+    ).toBe(true);
   });
 });

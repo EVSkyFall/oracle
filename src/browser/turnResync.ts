@@ -199,6 +199,13 @@ class RunTimeSpent extends Error {}
 class ReloadAbandoned extends Error {}
 const endsReload = (error: unknown) =>
   error instanceof RunTimeSpent || error instanceof ReloadAbandoned;
+/** A step that fails on its own is skipped with `fallback`; one that ends the reload is not. */
+const orElse = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
+  promise.catch((error: unknown) => {
+    if (endsReload(error)) throw error;
+    return fallback;
+  });
+type Step = <T>(what: string, start: () => Promise<T>, capMs: number) => Promise<T>;
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> =>
   new Promise<T>((resolve, reject) => {
@@ -398,18 +405,48 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   };
 
   /**
+   * Waits until `settleBy` for a document that has parsed (with `mark`: a new one, the mark
+   * gone) and a turn count that holds for three reads in a row; returns that count (-1 unknown).
+   */
+  const settleTurns = async (step: Step, settleBy: number, mark?: string): Promise<number> => {
+    const settleLeft = () => Math.max(1, settleBy - Date.now());
+    const readiness = mark
+      ? `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`
+      : "document.readyState";
+    while (Date.now() < settleBy) {
+      const state = await orElse(
+        step("reading the new page", () => readPage(readiness), settleLeft()),
+        "old",
+      );
+      if (state === "interactive" || state === "complete") break;
+      await idle(250);
+    }
+    let turns = -1;
+    let steady = 0;
+    while (Date.now() < settleBy && steady < 3) {
+      const count = await orElse(
+        step(
+          "counting the turns",
+          () => readPage(buildConversationTurnCountExpression()),
+          settleLeft(),
+        ),
+        -1,
+      );
+      const next = typeof count === "number" ? count : -1;
+      steady = next > 0 && next === turns ? steady + 1 : 0;
+      turns = next;
+      await idle(250);
+    }
+    return turns;
+  };
+
+  /**
    * Reloads the conversation and waits until the new page shows its turns. Every step is bounded
    * by the run's remaining time and stops once `abandoned()` (RunTimeSpent / ReloadAbandoned).
    */
   const reload = async ({ url }: { url: string }, abandoned: () => boolean): Promise<void> => {
-    const step = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
+    const step: Step = (what, start, capMs) =>
       abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
-    // A step that fails on its own is skipped with `fallback`; one that ends the reload is not.
-    const orElse = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
-      promise.catch((error: unknown) => {
-        if (endsReload(error)) throw error;
-        return fallback;
-      });
     const mark = randomUUID();
     await orElse(
       step(
@@ -442,41 +479,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         return;
       }
     }
-    const settleBy = Date.now() + settleMs;
-    const settleLeft = () => Math.max(1, settleBy - Date.now());
-    // The new document: the mark is gone and the page has parsed.
-    while (Date.now() < settleBy) {
-      const state = await orElse(
-        step(
-          "reading the new page",
-          () =>
-            readPage(
-              `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`,
-            ),
-          settleLeft(),
-        ),
-        "old",
-      );
-      if (state === "interactive" || state === "complete") break;
-      await idle(250);
-    }
-    // Its turns: the count holds for three reads in a row.
-    let turns = -1;
-    let steady = 0;
-    while (Date.now() < settleBy && steady < 3) {
-      const count = await orElse(
-        step(
-          "counting the turns",
-          () => readPage(buildConversationTurnCountExpression()),
-          settleLeft(),
-        ),
-        -1,
-      );
-      const next = typeof count === "number" ? count : -1;
-      steady = next > 0 && next === turns ? steady + 1 : 0;
-      turns = next;
-      await idle(250);
-    }
+    const turns = await settleTurns(step, Date.now() + settleMs, mark);
     logger(
       `[browser] Conversation ${how}${turns > 0 ? ` (${turns} turns on the page)` : ""}; waiting for the turn again.`,
     );
@@ -494,19 +497,15 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       logger(
         `[browser] The page stopped answering (${Math.floor((Date.now() - since) / 1_000)}s); ${what}`,
       );
-    const step = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
+    const step: Step = (what, start, capMs) =>
       abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
-    const orElse = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
-      promise.catch((error: unknown) => {
-        if (endsReload(error)) throw error;
-        return fallback;
-      });
     const answers = (capMs: number) =>
       orElse(
         step("asking the page", () => readPage("1").then(() => true), capMs),
         false,
       );
 
+    let turnsAfterReload = -1;
     said("stopping its script.");
     await orElse(
       step(
@@ -537,14 +536,21 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
           );
         }
       }
-      // Any answer now comes from the reloaded document.
+      // Any answer now comes from the reloaded document; once it answers, it shows its turns
+      // before the wait starts again (as after the marked reload).
       const settleBy = Date.now() + settleMs;
-      while (Date.now() < settleBy && !(await answers(Math.max(1, settleBy - Date.now())))) {
+      let answered = false;
+      while (Date.now() < settleBy) {
+        answered = await answers(Math.max(1, settleBy - Date.now()));
+        if (answered) break;
         await idle(250);
       }
+      if (answered) turnsAfterReload = await settleTurns(step, Date.now() + settleMs);
     }
     if (await answers(PAGE_ANSWER_WAIT_MS)) {
-      said("it answers again; waiting for the turn again.");
+      said(
+        `it answers again${turnsAfterReload > 0 ? ` (${turnsAfterReload} turns on the page)` : ""}; waiting for the turn again.`,
+      );
       return;
     }
     if (!trigger.url || !options.replaceTab) {
@@ -566,24 +572,8 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       said("a new tab could not be opened; waiting on the page as it is.");
       return;
     }
-    // The new tab's turns: the count holds for three reads in a row.
-    const settleBy = Date.now() + settleMs;
-    let turns = -1;
-    let steady = 0;
-    while (Date.now() < settleBy && steady < 3) {
-      const count = await orElse(
-        step(
-          "counting the turns",
-          () => readPage(buildConversationTurnCountExpression()),
-          Math.max(1, settleBy - Date.now()),
-        ),
-        -1,
-      );
-      const next = typeof count === "number" ? count : -1;
-      steady = next > 0 && next === turns ? steady + 1 : 0;
-      turns = next;
-      await idle(250);
-    }
+    // The new tab: it has parsed and its turn count holds.
+    const turns = await settleTurns(step, Date.now() + settleMs);
     if (replacement.ready) {
       await orElse(
         step("readying the new tab", () => Promise.resolve(replacement.ready!()), PAGE_COMMAND_MS),
