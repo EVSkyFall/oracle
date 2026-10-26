@@ -40,16 +40,18 @@ async function verify(
 ) {
   const logger = Object.assign(vi.fn(), { verbose: false });
   const onUnproven = vi.fn();
+  const onCommitted = vi.fn();
   const outcome = await promptComposer
     .verifyPromptCommitted(runtimeShowing(value), PROMPT, 300, logger, 4, {
       baselineUserIds: ids ?? undefined,
       onUnproven,
+      onCommitted,
     })
     .then(
       (committed) => ({ committed }),
       (error: unknown) => ({ error }),
     );
-  return { outcome, logger, onUnproven };
+  return { outcome, logger, onUnproven, onCommitted };
 }
 const notSent = (outcome: unknown) =>
   expect((outcome as { error?: Error }).error?.message).toMatch(
@@ -58,7 +60,7 @@ const notSent = (outcome: unknown) =>
 
 describe("the commit check proves a send by the latest user turn's identity", () => {
   test("a new user turn on a page that unmounted its oldest turn (count unchanged) is a proven commit", async () => {
-    const { outcome, onUnproven } = await verify(
+    const { outcome, onUnproven, onCommitted } = await verify(
       probe({
         latestUserMatched: true,
         latestUserIsNew: true,
@@ -70,6 +72,8 @@ describe("the commit check proves a send by the latest user turn's identity", ()
     // The committed count ends at the sent user turn: the answer wait starts at index 3.
     expect(outcome).toEqual({ committed: 4 });
     expect(onUnproven).not.toHaveBeenCalled();
+    // The run keeps its id: every answer wait accepts only that exact turn.
+    expect(onCommitted).toHaveBeenCalledWith({ index: 3, text: PROMPT, messageId: "u5" });
   });
 
   test("a fresh conversation whose new user turn has no id is proven by the count, as before", async () => {
@@ -229,7 +233,6 @@ describe("an unproven send whose composer was cleared goes on, scoped only to a 
     expect(outcome).toEqual({ committed: 5 });
     expect(onUnproven).toHaveBeenCalledWith({ index: 4, text: PROMPT, messageId: null });
   });
-
   test("without ids and without a grown count, a latest user turn showing the prompt never stands", async () => {
     const { outcome, onUnproven } = await verify(
       probe({
@@ -258,13 +261,14 @@ describe("the fingerprint of an unproven send", () => {
     expect(fingerprintOfUserTurn(null)).toBeUndefined();
   });
 
-  test("both the local and the remote run take it after an unproven commit", async () => {
+  test("both the local and the remote run take it from the turn the commit check found", async () => {
     const { readFile } = await import("node:fs/promises");
     const path = await import("node:path");
     const index = await readFile(path.join(process.cwd(), "src", "browser", "index.ts"), "utf8");
+    // The proven turn, else the one standing for an unproven send; never a later page read then.
     expect(
       index.match(
-        /providerState\.commitUnproven === true\s*\?\s*fingerprintOfUserTurn\(providerState\.unprovenCommitTurn/g,
+        /const sentUserTurn = \(providerState\.committedTurn \?\?\s*providerState\.unprovenCommitTurn \?\?\s*null\) as PageUserTurn \| null;\s*const renderedPromptHash = sentUserTurn\?\.messageId\s*\?\s*fingerprintOfUserTurn\(sentUserTurn\)\s*:\s*providerState\.commitUnproven === true\s*\?\s*undefined\s*:\s*await readSubmittedPromptFingerprint\(\s*Runtime,\s*previousUserMessageIds,\s*config\.inputTimeoutMs,\s*prompt,\s*\)/g,
       ),
     ).toHaveLength(2);
   });
@@ -281,8 +285,13 @@ describe("the run decides by id on every send, local and remote, initial and in-
     // Each answer wait attempt, the recheck included, starts at the sent turn found by id.
     expect(count("resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs })")).toBe(2);
     expect(count("await scopeAnswerToSentTurn();")).toBe(2);
+    // The sent turn's record: the pre-send ids, its id once the commit check found it, the prompt.
+    expect(
+      count("? { previousUserMessageIds, messageId: sentUserTurn?.messageId ?? null, prompt }"),
+    ).toBe(2);
+    expect(count("turn: sentTurn,")).toBe(2);
     // Initial sends and in-run follow-ups (local and remote) record their scope and prompt index.
-    expect(count("sentTurnUserIds = submission.presendUserTurnIds ?? null;")).toBe(4);
+    expect(count("sentTurn = submission.sentTurn ?? null;")).toBe(4);
     expect(count("pendingPromptIndex = 0;") - count("let pendingPromptIndex = 0;")).toBe(2);
     expect(count("pendingPromptIndex = index + 1;")).toBe(2);
     // Recorded with promptSubmitted, and carried wherever the submitted-turn hash goes.

@@ -1,26 +1,49 @@
 import type { ChromeClient } from "./types.js";
 import type { TurnResyncAttempt } from "./turnResync.js";
-import { waitForSentUserTurn } from "./promptFingerprint.js";
+import { waitForSentUserTurn, type SentTurnQuery } from "./promptFingerprint.js";
 
-export interface SentTurnScope {
+/** What identifies the user turn a send produced, kept for the run's answer waits. */
+export interface SentTurnRecord {
   /** The user turn identities rendered before the send. */
   previousUserMessageIds: readonly string[];
+  /** Its id: from the commit check, else recorded here the first time the turn is found. */
+  messageId: string | null;
+  /** The prompt the send typed. */
+  prompt: string | null;
+}
+
+export interface SentTurnScope {
+  turn: SentTurnRecord;
   /** The answer wait's current start (the turn index the run passes as minTurnIndex). */
   current: () => number | null;
   /** Moves the answer wait's start to the sent user turn. */
   moveTo: (index: number) => void;
 }
 
-/** Reads the sent user turn once (by id) and moves the scope there; true when it is mounted. */
+function queryOf(turn: SentTurnRecord): SentTurnQuery {
+  return {
+    previousMessageIds: turn.previousUserMessageIds,
+    sentMessageId: turn.messageId,
+    prompt: turn.prompt,
+  };
+}
+
+/** Records the found turn's id: from then on only that exact turn is the sent one. */
+function settle(scope: SentTurnScope, found: { index: number; messageId: string | null }): boolean {
+  if (!scope.turn.messageId && found.messageId) scope.turn.messageId = found.messageId;
+  if (found.index === scope.current()) return false;
+  scope.moveTo(found.index);
+  return true;
+}
+
+/** Reads the sent user turn once and moves the scope there; true when it is mounted. */
 export async function scopeToSentTurnNow(
   runtime: ChromeClient["Runtime"],
   scope: SentTurnScope,
 ): Promise<boolean> {
-  const index = await waitForSentUserTurn(runtime, scope.previousUserMessageIds, {
-    timeoutMs: 0,
-  });
-  if (index === null) return false;
-  if (index !== scope.current()) scope.moveTo(index);
+  const found = await waitForSentUserTurn(runtime, queryOf(scope.turn), { timeoutMs: 0 });
+  if (!found) return false;
+  settle(scope, found);
   return true;
 }
 
@@ -52,14 +75,13 @@ export async function waitAtSentTurn<T>(
   if (attempt.signal.aborted) relay();
   let moved = false;
   // A read every 2 s: it can run for a whole long answer.
-  const watcher = waitForSentUserTurn(runtime, scope.previousUserMessageIds, {
+  const watcher = waitForSentUserTurn(runtime, queryOf(scope.turn), {
     signal: stopWatching.signal,
     timeoutMs: attempt.remainingMs(totalMs),
     pollMs: 2_000,
   })
-    .then((index) => {
-      if (index === null || stopWatching.signal.aborted || index === scope.current()) return;
-      scope.moveTo(index);
+    .then((found) => {
+      if (!found || stopWatching.signal.aborted || !settle(scope, found)) return;
       moved = true;
       restart.abort();
     })

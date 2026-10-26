@@ -4,7 +4,12 @@ import {
   readUserMessageIds,
   type PageUserTurn,
 } from "./promptFingerprint.js";
-import { scopeToSentTurnNow, waitAtSentTurn, type SentTurnScope } from "./sentTurnScope.js";
+import {
+  scopeToSentTurnNow,
+  waitAtSentTurn,
+  type SentTurnRecord,
+  type SentTurnScope,
+} from "./sentTurnScope.js";
 import {
   createAttemptAssistantRecheck,
   createBlockingUiWarningCheck,
@@ -544,8 +549,8 @@ export function maybeArchiveCompletedConversationForTest(
 
 type BrowserSubmissionResult = {
   baselineTurns: number | null;
-  /** The user turn identities rendered before the send. */
-  presendUserTurnIds?: readonly string[] | null;
+  /** What identifies the user turn the send produced (null without user turn ids). */
+  sentTurn?: SentTurnRecord | null;
   baselineAssistantText: string | null;
   deepResearchTargetKeys?: string[];
   deepResearchTargetBaselineCaptured?: boolean;
@@ -1926,15 +1931,21 @@ async function runBrowserModeInternal(
       });
       await markPromptSubmitted();
       const providerBaselineTurns = providerState.baselineTurns;
-      // An unproven commit already waited out its window; its fingerprint is the turn the
-      // commit check found standing for the sent one (none when it could not tell).
-      const renderedPromptHash =
-        providerState.commitUnproven === true
-          ? fingerprintOfUserTurn(providerState.unprovenCommitTurn as PageUserTurn | null)
+      // The sent user turn as the commit check found it: the turn that proved the commit, or,
+      // after an unproven commit (which already waited out its window), the turn standing for
+      // the sent one (none when it could not tell).
+      const sentUserTurn = (providerState.committedTurn ??
+        providerState.unprovenCommitTurn ??
+        null) as PageUserTurn | null;
+      const renderedPromptHash = sentUserTurn?.messageId
+        ? fingerprintOfUserTurn(sentUserTurn)
+        : providerState.commitUnproven === true
+          ? undefined
           : await readSubmittedPromptFingerprint(
               Runtime,
               previousUserMessageIds,
               config.inputTimeoutMs,
+              prompt,
             );
       if (renderedPromptHash) {
         submittedPromptHash = renderedPromptHash;
@@ -1972,7 +1983,9 @@ async function runBrowserModeInternal(
       return {
         baselineTurns,
         baselineAssistantText,
-        presendUserTurnIds: previousUserMessageIds ?? null,
+        sentTurn: previousUserMessageIds
+          ? { previousUserMessageIds, messageId: sentUserTurn?.messageId ?? null, prompt }
+          : null,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
@@ -1987,14 +2000,14 @@ async function runBrowserModeInternal(
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
-    let sentTurnUserIds: readonly string[] | null = null;
+    let sentTurn: SentTurnRecord | null = null;
     let imageArtifactMinTurnIndex: number | null = null;
     // The answer follows the user turn this run sent, found by its identity (sentTurnScope.ts):
     // each attempt starts there, and a turn that mounts late restarts the wait there.
     const sentTurnScope = (): SentTurnScope | null =>
-      sentTurnUserIds
+      sentTurn
         ? {
-            previousUserMessageIds: sentTurnUserIds,
+            turn: sentTurn,
             current: () => baselineTurns,
             moveTo: (index) => {
               logger(
@@ -2030,7 +2043,7 @@ async function runBrowserModeInternal(
         logger,
       });
       baselineTurns = submission.baselineTurns;
-      sentTurnUserIds = submission.presendUserTurnIds ?? null;
+      sentTurn = submission.sentTurn ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
@@ -2493,7 +2506,7 @@ async function runBrowserModeInternal(
           logger,
         });
         baselineTurns = submission.baselineTurns;
-        sentTurnUserIds = submission.presendUserTurnIds ?? null;
+        sentTurn = submission.sentTurn ?? null;
         baselineAssistantText = submission.baselineAssistantText;
       } finally {
         await releaseProfileLockIfHeld();
@@ -3738,15 +3751,21 @@ async function runRemoteBrowserMode(
       });
       await markPromptSubmitted();
       const providerBaselineTurns = providerState.baselineTurns;
-      // An unproven commit already waited out its window; its fingerprint is the turn the
-      // commit check found standing for the sent one (none when it could not tell).
-      const renderedPromptHash =
-        providerState.commitUnproven === true
-          ? fingerprintOfUserTurn(providerState.unprovenCommitTurn as PageUserTurn | null)
+      // The sent user turn as the commit check found it: the turn that proved the commit, or,
+      // after an unproven commit (which already waited out its window), the turn standing for
+      // the sent one (none when it could not tell).
+      const sentUserTurn = (providerState.committedTurn ??
+        providerState.unprovenCommitTurn ??
+        null) as PageUserTurn | null;
+      const renderedPromptHash = sentUserTurn?.messageId
+        ? fingerprintOfUserTurn(sentUserTurn)
+        : providerState.commitUnproven === true
+          ? undefined
           : await readSubmittedPromptFingerprint(
               Runtime,
               previousUserMessageIds,
               config.inputTimeoutMs,
+              prompt,
             );
       if (renderedPromptHash) {
         submittedPromptHash = renderedPromptHash;
@@ -3758,7 +3777,9 @@ async function runRemoteBrowserMode(
       return {
         baselineTurns,
         baselineAssistantText,
-        presendUserTurnIds: previousUserMessageIds ?? null,
+        sentTurn: previousUserMessageIds
+          ? { previousUserMessageIds, messageId: sentUserTurn?.messageId ?? null, prompt }
+          : null,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
@@ -3773,14 +3794,14 @@ async function runRemoteBrowserMode(
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
-    let sentTurnUserIds: readonly string[] | null = null;
+    let sentTurn: SentTurnRecord | null = null;
     let imageArtifactMinTurnIndex: number | null = null;
     // The answer follows the user turn this run sent, found by its identity (sentTurnScope.ts):
     // each attempt starts there, and a turn that mounts late restarts the wait there.
     const sentTurnScope = (): SentTurnScope | null =>
-      sentTurnUserIds
+      sentTurn
         ? {
-            previousUserMessageIds: sentTurnUserIds,
+            turn: sentTurn,
             current: () => baselineTurns,
             moveTo: (index) => {
               logger(
@@ -3813,7 +3834,7 @@ async function runRemoteBrowserMode(
       logger,
     });
     baselineTurns = submission.baselineTurns;
-    sentTurnUserIds = submission.presendUserTurnIds ?? null;
+    sentTurn = submission.sentTurn ?? null;
     baselineAssistantText = submission.baselineAssistantText;
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
@@ -4227,7 +4248,7 @@ async function runRemoteBrowserMode(
         logger,
       });
       baselineTurns = submission.baselineTurns;
-      sentTurnUserIds = submission.presendUserTurnIds ?? null;
+      sentTurn = submission.sentTurn ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
       turns.push({ ...turn, prompt: followUpPrompt });

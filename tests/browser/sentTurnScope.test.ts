@@ -1,24 +1,40 @@
 import { describe, expect, test, vi } from "vitest";
-import { waitAtSentTurn, type SentTurnScope } from "../../src/browser/sentTurnScope.js";
+import {
+  scopeToSentTurnNow,
+  waitAtSentTurn,
+  type SentTurnScope,
+} from "../../src/browser/sentTurnScope.js";
 
 // One answer-wait attempt scoped to the user turn the run sent, found by its identity. The page's
 // latest user turn is a fake that the test moves: before the send it is u4 (index 3 of a window
 // of four); the sent turn u5 mounts at index 3 once the oldest exchange unmounts.
-function page(latest: { index: number; messageId: string } | null) {
+type PageTurn = {
+  index: number;
+  messageId: string;
+  text?: string;
+  /** No pre-send user turn is rendered (the page's read flags it). */
+  presendUnrendered?: boolean;
+};
+function page(latest: PageTurn | null) {
   const state = { latest };
   const runtime = {
     evaluate: vi.fn(async () => ({
-      result: { value: state.latest ? { ...state.latest, text: "x" } : null },
+      result: { value: state.latest ? { text: "x", ...state.latest } : null },
     })),
   };
   return { state, runtime: runtime as never, evaluate: runtime.evaluate };
 }
 
-function scopeAt(start: number) {
+const SENT_PROMPT = "Follow-up 5: print 1..150, one per line";
+function scopeAt(start: number, sentMessageId: string | null = null) {
   const moves: number[] = [];
   let current: number | null = start;
   const scope: SentTurnScope = {
-    previousUserMessageIds: ["u1", "u2", "u3", "u4"],
+    turn: {
+      previousUserMessageIds: ["u1", "u2", "u3", "u4"],
+      messageId: sentMessageId,
+      prompt: SENT_PROMPT,
+    },
     current: () => current,
     moveTo: (index) => {
       moves.push(index);
@@ -92,6 +108,54 @@ describe("an answer-wait attempt at the sent user turn", () => {
     });
     setTimeout(() => reload.abort(), 50);
     await expect(outcome).rejects.toThrow("reloaded");
+  });
+
+  test("with the sent turn's id known, an older turn rendered later never moves the scope", async () => {
+    // A window above the send's own (a scroll or a reload): u0 was never among the pre-send ids.
+    const view = page({ index: 2, messageId: "u0", presendUnrendered: true });
+    const { scope, moves } = scopeAt(3, "u5");
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(false);
+    view.state.latest = { index: 1, messageId: "u6" };
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(false);
+    expect(moves).toEqual([]);
+    // The sent turn itself, wherever the window puts it.
+    view.state.latest = { index: 2, messageId: "u5" };
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(true);
+    expect(moves).toEqual([2]);
+  });
+
+  test("with the id unknown, a latest turn after no rendered pre-send turn counts only when it shows the sent prompt", async () => {
+    const view = page({
+      index: 2,
+      messageId: "u0",
+      text: "Earlier question 0",
+      presendUnrendered: true,
+    });
+    const { scope, moves } = scopeAt(3);
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(false);
+    expect(moves).toEqual([]);
+    expect(scope.turn.messageId).toBeNull();
+    view.state.latest = { index: 2, messageId: "u5", text: SENT_PROMPT, presendUnrendered: true };
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(true);
+    expect(moves).toEqual([2]);
+  });
+
+  test("the first find records the sent turn's id: from then on only that turn moves the scope", async () => {
+    const view = page({ index: 3, messageId: "u5" });
+    const { scope, moves } = scopeAt(4);
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(true);
+    expect(scope.turn.messageId).toBe("u5");
+    // Another turn not among the pre-send ids, after the send's own window went away.
+    view.state.latest = { index: 1, messageId: "u0" };
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(false);
+    expect(moves).toEqual([3]);
+  });
+
+  test("a pre-send turn is never the sent one", async () => {
+    const view = page({ index: 3, messageId: "u4" });
+    const { scope, moves } = scopeAt(4);
+    expect(await scopeToSentTurnNow(view.runtime, scope)).toBe(false);
+    expect(moves).toEqual([]);
   });
 
   test("without the pre-send ids the attempt runs as before", async () => {

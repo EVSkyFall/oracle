@@ -6,8 +6,15 @@ import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
 import { chatgptDomProvider } from "../../src/browser/providers/chatgptDomProvider.js";
 import { buildConversationTurnCountExpression } from "../../src/browser/conversationTurns.js";
-import { readUserMessageIds } from "../../src/browser/promptFingerprint.js";
-import { waitAtSentTurn } from "../../src/browser/sentTurnScope.js";
+import {
+  readSubmittedPromptFingerprint,
+  readUserMessageIds,
+} from "../../src/browser/promptFingerprint.js";
+import {
+  scopeToSentTurnNow,
+  waitAtSentTurn,
+  type SentTurnScope,
+} from "../../src/browser/sentTurnScope.js";
 import { waitForAssistantResponse } from "../../src/browser/actions/assistantResponse.js";
 
 // Real-Chrome fixture of sends in a long conversation (2026-10-26: session
@@ -49,16 +56,28 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     ? '<div data-chatgpt-search-unit-key="a' + n + ':assistant" data-chatgpt-search-message-ids="a' + n + '">'
     : '<div data-message-author-role="assistant">') +
     '<div class="markdown"><p>' + text + '</p></div><div class="turn-action-controls"><button type="button" data-testid="copy-turn-action-button" aria-label="Copy">c</button></div></div>';
+  const exchanges = [];
+  const render = (record) => {
+    const node = document.createElement('div');
+    if (mode.ids) node.setAttribute('data-turn-key', 'u' + record.n);
+    else node.setAttribute('data-testid', 'conversation-turn-' + record.n);
+    node.innerHTML = '<div data-content-search-turn-key="k' + record.n + '">' + userUnit(record.n, record.user) + (record.answer ? assistantUnit(record.n, record.answer) : '') + '</div>';
+    return node;
+  };
   const exchange = (user, answer) => {
     counter += 1;
-    const node = document.createElement('div');
-    if (mode.ids) node.setAttribute('data-turn-key', 'u' + counter);
-    else node.setAttribute('data-testid', 'conversation-turn-' + counter);
-    node.innerHTML = '<div data-content-search-turn-key="k' + counter + '">' + userUnit(counter, user) + (answer ? assistantUnit(counter, answer) : '') + '</div>';
+    const record = { n: counter, user, answer };
+    exchanges.push(record);
+    const node = render(record);
     thread.append(node);
     // The window keeps the latest exchanges only: the oldest unmounts.
     while (mode.window && thread.children.length > mode.window) thread.firstElementChild.remove();
-    return { node, n: counter };
+    return { node, n: counter, record };
+  };
+  // Another window of exchanges (first..last), as after a scroll or a reload.
+  window.showExchanges = (first, last) => {
+    thread.replaceChildren(...exchanges.filter((r) => r.n >= first && r.n <= last).map(render));
+    return thread.children.length;
   };
   // ids: message ids on the units; window: exchanges kept rendered (0: all); initial: the earlier
   // turns' prompts; lost: the click sends nothing; lateMs: the new exchange mounts this late.
@@ -72,9 +91,10 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     const sent = editor.innerText.trim();
     editor.textContent = '';
     setTimeout(() => {
-      const { node, n } = exchange(sent, null);
+      const { node, n, record } = exchange(sent, null);
       setTimeout(() => {
-        node.firstElementChild.insertAdjacentHTML('beforeend', assistantUnit(n, 'Answer to: ' + sent));
+        record.answer = 'Answer to: ' + sent;
+        node.firstElementChild.insertAdjacentHTML('beforeend', assistantUnit(n, record.answer));
       }, 1500);
     }, mode.lateMs ?? 0);
   });
@@ -203,7 +223,11 @@ describe.runIf(enabled)(
       const answer = await waitAtSentTurn(
         client.Runtime,
         {
-          previousUserMessageIds: previousUserMessageIds!,
+          turn: {
+            previousUserMessageIds: previousUserMessageIds!,
+            messageId: null,
+            prompt: PROMPT,
+          },
           current: () => state.baselineTurns as number,
           moveTo: (index) => {
             moves.push(index);
@@ -228,6 +252,51 @@ describe.runIf(enabled)(
       expect(moves).toEqual([3]);
       expect(answer.text.trim()).toBe(answerTo(PROMPT));
     }, 180_000);
+
+    test("an older exchange rendered after the send (a scroll, a reload) never moves the scope, with the sent id known or not", async () => {
+      // Before the send only the window u5..u8 is rendered: the pre-send ids hold that window.
+      await open({ ids: true, window: 4, initial: earlier(8) });
+      const { ctx, state, previousUserMessageIds } = await send(PROMPT);
+      expect(previousUserMessageIds).toEqual(["u5", "u6", "u7", "u8"]);
+      expect(state.committedTurn).toMatchObject({ index: 3, messageId: "u9" });
+      expect(await answerOf(ctx)).toBe(answerTo(PROMPT));
+      const scopeFor = (messageId: string | null, start: number) => {
+        const moves: number[] = [];
+        const scope: SentTurnScope = {
+          turn: { previousUserMessageIds: previousUserMessageIds!, messageId, prompt: PROMPT },
+          current: () => start,
+          moveTo: (index) => moves.push(index),
+        };
+        return { scope, moves };
+      };
+      // The window moves up to u2..u4: none of them was rendered before the send.
+      await client.Runtime.evaluate({ expression: "window.showExchanges(2, 4)" });
+      for (const messageId of ["u9", null]) {
+        const { scope, moves } = scopeFor(messageId, 3);
+        expect(await scopeToSentTurnNow(client.Runtime, scope), String(messageId)).toBe(false);
+        expect(moves, String(messageId)).toEqual([]);
+        expect(scope.turn.messageId).toBe(messageId);
+      }
+      expect(
+        await readSubmittedPromptFingerprint(client.Runtime, previousUserMessageIds, 0, PROMPT),
+      ).toBeUndefined();
+      // The send's own window, scrolled one exchange up (u5..u8 at 0..3, u9 below): no move.
+      await client.Runtime.evaluate({ expression: "window.showExchanges(5, 8)" });
+      for (const messageId of ["u9", null]) {
+        const { scope, moves } = scopeFor(messageId, 3);
+        expect(await scopeToSentTurnNow(client.Runtime, scope), String(messageId)).toBe(false);
+        expect(moves, String(messageId)).toEqual([]);
+      }
+      // The sent turn back in a window of three (u7..u9): found by its id, or as the latest user
+      // turn after the rendered pre-send ones.
+      await client.Runtime.evaluate({ expression: "window.showExchanges(7, 9)" });
+      for (const messageId of ["u9", null]) {
+        const { scope, moves } = scopeFor(messageId, 3);
+        expect(await scopeToSentTurnNow(client.Runtime, scope), String(messageId)).toBe(true);
+        expect(moves, String(messageId)).toEqual([2]);
+        expect(scope.turn.messageId).toBe("u9");
+      }
+    }, 150_000);
 
     test("without ids, an unproven windowed send goes on but never lowers the scope onto an older turn", async () => {
       await open({ ids: false, window: 4, initial: earlier(4) });

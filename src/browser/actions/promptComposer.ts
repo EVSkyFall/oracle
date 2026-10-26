@@ -157,6 +157,8 @@ export async function submitPrompt(
      * latest user turn when it shows the prompt and is not provably an older turn, else null.
      */
     onCommitUnproven?: (turn: PageUserTurn | null) => void;
+    /** The commit was proven by the sent user turn: called with that turn. */
+    onCommitted?: (turn: PageUserTurn) => void;
     /**
      * The user turn identities rendered before the send, as the run read them (with its input
      * timeout) before staging the prompt. Read here once when not given.
@@ -457,7 +459,11 @@ export async function submitPrompt(
     commitTimeoutMs,
     logger,
     deps.baselineTurns ?? undefined,
-    { baselineUserIds, onUnproven: deps.onCommitUnproven },
+    {
+      baselineUserIds,
+      onUnproven: deps.onCommitUnproven,
+      onCommitted: deps.onCommitted,
+    },
   );
 }
 
@@ -1298,6 +1304,7 @@ async function verifyPromptCommitted(
     /** The user turn identities rendered before the send (readUserMessageIds). */
     baselineUserIds?: readonly string[];
     onUnproven?: (turn: PageUserTurn | null) => void;
+    onCommitted?: (turn: PageUserTurn) => void;
   } = {},
 ): Promise<number | null> {
   const deadline = Date.now() + timeoutMs;
@@ -1422,6 +1429,11 @@ async function verifyPromptCommitted(
     };
   })()`;
 
+  const latestUserTurn = (probe: CommitProbeState): PageUserTurn => ({
+    index: probe.latestUserIndex!,
+    text: probe.latestUserRawText ?? null,
+    messageId: probe.latestUserId ?? null,
+  });
   let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
@@ -1438,6 +1450,7 @@ async function verifyPromptCommitted(
       typeof info.latestUserIndex === "number" &&
       info.latestUserIndex >= 0
     ) {
+      options.onCommitted?.(latestUserTurn(info));
       return info.latestUserIndex + 1;
     }
     // With the pre-send identities every decision is made by id: text in older turns and a count
@@ -1483,15 +1496,7 @@ async function verifyPromptCommitted(
     );
     const latestStands =
       newUserTurn && typeof probe?.latestUserIndex === "number" && probe.latestUserIndex >= 0;
-    options.onUnproven?.(
-      latestStands
-        ? {
-            index: probe!.latestUserIndex!,
-            text: probe!.latestUserRawText ?? null,
-            messageId: probe!.latestUserId ?? null,
-          }
-        : null,
-    );
+    options.onUnproven?.(latestStands ? latestUserTurn(probe!) : null);
     return latestStands ? probe!.latestUserIndex! + 1 : null;
   }
   if (logger) {

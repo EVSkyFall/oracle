@@ -30,6 +30,8 @@ interface ChatgptDomProviderState {
   commitUnproven?: boolean;
   /** With commitUnproven: the latest user turn standing for the sent one, if any. */
   unprovenCommitTurn?: PageUserTurn | null;
+  /** The sent user turn that proved the commit. */
+  committedTurn?: PageUserTurn | null;
 }
 
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
@@ -71,6 +73,9 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       onCommitUnproven: (turn) => {
         state.commitUnproven = true;
         state.unprovenCommitTurn = turn;
+      },
+      onCommitted: (turn) => {
+        state.committedTurn = turn;
       },
     },
     ctx.prompt,
