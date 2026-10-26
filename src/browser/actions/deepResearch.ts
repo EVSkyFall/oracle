@@ -10,6 +10,7 @@ import {
 } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
+import { RunTimeExpiredError } from "../runClient.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import {
   captureAssistantMarkdown,
@@ -260,27 +261,38 @@ export async function waitForResearchPlanAutoConfirm(
     return capturedPlan;
   };
 
-  // Phase A: Detect research plan appearance (up to 60s)
-  const planDeadline = Date.now() + 60_000;
-  let planDetected = false;
+  try {
+    return await waitForPlan();
+  } catch (error) {
+    if (!(error instanceof RunTimeExpiredError)) throw error;
+    logger(
+      "[browser] Deep Research plan wait: the page did not answer within the plan wait; proceeding to monitor research progress.",
+    );
+    return capturedPlan;
+  }
 
-  while (Date.now() < planDeadline) {
-    const frameStatus = await readPlanStatus();
-    if (frameStatus) {
-      await capturePlan(frameStatus);
-      if (frameStatus.researchStarted) {
-        return reportResearchStarted();
-      }
-      if (capturedPlan) {
-        planDetected = true;
-        break;
-      }
-    }
+  async function waitForPlan(): Promise<BrowserResearchPlanMetadata | null> {
+    // Phase A: Detect research plan appearance (up to 60s)
+    const planDeadline = Date.now() + 60_000;
+    let planDetected = false;
 
-    // Legacy/inline fallback. Do not treat an arbitrary large iframe as a plan:
-    // ChatGPT projects, attachments, and other tools also render large iframes.
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    while (Date.now() < planDeadline) {
+      const frameStatus = await readPlanStatus();
+      if (frameStatus) {
+        await capturePlan(frameStatus);
+        if (frameStatus.researchStarted) {
+          return reportResearchStarted();
+        }
+        if (capturedPlan) {
+          planDetected = true;
+          break;
+        }
+      }
+
+      // Legacy/inline fallback. Do not treat an arbitrary large iframe as a plan:
+      // ChatGPT projects, attachments, and other tools also render large iframes.
+      const { result } = await Runtime.evaluate({
+        expression: `(() => {
         const turns = Array.from(document.querySelectorAll(':is([data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"])'));
         const assistantText = String(turns.at(-1)?.textContent || '').toLowerCase();
         const hasResearchText = assistantText.includes('researching') ||
@@ -289,39 +301,39 @@ export async function waitForResearchPlanAutoConfirm(
           assistantText.includes('研究计划');
         return { hasResearchText };
       })()`,
-      returnByValue: true,
-    });
+        returnByValue: true,
+      });
 
-    const val = result?.value as { hasResearchText?: boolean } | undefined;
-    if (val?.hasResearchText) {
-      planDetected = true;
-      logger("[browser] Deep Research activity detected; waiting for plan auto-confirm...");
-      break;
-    }
-    await delay(2_000);
-  }
-
-  if (!planDetected) {
-    logger(
-      "Warning: Research plan not detected within 60s; continuing (may have auto-confirmed already)",
-    );
-    return capturedPlan;
-  }
-
-  // Phase B: Wait for the OOPIF's real execution state instead of sleeping for
-  // the full countdown. The main page cannot see this sandboxed iframe's text.
-  const confirmStart = Date.now();
-  while (Date.now() - confirmStart < autoConfirmWaitMs) {
-    const frameStatus = await readPlanStatus();
-    if (frameStatus) {
-      await capturePlan(frameStatus);
-      if (frameStatus.researchStarted) {
-        return reportResearchStarted();
+      const val = result?.value as { hasResearchText?: boolean } | undefined;
+      if (val?.hasResearchText) {
+        planDetected = true;
+        logger("[browser] Deep Research activity detected; waiting for plan auto-confirm...");
+        break;
       }
+      await delay(2_000);
     }
 
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    if (!planDetected) {
+      logger(
+        "Warning: Research plan not detected within 60s; continuing (may have auto-confirmed already)",
+      );
+      return capturedPlan;
+    }
+
+    // Phase B: Wait for the OOPIF's real execution state instead of sleeping for
+    // the full countdown. The main page cannot see this sandboxed iframe's text.
+    const confirmStart = Date.now();
+    while (Date.now() - confirmStart < autoConfirmWaitMs) {
+      const frameStatus = await readPlanStatus();
+      if (frameStatus) {
+        await capturePlan(frameStatus);
+        if (frameStatus.researchStarted) {
+          return reportResearchStarted();
+        }
+      }
+
+      const { result } = await Runtime.evaluate({
+        expression: `(() => {
         const text = (document.body?.innerText || '').toLowerCase();
         const isResearching = text.includes('researching...') ||
           text.includes('reading sources') ||
@@ -329,19 +341,20 @@ export async function waitForResearchPlanAutoConfirm(
           text.includes('正在阅读来源');
         return { isResearching };
       })()`,
-      returnByValue: true,
-    });
-    const val = result?.value as { isResearching?: boolean } | undefined;
+        returnByValue: true,
+      });
+      const val = result?.value as { isResearching?: boolean } | undefined;
 
-    if (val?.isResearching) {
-      return reportResearchStarted();
+      if (val?.isResearching) {
+        return reportResearchStarted();
+      }
+
+      await delay(2_000);
     }
 
-    await delay(2_000);
+    logger("[browser] Deep Research plan wait elapsed; proceeding to monitor research progress.");
+    return capturedPlan;
   }
-
-  logger("[browser] Deep Research plan wait elapsed; proceeding to monitor research progress.");
-  return capturedPlan;
 }
 
 /**
@@ -359,12 +372,35 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    /** Ends the wait (the resync aborts it to recover a page that stopped answering). */
+    signal?: AbortSignal;
   },
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
+  const signal = options?.signal;
+  // An aborted wait stops at once, also while a call to the page has not answered.
+  const untilAborted = <T>(promise: Promise<T>): Promise<T> => {
+    if (!signal) return promise;
+    promise.catch(() => undefined);
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new Error("Deep Research wait aborted"));
+      if (signal.aborted) return onAbort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  };
   const start = Date.now();
   let lastLogTime = start;
   let lastTextLength = 0;
@@ -391,211 +427,227 @@ export async function waitForDeepResearchCompletion(
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
-  while (Date.now() - start < timeoutMs) {
-    const { result } = await Runtime.evaluate({
-      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral, [...knownFrameHosts]),
-      returnByValue: true,
-    });
-
-    const val = result?.value as
-      | {
-          finished?: boolean;
-          stopVisible?: boolean;
-          textLength?: number;
-          hasIframe?: boolean;
-          hasActiveScopedResearch?: boolean;
-          incompleteResult?: boolean;
-          researchActivity?: boolean;
-          accountBlocked?: boolean;
-          turnKey?: string;
-          turnCount?: number;
-          replyText?: string;
-          deepResearchFrameInScope?: boolean;
-          firstTurnKey?: string;
-          firstTurnLength?: number;
-          firstTurnText?: string;
-        }
-      | undefined;
-
-    if (val?.accountBlocked) {
-      throw new BrowserAutomationError(
-        "ChatGPT account security block detected during Deep Research. Open chatgpt.com in Chrome, secure the account, then rerun Oracle.",
-        { stage: "chatgpt-account-blocked", code: "chatgpt-account-blocked" },
+  try {
+    while (Date.now() - start < timeoutMs) {
+      const { result } = await untilAborted(
+        Runtime.evaluate({
+          expression: buildDeepResearchCompletionPollExpression(minTurnLiteral, [
+            ...knownFrameHosts,
+          ]),
+          returnByValue: true,
+        }),
       );
-    }
-    // ChatGPT renders the Deep Research report inside an out-of-process,
-    // sandboxed iframe (connector_openai_deep_research.*.oaiusercontent.com),
-    // doubly nested and same-origin. That OOPIF does NOT appear in the main
-    // page's frame tree, so the in-page isolated-world path
-    // (readDeepResearchFrameResult) can never see it. The target-attach path
-    // (readDeepResearchTargetResult) attaches to the iframe's own CDP target and
-    // walks its nested frames, so it CAN read the report. Prefer the target path
-    // and fall back to the in-page frame path for legacy/inline rendering.
-    const rawTargetResult = client
-      ? ((
-          await readDeepResearchTargetResult(
-            client,
-            ignoredTargetKeys,
-            requireScopedTargetOwner ? minTurnLiteral : -1,
-            {
-              // Reattach sets the owner flag even when the turn index could not
-              // be read. -1 would skip the owner filter and accept any finished
-              // iframe, including a report from another run.
-              rejectCompletedWhenOwnerUnknown: requireScopedTargetOwner && minTurnLiteral < 0,
-              frameScopeTurnIndex: minTurnLiteral,
-              knownFrameHosts,
-            },
-          ).catch(() => null)
-        )?.read ?? null)
-      : null;
-    const targetResult = filterIncompleteDeepResearchRead(rawTargetResult);
-    // A completed target read is authoritative. If the target read is missing or
-    // only in-progress, still try the in-page frame path so an incomplete target
-    // read does not suppress a completed report there (legacy/inline rendering).
-    const inPageScan =
-      !targetResult?.completed && Page
-        ? await readDeepResearchFrameResult(
-            Runtime,
-            Page,
-            client,
-            scopedToNewTurns ? minTurnLiteral : -1,
-          ).catch(() => null)
-        : null;
-    const rawInPageResult = inPageScan?.read ?? null;
-    const inPageResult = filterIncompleteDeepResearchRead(rawInPageResult);
-    const read = pickPreferredDeepResearchRead(targetResult, inPageResult);
-    // Target keys captured before submission are ignored, so a target result is
-    // tied to this run. Main-page iframes are not: old reports can remain in the
-    // conversation and must never authorize a new normal-response fallback.
-    // The report surface (a frame) decides completion once it is seen: the reply next to it is
-    // only the acknowledgement.
-    const frameSeen = Boolean(
-      rawTargetResult || (scopedToNewTurns && rawInPageResult) || val?.deepResearchFrameInScope,
-    );
-    if (frameSeen && !sawResearchFrame) {
-      logger("[browser] Deep Research report frame found; waiting for the research to complete.");
-    }
-    sawResearchFrame ||= frameSeen;
-    observedResearchEvidence ||= Boolean(
-      frameSeen || val?.researchActivity || val?.hasActiveScopedResearch,
-    );
-    // Scoped to this prompt, the last turn's own key identifies it; unscoped, the turn count
-    // tells a newer turn from the same one.
-    const turnIdentity = scopedToNewTurns
-      ? (val?.turnKey ?? "")
-      : `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
-    // Scoped to this prompt's turns, a second assistant turn means something followed the first
-    // reply (a reattach can arrive after the report did).
-    const laterTurnPresent = scopedToNewTurns && (val?.turnCount ?? 0) > 1;
-    if (!observedResearchEvidence && laterTurnPresent) observedResearchEvidence = true;
-    const textLength = val?.textLength ?? 0;
-    // The first reply is the first assistant turn after the prompt: with a later turn already
-    // present (a reattach after the report), that is the acknowledgement, not the last turn.
-    if (!firstReply && val && laterTurnPresent) {
-      firstReply = {
-        identity: val.firstTurnKey ?? "",
-        textLength: val.firstTurnLength ?? 0,
-        text: val.firstTurnText ?? "",
-      };
-    }
-    const movedPastFirstReply =
-      firstReply !== null &&
-      (laterTurnPresent ||
-        turnIdentity !== firstReply.identity ||
-        (textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200));
-    if (firstReply && !observedResearchEvidence && val) {
-      if (movedPastFirstReply || val.stopVisible) {
-        observedResearchEvidence = true;
-        logger("[browser] Deep Research activity followed ChatGPT's first reply.");
-      }
-    }
-    if (read?.completed && read.text) {
-      logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return {
-        text: read.text,
-        html: read.html,
-        meta: { turnId: null, messageId: null },
-      };
-    }
-    // A frame report without a known banner (localized UI, renamed banner) once it is stable.
-    // Stability only counts while nothing shows progress: not the page (its stop button, an
-    // active research in this turn) and not the frame.
-    const progressShown = Boolean(
-      val?.stopVisible || val?.hasActiveScopedResearch || read?.progressActive,
-    );
-    if (
-      read &&
-      !read.completed &&
-      read.structuralComplete &&
-      read.candidateText &&
-      !progressShown
-    ) {
-      const digest = `${read.candidateText.length}:${read.candidateText.slice(-200)}`;
-      structural =
-        structural?.digest === digest
-          ? { digest, polls: structural.polls + 1 }
-          : { digest, polls: 1 };
-      if (structural.polls >= DEEP_RESEARCH_STRUCTURAL_STABLE_POLLS) {
-        logger(
-          `Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed; report stable in its frame)`,
+
+      const val = result?.value as
+        | {
+            finished?: boolean;
+            stopVisible?: boolean;
+            textLength?: number;
+            hasIframe?: boolean;
+            hasActiveScopedResearch?: boolean;
+            incompleteResult?: boolean;
+            researchActivity?: boolean;
+            accountBlocked?: boolean;
+            turnKey?: string;
+            turnCount?: number;
+            replyText?: string;
+            deepResearchFrameInScope?: boolean;
+            firstTurnKey?: string;
+            firstTurnLength?: number;
+            firstTurnText?: string;
+          }
+        | undefined;
+
+      if (val?.accountBlocked) {
+        throw new BrowserAutomationError(
+          "ChatGPT account security block detected during Deep Research. Open chatgpt.com in Chrome, secure the account, then rerun Oracle.",
+          { stage: "chatgpt-account-blocked", code: "chatgpt-account-blocked" },
         );
+      }
+      // ChatGPT renders the Deep Research report inside an out-of-process,
+      // sandboxed iframe (connector_openai_deep_research.*.oaiusercontent.com),
+      // doubly nested and same-origin. That OOPIF does NOT appear in the main
+      // page's frame tree, so the in-page isolated-world path
+      // (readDeepResearchFrameResult) can never see it. The target-attach path
+      // (readDeepResearchTargetResult) attaches to the iframe's own CDP target and
+      // walks its nested frames, so it CAN read the report. Prefer the target path
+      // and fall back to the in-page frame path for legacy/inline rendering.
+      const rawTargetResult = client
+        ? ((
+            await untilAborted(
+              readDeepResearchTargetResult(
+                client,
+                ignoredTargetKeys,
+                requireScopedTargetOwner ? minTurnLiteral : -1,
+                {
+                  // Reattach sets the owner flag even when the turn index could not
+                  // be read. -1 would skip the owner filter and accept any finished
+                  // iframe, including a report from another run.
+                  rejectCompletedWhenOwnerUnknown: requireScopedTargetOwner && minTurnLiteral < 0,
+                  frameScopeTurnIndex: minTurnLiteral,
+                  knownFrameHosts,
+                },
+              ).catch(() => null),
+            )
+          )?.read ?? null)
+        : null;
+      const targetResult = filterIncompleteDeepResearchRead(rawTargetResult);
+      // A completed target read is authoritative. If the target read is missing or
+      // only in-progress, still try the in-page frame path so an incomplete target
+      // read does not suppress a completed report there (legacy/inline rendering).
+      const inPageScan =
+        !targetResult?.completed && Page
+          ? await untilAborted(
+              readDeepResearchFrameResult(
+                Runtime,
+                Page,
+                client,
+                scopedToNewTurns ? minTurnLiteral : -1,
+              ).catch(() => null),
+            )
+          : null;
+      const rawInPageResult = inPageScan?.read ?? null;
+      const inPageResult = filterIncompleteDeepResearchRead(rawInPageResult);
+      const read = pickPreferredDeepResearchRead(targetResult, inPageResult);
+      // Target keys captured before submission are ignored, so a target result is
+      // tied to this run. Main-page iframes are not: old reports can remain in the
+      // conversation and must never authorize a new normal-response fallback.
+      // The report surface (a frame) decides completion once it is seen: the reply next to it is
+      // only the acknowledgement.
+      const frameSeen = Boolean(
+        rawTargetResult || (scopedToNewTurns && rawInPageResult) || val?.deepResearchFrameInScope,
+      );
+      if (frameSeen && !sawResearchFrame) {
+        logger("[browser] Deep Research report frame found; waiting for the research to complete.");
+      }
+      sawResearchFrame ||= frameSeen;
+      observedResearchEvidence ||= Boolean(
+        frameSeen || val?.researchActivity || val?.hasActiveScopedResearch,
+      );
+      // Scoped to this prompt, the last turn's own key identifies it; unscoped, the turn count
+      // tells a newer turn from the same one.
+      const turnIdentity = scopedToNewTurns
+        ? (val?.turnKey ?? "")
+        : `${val?.turnCount ?? ""}:${val?.turnKey ?? ""}`;
+      // Scoped to this prompt's turns, a second assistant turn means something followed the first
+      // reply (a reattach can arrive after the report did).
+      const laterTurnPresent = scopedToNewTurns && (val?.turnCount ?? 0) > 1;
+      if (!observedResearchEvidence && laterTurnPresent) observedResearchEvidence = true;
+      const textLength = val?.textLength ?? 0;
+      // The first reply is the first assistant turn after the prompt: with a later turn already
+      // present (a reattach after the report), that is the acknowledgement, not the last turn.
+      if (!firstReply && val && laterTurnPresent) {
+        firstReply = {
+          identity: val.firstTurnKey ?? "",
+          textLength: val.firstTurnLength ?? 0,
+          text: val.firstTurnText ?? "",
+        };
+      }
+      const movedPastFirstReply =
+        firstReply !== null &&
+        (laterTurnPresent ||
+          turnIdentity !== firstReply.identity ||
+          (textLength >= firstReply.textLength * 2 && textLength - firstReply.textLength >= 200));
+      if (firstReply && !observedResearchEvidence && val) {
+        if (movedPastFirstReply || val.stopVisible) {
+          observedResearchEvidence = true;
+          logger("[browser] Deep Research activity followed ChatGPT's first reply.");
+        }
+      }
+      if (read?.completed && read.text) {
+        logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
         return {
-          text: read.candidateText,
-          html: read.candidateHtml,
+          text: read.text,
+          html: read.html,
           meta: { turnId: null, messageId: null },
         };
       }
-    } else {
-      structural = null;
-    }
-
-    // The research frame's own state wins: while it reports work in progress, no turn change or
-    // finished assistant status is the final report.
-    const frameWorking = Boolean(read && !read.completed);
-    if (val?.finished && !frameWorking) {
-      const extractable =
-        observedResearchEvidence &&
-        (!sawResearchFrame || (firstReply !== null && movedPastFirstReply));
-      if (extractable) {
-        logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-        return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      // A frame report without a known banner (localized UI, renamed banner) once it is stable.
+      // Stability only counts while nothing shows progress: not the page (its stop button, an
+      // active research in this turn) and not the frame.
+      const progressShown = Boolean(
+        val?.stopVisible || val?.hasActiveScopedResearch || read?.progressActive,
+      );
+      if (
+        read &&
+        !read.completed &&
+        read.structuralComplete &&
+        read.candidateText &&
+        !progressShown
+      ) {
+        const digest = `${read.candidateText.length}:${read.candidateText.slice(-200)}`;
+        structural =
+          structural?.digest === digest
+            ? { digest, polls: structural.polls + 1 }
+            : { digest, polls: 1 };
+        if (structural.polls >= DEEP_RESEARCH_STRUCTURAL_STABLE_POLLS) {
+          logger(
+            `Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed; report stable in its frame)`,
+          );
+          return {
+            text: read.candidateText,
+            html: read.candidateHtml,
+            meta: { turnId: null, messageId: null },
+          };
+        }
+      } else {
+        structural = null;
       }
-    }
-    if (val?.finished && !firstReply) {
-      firstReply = { identity: turnIdentity, textLength, text: val.replyText ?? "" };
-      if (!observedResearchEvidence) {
-        logger(
-          "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
-        );
+
+      // The research frame's own state wins: while it reports work in progress, no turn change or
+      // finished assistant status is the final report.
+      const frameWorking = Boolean(read && !read.completed);
+      if (val?.finished && !frameWorking) {
+        const extractable =
+          observedResearchEvidence &&
+          (!sawResearchFrame || (firstReply !== null && movedPastFirstReply));
+        if (extractable) {
+          logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
+          return await untilAborted(
+            extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined),
+          );
+        }
       }
-    }
+      if (val?.finished && !firstReply) {
+        firstReply = { identity: turnIdentity, textLength, text: val.replyText ?? "" };
+        if (!observedResearchEvidence) {
+          logger(
+            "[browser] ChatGPT replied without visible Deep Research activity yet; Deep Research acknowledges first and researches afterwards, so Oracle keeps waiting for the research.",
+          );
+        }
+      }
 
-    const incompleteFrameResult = Boolean(
-      (rawTargetResult?.completed && !targetResult?.completed) ||
-      (rawInPageResult?.completed && !inPageResult?.completed),
-    );
-    if ((val?.incompleteResult || incompleteFrameResult) && !loggedIncompleteResult) {
-      logger("Deep Research interim status detected; waiting for the final report");
-      loggedIncompleteResult = true;
-    }
+      const incompleteFrameResult = Boolean(
+        (rawTargetResult?.completed && !targetResult?.completed) ||
+        (rawInPageResult?.completed && !inPageResult?.completed),
+      );
+      if ((val?.incompleteResult || incompleteFrameResult) && !loggedIncompleteResult) {
+        logger("Deep Research interim status detected; waiting for the final report");
+        loggedIncompleteResult = true;
+      }
 
-    // Progress logging every 60 seconds
-    const now = Date.now();
-    if (now - lastLogTime >= 60_000) {
-      const elapsed = Math.round((now - start) / 1000);
-      const chars = Math.max(val?.textLength ?? 0, read?.textLength ?? 0);
-      const phase =
-        read?.inProgress || val?.hasIframe
-          ? "researching"
-          : val?.stopVisible
-            ? "generating"
-            : "waiting";
-      logger(`Deep Research ${phase}... ${elapsed}s elapsed, ~${chars} chars`);
-      lastLogTime = now;
-    }
+      // Progress logging every 60 seconds
+      const now = Date.now();
+      if (now - lastLogTime >= 60_000) {
+        const elapsed = Math.round((now - start) / 1000);
+        const chars = Math.max(val?.textLength ?? 0, read?.textLength ?? 0);
+        const phase =
+          read?.inProgress || val?.hasIframe
+            ? "researching"
+            : val?.stopVisible
+              ? "generating"
+              : "waiting";
+        logger(`Deep Research ${phase}... ${elapsed}s elapsed, ~${chars} chars`);
+        lastLogTime = now;
+      }
 
-    lastTextLength = Math.max(val?.textLength ?? 0, read?.textLength ?? 0, lastTextLength);
-    await delay(DEEP_RESEARCH_POLL_INTERVAL_MS);
+      lastTextLength = Math.max(val?.textLength ?? 0, read?.textLength ?? 0, lastTextLength);
+      await untilAborted(delay(DEEP_RESEARCH_POLL_INTERVAL_MS));
+    }
+  } catch (error) {
+    // The run's time ran out while a call to the page went unanswered (runClient.ts): the wait
+    // ends exactly as at its own timeout below.
+    if (!(error instanceof RunTimeExpiredError)) throw error;
   }
 
   if (firstReply && !observedResearchEvidence) {

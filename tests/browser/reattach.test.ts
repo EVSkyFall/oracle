@@ -512,15 +512,17 @@ describe("resumeBrowserSession", () => {
       waitForConversationHydration: vi.fn(async () => 2),
       promptPreview: "[bundle] research the attached files",
     });
+    // The wait gets what is left of the timeout and the attempt signal of the page recovery.
     expect(waitForDeepResearchCompletion).toHaveBeenCalledWith(
       expect.anything(),
       logger,
-      2000,
+      expect.any(Number),
       4,
       expect.any(Object),
       expect.any(Object),
-      { requireScopedTargetOwner: true },
+      { requireScopedTargetOwner: true, signal: expect.any(AbortSignal) },
     );
+    expect((waitForDeepResearchCompletion.mock.calls[0] as unknown[])[2]).toBeGreaterThan(1_900);
   });
 
   test("uses Deep Research completion path when reattaching research sessions", async () => {
@@ -593,14 +595,16 @@ describe("resumeBrowserSession", () => {
     expect(waitForDeepResearchCompletion).toHaveBeenCalledWith(
       expect.anything(),
       logger,
-      2000,
+      expect.any(Number),
       1,
       expect.any(Object),
       expect.any(Object),
       {
         requireScopedTargetOwner: true,
+        signal: expect.any(AbortSignal),
       },
     );
+    expect((waitForDeepResearchCompletion.mock.calls[0] as unknown[])[2]).toBeGreaterThan(1_900);
     // The Runtime it gets is the run's (bounded, movable) client: it acts on the connected tab.
     const passed = (waitForDeepResearchCompletion.mock.calls[0] as unknown[])[0] as {
       evaluate: (params: unknown) => Promise<unknown>;

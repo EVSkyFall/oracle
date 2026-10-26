@@ -55,6 +55,7 @@ import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./action
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
 import { createTurnResync } from "./turnResync.js";
 import { createRunClient } from "./runClient.js";
+import { waitForDeepResearchWithRecovery } from "./deepResearchWait.js";
 import { clientTargetId, moveRunToNewTab, type ReplacementTab } from "./tabReplacement.js";
 import { claimBrowserTarget } from "./targetClaim.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
@@ -302,37 +303,6 @@ async function resumeBrowserSessionInternal(
       onApproval: deps.onAppApproval,
       saveDiagnostic: deps.saveAppApprovalDiagnostic,
     };
-    if (config?.researchMode === "deep") {
-      const waitForDeepResearch =
-        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
-      const researchResult = await withTimeout(
-        cancellation.call(() =>
-          withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
-            waitForDeepResearch(
-              Runtime,
-              logger,
-              timeoutMs,
-              minTurnIndex ?? undefined,
-              Page,
-              client,
-              {
-                requireScopedTargetOwner: true,
-              },
-            ),
-          ),
-        ),
-        timeoutMs + 5_000,
-        "Reattach Deep Research response timed out",
-      );
-      const captureTarget = await captureIdentity().catch(() => undefined);
-      await closeAttached();
-      return {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-        captureTarget,
-      };
-    }
-    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     // A tab whose renderer stopped answering is replaced by a new tab on the conversation
     // (turnResync.ts); the frozen tab is closed when the session's run opened it.
     const replaceFrozenTab = (
@@ -397,6 +367,44 @@ async function resumeBrowserSessionInternal(
           if (ownedTarget?.claimId) await claimBrowserTarget(Runtime, ownedTarget.claimId);
         },
       });
+    if (config?.researchMode === "deep") {
+      const waitForDeepResearch =
+        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
+      const researchResult = await withTimeout(
+        cancellation.call(() =>
+          waitForDeepResearchWithRecovery({
+            Runtime,
+            Page,
+            client,
+            logger,
+            conversationUrl: () => expectedConversationUrl,
+            timeLimit: runClient,
+            replaceTab: replaceFrozenTab,
+            timeoutMs,
+            minTurnIndex: minTurnIndex ?? undefined,
+            options: { requireScopedTargetOwner: true },
+            wait: waitForDeepResearch,
+            watch: (operation, monitor) =>
+              withAppApprovalMonitor(
+                Runtime,
+                client.Input,
+                { ...approvalMonitor, ...monitor },
+                operation,
+              ),
+          }),
+        ),
+        timeoutMs + 5_000,
+        "Reattach Deep Research response timed out",
+      );
+      const captureTarget = await captureIdentity().catch(() => undefined);
+      await closeAttached();
+      return {
+        answerText: researchResult.text,
+        answerMarkdown: researchResult.text,
+        captureTarget,
+      };
+    }
+    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     // A stalled turn (or a prompt hidden in the page) is reloaded and waited for again.
     const resync = createTurnResync({
       Runtime,
@@ -691,22 +699,6 @@ async function resumeBrowserSessionViaNewChrome(
       onApproval: deps.onAppApproval,
       saveDiagnostic: deps.saveAppApprovalDiagnostic,
     };
-    if (resolved.researchMode === "deep") {
-      const waitForDeepResearch =
-        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
-      const researchResult = await cancellation.call(() =>
-        withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
-          waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
-            requireScopedTargetOwner: true,
-          }),
-        ),
-      );
-      return {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-      };
-    }
-    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     // A tab whose renderer stopped answering is replaced by a new tab on the conversation
     // (turnResync.ts); this Chrome is the reattach's own, so the frozen tab is closed.
     let currentTabId = clientTargetId(rawClient);
@@ -751,6 +743,37 @@ async function resumeBrowserSessionViaNewChrome(
           movedClient = opened.client;
         },
       });
+    if (resolved.researchMode === "deep") {
+      const waitForDeepResearch =
+        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
+      const researchResult = await cancellation.call(() =>
+        waitForDeepResearchWithRecovery({
+          Runtime,
+          Page,
+          client,
+          logger,
+          conversationUrl: () => conversationUrl,
+          timeLimit: runClient,
+          replaceTab: replaceFrozenTab,
+          timeoutMs,
+          minTurnIndex: minTurnIndex ?? undefined,
+          options: { requireScopedTargetOwner: true },
+          wait: waitForDeepResearch,
+          watch: (operation, monitor) =>
+            withAppApprovalMonitor(
+              Runtime,
+              client.Input,
+              { ...approvalMonitor, ...monitor },
+              operation,
+            ),
+        }),
+      );
+      return {
+        answerText: researchResult.text,
+        answerMarkdown: researchResult.text,
+      };
+    }
+    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const resync = createTurnResync({
       Runtime,
       Page,

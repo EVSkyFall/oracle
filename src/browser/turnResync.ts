@@ -150,6 +150,11 @@ export interface TurnResyncOptions {
    * once `givenUp()` (its step ran out of time) is closed instead of taking the run over.
    */
   replaceTab?: (url: string, givenUp: () => boolean) => Promise<ReplacementTab | null>;
+  /**
+   * Only a page that stops answering is recovered; a quiet thread and a hidden prompt are not
+   * reasons to reload (Deep Research can be quiet for many minutes while it researches).
+   */
+  frozenOnly?: boolean;
 }
 
 export interface TurnResync {
@@ -349,6 +354,8 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       if (frozenSince !== null) {
         kind = "frozen";
         reason = formatQuiet(now - frozenSince);
+      } else if (options.frozenOnly) {
+        // only a page that stops answering is recovered
       } else if (now - stallAnchor >= stallMs * 2 ** stallReloads) {
         reason = `no change for ${formatQuiet(quiet)}`;
       } else if (

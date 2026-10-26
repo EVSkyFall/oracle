@@ -70,6 +70,10 @@ import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./action
 import { createTurnResync, type TurnResyncAttempt } from "./turnResync.js";
 import { createRunClient, type RunClient } from "./runClient.js";
 import { moveRunToNewTab, type ReplacementTab } from "./tabReplacement.js";
+import {
+  deepResearchPlanWaitBoundMs,
+  waitForDeepResearchWithRecovery,
+} from "./deepResearchWait.js";
 import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
@@ -92,7 +96,6 @@ import {
 import {
   activateDeepResearch,
   captureDeepResearchTargetKeys,
-  waitForDeepResearchCompletion,
   waitForResearchPlanAutoConfirm,
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
@@ -1309,6 +1312,65 @@ async function runBrowserModeInternal(
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       cancellation.race(Promise.race([promise, disconnectPromise]));
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
+    const replaceFrozenTab = async (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> => {
+      const run = runClient;
+      const port = chrome?.port;
+      if (!run || !port) return null;
+      return moveRunToNewTab({
+        runClient: run,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectWithNewTab(port, logger, url, chromeHost, {
+                fallbackToDefault: false,
+                background: config.noFocus,
+              }),
+            async (late) => {
+              await late.client.close().catch(() => undefined);
+              if (late.targetId) await closeTab(port, late.targetId, logger, chromeHost);
+            },
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: async () => {
+              await opened.client.close().catch(() => undefined);
+              if (opened.targetId) await closeTab(port, opened.targetId, logger, chromeHost);
+            },
+          };
+        },
+        retire: (retired) => {
+          const frozenId = isolatedTargetId;
+          const steps: Array<() => Promise<unknown>> = [() => retired.close()];
+          if (ownsTarget && frozenId) {
+            steps.push(() => closeTab(port, frozenId, logger, chromeHost));
+          } else if (frozenId) {
+            logger(
+              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
+            );
+          }
+          return steps;
+        },
+        moved: (opened) => {
+          isolatedTargetId = opened.targetId ?? null;
+          lastTargetId = opened.targetId ?? lastTargetId;
+          ownsTarget = Boolean(opened.targetId);
+          ownedRecoveryTarget =
+            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
+              ? { host: chromeHost, port, targetId: opened.targetId, claimId: targetClaimId }
+              : undefined;
+          void emitRuntimeHint();
+        },
+        ready: () => claimBrowserTarget(Runtime, targetClaimId),
+      });
+    };
     const loginClient = client;
     const watchAppApprovals = <T>(
       operation: () => Promise<T>,
@@ -1920,36 +1982,47 @@ async function runBrowserModeInternal(
     const imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
-      await raceWithDisconnect(
-        watchAppApprovals(() =>
-          waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
-            Page,
-            client: researchClient,
+      // No call of the plan wait outlives its own time (deepResearchWait.ts).
+      const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
+      runClient?.setDeadline(planWaitUntil);
+      try {
+        await raceWithDisconnect(
+          watchAppApprovals(
+            () =>
+              waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
+                Page,
+                client: researchClient,
+                ignoredTargetKeys: deepResearchTargetKeys,
+                targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+                minTurnIndex: baselineTurns,
+                onPlan: async (plan) => {
+                  researchPlan = plan;
+                  await emitRuntimeHint();
+                },
+              }),
+            { deadline: () => planWaitUntil },
+          ),
+        );
+      } finally {
+        runClient?.setDeadline(null);
+      }
+      const researchResult = await raceWithDisconnect(
+        waitForDeepResearchWithRecovery({
+          Runtime,
+          Page,
+          client: researchClient,
+          logger,
+          conversationUrl: () => lastUrl,
+          timeLimit: runClient ?? undefined,
+          replaceTab: replaceFrozenTab,
+          timeoutMs: config.timeoutMs,
+          minTurnIndex: baselineTurns,
+          options: {
             ignoredTargetKeys: deepResearchTargetKeys,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-            minTurnIndex: baselineTurns,
-            onPlan: async (plan) => {
-              researchPlan = plan;
-              await emitRuntimeHint();
-            },
-          }),
-        ),
-      );
-      const researchResult = await raceWithDisconnect(
-        watchAppApprovals(() =>
-          waitForDeepResearchCompletion(
-            Runtime,
-            logger,
-            config.timeoutMs,
-            baselineTurns,
-            Page,
-            researchClient,
-            {
-              ignoredTargetKeys: deepResearchTargetKeys,
-              targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-            },
-          ),
-        ),
+          },
+          watch: (operation, monitor) => watchAppApprovals(operation, monitor),
+        }),
       );
       await updateConversationHint("post-deep-research", 15_000).catch(() => false);
       runStatus = "complete";
@@ -2032,65 +2105,6 @@ async function runBrowserModeInternal(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
-    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
-    const replaceFrozenTab = async (
-      url: string,
-      givenUp: () => boolean,
-    ): Promise<ReplacementTab | null> => {
-      const run = runClient;
-      const port = chrome?.port;
-      if (!run || !port) return null;
-      return moveRunToNewTab({
-        runClient: run,
-        logger,
-        givenUp,
-        open: async () => {
-          const opened = await cancellation.acquire(
-            () =>
-              connectWithNewTab(port, logger, url, chromeHost, {
-                fallbackToDefault: false,
-                background: config.noFocus,
-              }),
-            async (late) => {
-              await late.client.close().catch(() => undefined);
-              if (late.targetId) await closeTab(port, late.targetId, logger, chromeHost);
-            },
-          );
-          return {
-            client: cancellation.client(opened.client),
-            targetId: opened.targetId,
-            discard: async () => {
-              await opened.client.close().catch(() => undefined);
-              if (opened.targetId) await closeTab(port, opened.targetId, logger, chromeHost);
-            },
-          };
-        },
-        retire: (retired) => {
-          const frozenId = isolatedTargetId;
-          const steps: Array<() => Promise<unknown>> = [() => retired.close()];
-          if (ownsTarget && frozenId) {
-            steps.push(() => closeTab(port, frozenId, logger, chromeHost));
-          } else if (frozenId) {
-            logger(
-              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
-            );
-          }
-          return steps;
-        },
-        moved: (opened) => {
-          isolatedTargetId = opened.targetId ?? null;
-          lastTargetId = opened.targetId ?? lastTargetId;
-          ownsTarget = Boolean(opened.targetId);
-          ownedRecoveryTarget =
-            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
-              ? { host: chromeHost, port, targetId: opened.targetId, claimId: targetClaimId }
-              : undefined;
-          void emitRuntimeHint();
-        },
-        ready: () => claimBrowserTarget(Runtime, targetClaimId),
-      });
-    };
     // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
@@ -3277,6 +3291,67 @@ async function runRemoteBrowserMode(
     };
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
+    const replaceFrozenTab = async (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> => {
+      const run = runClient;
+      if (!run) return null;
+      return moveRunToNewTab({
+        runClient: run,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectToRemoteChrome(host, port, logger, url, browserWSEndpoint, {
+                approvalWaitMs: browserWSEndpoint ? config.approvalWaitMs : undefined,
+                fallbackToDefault: false,
+                background: config.noFocus,
+              }),
+            (late) => late.close(),
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: () => opened.close(),
+            connection: opened,
+          };
+        },
+        retire: (retired) => {
+          const frozenConnection = connection;
+          const frozenId = remoteTargetId;
+          if (ownsTarget && frozenConnection) {
+            return [() => frozenConnection.close({ preserveTarget: false })];
+          }
+          if (frozenId) {
+            logger(
+              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
+            );
+          }
+          return [() => retired.close()];
+        },
+        moved: (opened) => {
+          connection = opened.connection;
+          remoteTargetId = opened.targetId ?? null;
+          ownsTarget = Boolean(opened.targetId);
+          ownedRecoveryTarget =
+            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
+              ? {
+                  host,
+                  port,
+                  targetId: opened.targetId,
+                  browserWSEndpoint,
+                  claimId: targetClaimId,
+                }
+              : undefined;
+          void emitRuntimeHint();
+        },
+        ready: () => claimBrowserTarget(Runtime, targetClaimId),
+      });
+    };
     const watchAppApprovals = <T>(
       operation: () => Promise<T>,
       extra: Partial<AppApprovalMonitorOptions> = {},
@@ -3643,33 +3718,44 @@ async function runRemoteBrowserMode(
     const imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
-      await watchAppApprovals(() =>
-        waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
-          Page,
-          client: researchClient,
+      // No call of the plan wait outlives its own time (deepResearchWait.ts).
+      const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
+      runClient?.setDeadline(planWaitUntil);
+      try {
+        await watchAppApprovals(
+          () =>
+            waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
+              Page,
+              client: researchClient,
+              ignoredTargetKeys: deepResearchTargetKeys,
+              targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+              minTurnIndex: baselineTurns,
+              onPlan: async (plan) => {
+                researchPlan = plan;
+                await emitRuntimeHint();
+              },
+            }),
+          { deadline: () => planWaitUntil },
+        );
+      } finally {
+        runClient?.setDeadline(null);
+      }
+      const researchResult = await waitForDeepResearchWithRecovery({
+        Runtime,
+        Page,
+        client: researchClient,
+        logger,
+        conversationUrl: () => lastUrl,
+        timeLimit: runClient ?? undefined,
+        replaceTab: replaceFrozenTab,
+        timeoutMs: config.timeoutMs,
+        minTurnIndex: baselineTurns,
+        options: {
           ignoredTargetKeys: deepResearchTargetKeys,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-          minTurnIndex: baselineTurns,
-          onPlan: async (plan) => {
-            researchPlan = plan;
-            await emitRuntimeHint();
-          },
-        }),
-      );
-      const researchResult = await watchAppApprovals(() =>
-        waitForDeepResearchCompletion(
-          Runtime,
-          logger,
-          config.timeoutMs,
-          baselineTurns,
-          Page,
-          researchClient,
-          {
-            ignoredTargetKeys: deepResearchTargetKeys,
-            targetBaselineCaptured: deepResearchTargetBaselineCaptured,
-          },
-        ),
-      );
+        },
+        watch: (operation, monitor) => watchAppApprovals(operation, monitor),
+      });
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
@@ -3749,67 +3835,6 @@ async function runRemoteBrowserMode(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
-    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
-    const replaceFrozenTab = async (
-      url: string,
-      givenUp: () => boolean,
-    ): Promise<ReplacementTab | null> => {
-      const run = runClient;
-      if (!run) return null;
-      return moveRunToNewTab({
-        runClient: run,
-        logger,
-        givenUp,
-        open: async () => {
-          const opened = await cancellation.acquire(
-            () =>
-              connectToRemoteChrome(host, port, logger, url, browserWSEndpoint, {
-                approvalWaitMs: browserWSEndpoint ? config.approvalWaitMs : undefined,
-                fallbackToDefault: false,
-                background: config.noFocus,
-              }),
-            (late) => late.close(),
-          );
-          return {
-            client: cancellation.client(opened.client),
-            targetId: opened.targetId,
-            discard: () => opened.close(),
-            connection: opened,
-          };
-        },
-        retire: (retired) => {
-          const frozenConnection = connection;
-          const frozenId = remoteTargetId;
-          if (ownsTarget && frozenConnection) {
-            return [() => frozenConnection.close({ preserveTarget: false })];
-          }
-          if (frozenId) {
-            logger(
-              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
-            );
-          }
-          return [() => retired.close()];
-        },
-        moved: (opened) => {
-          connection = opened.connection;
-          remoteTargetId = opened.targetId ?? null;
-          ownsTarget = Boolean(opened.targetId);
-          ownedRecoveryTarget =
-            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
-              ? {
-                  host,
-                  port,
-                  targetId: opened.targetId,
-                  browserWSEndpoint,
-                  claimId: targetClaimId,
-                }
-              : undefined;
-          void emitRuntimeHint();
-        },
-        ready: () => claimBrowserTarget(Runtime, targetClaimId),
-      });
-    };
     // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
