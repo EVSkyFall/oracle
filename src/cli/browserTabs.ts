@@ -20,6 +20,8 @@ import {
   isRecoveredConversationHarvestReady,
   recoverConversationTab,
 } from "../browser/recoverConversation.js";
+import { isAnswerNowPlaceholderText } from "../browser/actions/assistantResponse.js";
+import { isImageOnlyUiChromeText } from "../browser/index.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { persistBrowserHarvest } from "./harvestIntegrity.js";
 import { completeOwnedBrowserHarvest } from "./recoveredBrowserHarvest.js";
@@ -29,6 +31,11 @@ import type { BrowserHarvestIntegrity } from "../sessionManager.js";
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
 const HARVEST_FRESHNESS_POLL_MS = 250;
+// Per poll, how long the normal capture's terminal proof may take on this session's turn. It
+// needs four samples about 400 ms apart with the text stable for 1.2 s, so a finished turn is
+// proven in about two seconds; 10 s leaves room for a slow renderer. An unproven turn is polled
+// again by the caller, so this only spaces the polls.
+const TURN_COMPLETE_PROOF_MS = 10_000;
 
 function isRecoverableMissingTabError(message: string): boolean {
   return (
@@ -62,7 +69,10 @@ function latestUserIsSessionTurn(
  * Where this session's turn stands on the page. Only an assistant answer that follows this
  * session's own user turn is its answer: the last assistant message on the page can belong to an
  * earlier turn while this one is still being generated (a Pro turn shows no assistant message
- * until late). With `requireFinished`, an answer still being generated (stop shown) is not one.
+ * until late). Placeholders and UI chrome ("ChatGPT said:", "Pro thinking Answer now", "Stopped
+ * thinking Edit") are never an answer. With `requireFinished`, only text the normal capture's
+ * terminal proof confirmed is the answer (`lastAssistantFinished`): a preamble can show without
+ * the stop button for a moment.
  */
 type SessionTurnState = "answer" | "generating" | "no-answer" | "other-turn";
 
@@ -72,17 +82,23 @@ function sessionTurnState(
   requireFinished: boolean,
 ): SessionTurnState {
   if (!latestUserIsSessionTurn(harvested, fingerprint)) return "other-turn";
-  const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText;
-  if (harvested.assistantFollowsLatestUser !== true || !answer?.trim()) {
+  const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
+  if (
+    harvested.assistantFollowsLatestUser !== true ||
+    !answer.trim() ||
+    isAnswerNowPlaceholderText(answer) ||
+    isImageOnlyUiChromeText(answer)
+  ) {
     return harvested.stopExists ? "generating" : "no-answer";
   }
-  return requireFinished && harvested.stopExists ? "generating" : "answer";
+  if (!requireFinished) return "answer";
+  return harvested.lastAssistantFinished === true ? "answer" : "generating";
 }
 
 function describeSessionTurn(state: SessionTurnState): string {
   switch (state) {
     case "generating":
-      return "This session's turn is still being generated (ChatGPT shows its stop button)";
+      return "This session's turn is still being generated (its answer is not finished yet)";
     case "no-answer":
       return "This session's turn has no assistant answer on the page";
     case "other-turn":
@@ -119,13 +135,16 @@ async function harvestSessionPrompt(
   const fingerprint = sessionFingerprint(meta, requireSessionPrompt);
   // This session's turn is saved only once it has finished; an explicit tab is a snapshot.
   const requireFinished = requireSessionPrompt;
+  const harvestOptions = requireFinished
+    ? { ...options, confirmTurnComplete: { timeoutMs: TURN_COMPLETE_PROOF_MS } }
+    : options;
   const freshnessTimeoutMs = resolveBrowserConfig(meta.browser?.config).inputTimeoutMs;
   const deadline = Date.now() + freshnessTimeoutMs;
-  let harvested = await harvestChatGptTab(options);
+  let harvested = await harvestChatGptTab(harvestOptions);
   let state = sessionTurnState(harvested, fingerprint, requireFinished);
   while (state !== "answer" && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, HARVEST_FRESHNESS_POLL_MS));
-    harvested = await harvestChatGptTab(options);
+    harvested = await harvestChatGptTab(harvestOptions);
     state = sessionTurnState(harvested, fingerprint, requireFinished);
   }
   if (state !== "answer") {
@@ -534,6 +553,7 @@ export async function liveTailSessionBrowserOutput(
       const harvested = await harvestChatGptTab({
         ...endpoint,
         ref: browserTabRef,
+        confirmTurnComplete: { timeoutMs: TURN_COMPLETE_PROOF_MS },
       });
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
       if (requireRecoveredContent && !isRecoveredConversationHarvestReady(harvested)) {

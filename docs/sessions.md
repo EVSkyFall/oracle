@@ -174,6 +174,11 @@ own submitted user turn; the last assistant message on the page can belong to
 an earlier turn while this one is still being generated (a Pro turn shows no
 assistant message until late). `"Capture identity: matched"` compares the
 conversation only; the turn is checked by the submitted-turn fingerprint.
+That answer counts only once the run's own completion proof confirms it
+finished: a finished-action bar on that turn, text that stopped changing, no
+stop button and no live thinking. A preamble shown while the stop button is
+briefly gone is not the answer, and placeholder or UI text ("ChatGPT said:",
+"Pro thinking … Answer now", "Stopped thinking Edit") is never an answer.
 While ChatGPT still generates the session's turn, `--live` keeps waiting, up to
 the session's browser timeout, and `--harvest` reports that the turn has no
 finished answer and saves nothing. Neither ever saves an earlier turn. An

@@ -800,6 +800,29 @@ async function terminateRuntimeExecution(Runtime: ChromeClient["Runtime"]): Prom
   }
 }
 
+/**
+ * The normal capture's terminal-only proof, for a reader that did not run the capture (a
+ * harvest): the latest assistant turn at or after `minTurnIndex` is returned only once it is
+ * proven finished (a debounced finished-action bar on that turn, stable text, no stop button,
+ * no live thinking), its text filtered like every capture (placeholders and UI chrome are no
+ * answer). Null when that is not proven within `timeoutMs`.
+ */
+export function confirmAssistantTurnComplete(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+  minTurnIndex?: number,
+  expectedConversationId?: string,
+  abortSignal?: AbortSignal,
+): ReturnType<typeof pollAssistantCompletion> {
+  return pollAssistantCompletion(
+    Runtime,
+    timeoutMs,
+    minTurnIndex,
+    expectedConversationId,
+    abortSignal,
+  );
+}
+
 async function pollAssistantCompletion(
   Runtime: ChromeClient["Runtime"],
   timeoutMs: number,

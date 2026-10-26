@@ -55,6 +55,8 @@ const completedHarvest = {
   lastAssistantSnippet: "Recovered answer.",
   lastUserText: "original prompt",
   lastUserSnippet: "original prompt",
+  // A real harvest that asked for it proves this turn finished (the normal capture's terminal proof).
+  lastAssistantFinished: true,
 } as const;
 
 describe("harvestSessionBrowserOutput recovery fallback", () => {

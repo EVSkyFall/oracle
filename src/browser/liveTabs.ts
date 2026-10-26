@@ -9,7 +9,11 @@ import {
   SEND_BUTTON_SELECTORS,
   STOP_BUTTON_SELECTORS,
 } from "./constants.js";
-import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
+import {
+  captureAssistantMarkdown,
+  confirmAssistantTurnComplete,
+  readAssistantSnapshot,
+} from "./actions/assistantResponse.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
@@ -72,6 +76,11 @@ export interface ChatGptTabSummary {
   lastAssistantMarkdown: string | null;
   lastAssistantMessageId?: string;
   lastAssistantTurnId?: string;
+  /**
+   * With `confirmTurnComplete`: whether the latest assistant turn after the latest user turn was
+   * proven finished by the normal capture's terminal proof; its text is then the proven answer.
+   */
+  lastAssistantFinished?: boolean;
 }
 
 interface ResolveChatGptTabOptions extends LiveChromeEndpoint {
@@ -85,6 +94,12 @@ interface InspectChatGptTabOptions extends LiveChromeEndpoint {
 interface HarvestChatGptTabOptions extends ResolveChatGptTabOptions {
   target?: ChromeTarget;
   stallWindowMs?: number;
+  /**
+   * Prove that the answer after the latest user turn has finished (confirmAssistantTurnComplete:
+   * a debounced finished-action bar on that turn, stable text, no stop button, no live thinking;
+   * placeholders and UI chrome are never an answer), waiting at most `timeoutMs`.
+   */
+  confirmTurnComplete?: { timeoutMs: number };
 }
 
 const noopLogger = Object.assign((_message: string) => {}, {}) as ((message: string) => void) & {
@@ -654,7 +669,9 @@ export async function harvestChatGptTab(
         normalizedSnapshotText.length > 0 &&
         normalizedSnapshotText === normalizedInspectedText);
     let assistantMarkdown: string | null = null;
+    let copiedMessageId: string | null = null;
     if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
+      copiedMessageId = typeof snapshot.messageId === "string" ? snapshot.messageId : null;
       assistantMarkdown = await captureAssistantMarkdown(
         Runtime,
         {
@@ -684,6 +701,44 @@ export async function harvestChatGptTab(
           ? snapshot.turnId
           : nowSummary.lastAssistantTurnId,
     };
+    if (options.confirmTurnComplete) {
+      harvested.lastAssistantFinished = false;
+      // Scoped like the run's own capture (its minTurnIndex is the submitted user turn's index in
+      // the same turn list), so an earlier answer never counts. A layout that keeps the user turn
+      // outside that list scopes to the assistant turn found after it instead.
+      const minTurn = [nowSummary.lastUserTurnIndex, nowSummary.lastAssistantTurnIndex].find(
+        (index): index is number => typeof index === "number" && index >= 0,
+      );
+      if (nowSummary.assistantFollowsLatestUser && !nowSummary.stopExists) {
+        const confirmed = await confirmAssistantTurnComplete(
+          Runtime,
+          options.confirmTurnComplete.timeoutMs,
+          minTurn,
+          nowSummary.conversationId,
+        ).catch(() => null);
+        if (confirmed?.text?.trim()) {
+          // The copy above was of this message with this text: its result stands (a failed copy
+          // falls back to the text, as without the proof), so the slow copy is not repeated.
+          const sameMessage =
+            copiedMessageId !== null &&
+            confirmed.meta.messageId === copiedMessageId &&
+            confirmed.text.trim() === harvested.lastAssistantText.trim();
+          const markdown = sameMessage
+            ? assistantMarkdown
+            : await captureAssistantMarkdown(Runtime, confirmed.meta, noopLogger).catch(() => null);
+          harvested.lastAssistantFinished = true;
+          harvested.lastAssistantText = confirmed.text.trim();
+          harvested.lastAssistantSnippet = trimToSnippet(harvested.lastAssistantText);
+          harvested.lastAssistantMarkdown = markdown ?? harvested.lastAssistantText;
+          if (typeof confirmed.meta.messageId === "string") {
+            harvested.lastAssistantMessageId = confirmed.meta.messageId;
+          }
+          if (typeof confirmed.meta.turnId === "string") {
+            harvested.lastAssistantTurnId = confirmed.meta.turnId;
+          }
+        }
+      }
+    }
     if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
       const firstFingerprint = harvested.fingerprint;
       await delay(options.stallWindowMs);

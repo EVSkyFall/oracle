@@ -66,6 +66,18 @@ const finished = {
   lastAssistantText: CURRENT,
   lastAssistantMarkdown: CURRENT,
   lastAssistantSnippet: CURRENT,
+  // The normal capture's terminal proof confirmed it (harvestChatGptTab's confirmTurnComplete).
+  lastAssistantFinished: true,
+};
+/** A Pro preamble after this session's turn while the stop button is briefly gone: not proven finished. */
+const PREAMBLE = "Let me look at the fix and its checks first.";
+const preambleNoStop = {
+  ...finished,
+  state: "completed",
+  lastAssistantText: PREAMBLE,
+  lastAssistantMarkdown: PREAMBLE,
+  lastAssistantSnippet: PREAMBLE,
+  lastAssistantFinished: false,
 };
 
 let cwd: string;
@@ -250,6 +262,94 @@ describe("a reattach saves only this session's own turn", () => {
     const outcome = (await settled) as { error?: Error };
     expect(String(outcome.error?.message)).toMatch(/not the one this session submitted/);
     expect(savedTexts()).not.toContain(PREVIOUS);
+  });
+
+  test("--harvest of a preamble shown while the stop button is briefly absent saves nothing", async () => {
+    const { harvestChatGptTab } = mockSession([preambleNoStop]);
+    const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const settled = harvestSessionBrowserOutput("sess-turn", {
+      writeOutputPath: "answer.md",
+      quietOutput: true,
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await advance(4_000);
+    const outcome = (await settled) as { error?: Error };
+    expect(String(outcome.error?.message)).toMatch(/still being generated.*nothing was saved/);
+    await expect(fs.access(path.join(cwd, "answer.md"))).rejects.toThrow();
+    expect(updateSession).not.toHaveBeenCalled();
+    // Every read asked for the normal capture's terminal proof on this turn.
+    for (const [options] of harvestChatGptTab.mock.calls as unknown as Array<[unknown]>) {
+      expect(options).toMatchObject({ confirmTurnComplete: { timeoutMs: expect.any(Number) } });
+    }
+  });
+
+  test("--live does not end on a preamble shown while the stop button is briefly absent; it returns the finished answer", async () => {
+    const { harvestChatGptTab } = mockSession([
+      generatingPartial,
+      ...Array.from({ length: 5 }, () => preambleNoStop),
+      generatingPartial,
+      finished,
+    ]);
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const settled = liveTailSessionBrowserOutput("sess-turn", {
+      writeOutputPath: "answer.md",
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await advance(30_000);
+    expect(await settled).toMatchObject({ value: { lastAssistantMarkdown: CURRENT } });
+    expect(await fs.readFile(path.join(cwd, "answer.md"), "utf8")).toBe(CURRENT);
+    // The first read only probes the tab; every read that decides asked for the proof.
+    for (const [options] of harvestChatGptTab.mock.calls.slice(1) as unknown as Array<[unknown]>) {
+      expect(options).toMatchObject({ confirmTurnComplete: { timeoutMs: expect.any(Number) } });
+    }
+  });
+
+  test.each([["ChatGPT said:"], ["Pro thinking\nAnswer now"], ["Stopped thinking\nEdit"]])(
+    "a turn showing only placeholder or UI chrome (%j) is never saved as its answer",
+    async (text) => {
+      const placeholder = {
+        ...finished,
+        lastAssistantText: text,
+        lastAssistantMarkdown: text,
+        lastAssistantSnippet: text,
+      };
+      mockSession([placeholder]);
+      const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+      for (const browserTabRef of [undefined, "target-x"]) {
+        const settled = harvestSessionBrowserOutput("sess-turn", {
+          writeOutputPath: "answer.md",
+          quietOutput: true,
+          browserTabRef,
+        }).then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+        await advance(4_000);
+        const outcome = (await settled) as { error?: Error };
+        expect(String(outcome.error?.message)).toMatch(/no assistant answer.*nothing was saved/);
+      }
+      await expect(fs.access(path.join(cwd, "answer.md"))).rejects.toThrow();
+      expect(updateSession).not.toHaveBeenCalled();
+    },
+  );
+
+  test("--harvest of this turn's finished answer returns and saves it", async () => {
+    const { harvestChatGptTab } = mockSession([finished]);
+    const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const result = await harvestSessionBrowserOutput("sess-turn", {
+      writeOutputPath: "answer.md",
+      quietOutput: true,
+    });
+    expect(result.lastAssistantMarkdown).toBe(CURRENT);
+    expect(await fs.readFile(path.join(cwd, "answer.md"), "utf8")).toBe(CURRENT);
+    expect(savedTexts()).toContain(CURRENT);
+    expect(harvestChatGptTab).toHaveBeenCalledWith(
+      expect.objectContaining({ confirmTurnComplete: { timeoutMs: expect.any(Number) } }),
+    );
   });
 
   test("--live and --harvest hold a slot while reading; the session's Chrome may be released only after its answer was saved, never for an explicit tab", async () => {
