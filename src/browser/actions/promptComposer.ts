@@ -44,6 +44,7 @@ import { assertComposerTierWithinCap } from "./thinkingTimeCap.js";
 import { normalizePromptText } from "../promptMatch.js";
 import {
   buildLatestUserTurnExpression,
+  buildUserTurnsExpression,
   readUserMessageIds,
   type PageUserTurn,
 } from "../promptFingerprint.js";
@@ -1409,7 +1410,8 @@ async function verifyPromptCommitted(
       // A long conversation keeps only a window of turns rendered: a new turn can unmount an old
       // one, so the count stays the same. The latest user turn's identity tells a new turn apart.
       const baselineUserIds = ${baselineUserIdsLiteral};
-      const latestUser = ${buildLatestUserTurnExpression()};
+      const userTurns = ${buildUserTurnsExpression()};
+      const latestUser = userTurns[userTurns.length - 1] ?? null;
       const latestUserText = normalize(latestUser?.text ?? '');
       const latestUserMatched =
         normalizedPrompt.length > 0 &&
@@ -1419,8 +1421,17 @@ async function verifyPromptCommitted(
         Boolean(latestUser?.messageId) &&
         Array.isArray(baselineUserIds) &&
         baselineUserIds.includes(latestUser.messageId);
+      const presendUserRendered =
+        Array.isArray(baselineUserIds) &&
+        userTurns.some((user) => Boolean(user.messageId) && baselineUserIds.includes(user.messageId));
+      // New: not rendered before the send, and either after a pre-send user turn that is still
+      // rendered (or there was none) or showing the prompt. An older turn that a window above the
+      // send's own renders (a scroll, a reload) is never new merely because its id was unseen.
       const latestUserIsNew =
-        Boolean(latestUser?.messageId) && Array.isArray(baselineUserIds) && !latestUserKnown;
+        Boolean(latestUser?.messageId) &&
+        Array.isArray(baselineUserIds) &&
+        !latestUserKnown &&
+        (baselineUserIds.length === 0 || presendUserRendered || latestUserMatched);
       // Without ids: the latest user turn shows the same text as the latest one before the send
       // (or that text is unknown), so it may be that older turn.
       const baselineLatestUser = ${baselineLatestUserTextLiteral};
@@ -1434,6 +1445,7 @@ async function verifyPromptCommitted(
         latestUserMatched,
         latestUserIsNew,
         latestUserKnown,
+        presendUserRendered,
         latestUserIndex: typeof latestUser?.index === 'number' ? latestUser.index : -1,
         latestUserId: latestUser?.messageId ?? null,
         latestUserRawText: latestUser?.text ?? null,
@@ -1576,6 +1588,7 @@ interface CommitProbeState {
   latestUserMatched?: boolean;
   latestUserIsNew?: boolean;
   latestUserKnown?: boolean;
+  presendUserRendered?: boolean;
   latestUserIndex?: number;
   latestUserId?: string | null;
   latestUserRawText?: string | null;
@@ -1607,6 +1620,7 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     latestUserMatched: probe.latestUserMatched,
     latestUserIsNew: probe.latestUserIsNew,
     latestUserKnown: probe.latestUserKnown,
+    presendUserRendered: probe.presendUserRendered,
     latestUserIndex: probe.latestUserIndex,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,

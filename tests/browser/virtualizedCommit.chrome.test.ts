@@ -80,7 +80,8 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     return thread.children.length;
   };
   // ids: message ids on the units; window: exchanges kept rendered (0: all); initial: the earlier
-  // turns' prompts; lost: the click sends nothing; lateMs: the new exchange mounts this late.
+  // turns' prompts; lost: the click sends nothing; lateMs: the new exchange mounts this late;
+  // windowOnSend: [first, last], the send goes out but the page then renders those exchanges only.
   window.setup = (options) => {
     mode = options;
     for (const [i, text] of options.initial.entries()) exchange(text, 'Earlier answer ' + (i + 1));
@@ -90,6 +91,11 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     if (!event.isTrusted || mode.lost) return;
     const sent = editor.innerText.trim();
     editor.textContent = '';
+    if (mode.windowOnSend) {
+      exchanges.push({ n: ++counter, user: sent, answer: null });
+      window.showExchanges(mode.windowOnSend[0], mode.windowOnSend[1]);
+      return;
+    }
     setTimeout(() => {
       const { node, n, record } = exchange(sent, null);
       setTimeout(() => {
@@ -296,6 +302,24 @@ describe.runIf(enabled)(
         expect(moves, String(messageId)).toEqual([2]);
         expect(scope.turn.messageId).toBe("u9");
       }
+    }, 150_000);
+
+    test("a window that moves above the send's own during the commit check never stands for the send", async () => {
+      // Astra r13: the window before the send is u5..u8; the composer clears, and the page then
+      // renders u2..u4. u4 was not rendered before the send, but nothing places it after the send.
+      await open({ ids: true, window: 4, initial: earlier(8), windowOnSend: [2, 4] });
+      const { state, outcome, logger, previousUserMessageIds } = await send(PROMPT);
+      expect(previousUserMessageIds).toEqual(["u5", "u6", "u7", "u8"]);
+      expect(outcome).toEqual({ sent: true });
+      expect(state.commitUnproven).toBe(true);
+      // No turn is handed out: no fingerprint, no fixed id, and the scope is not lowered onto u4.
+      expect(state.committedTurn).toBeUndefined();
+      expect(state.unprovenCommitTurn).toBeNull();
+      expect(state.committedTurns).toBeNull();
+      expect(state.baselineTurns).toBe(4);
+      expect(logger).toHaveBeenCalledWith(
+        expect.stringMatching(/^\[browser\] Prompt commit not proven \(.*\); treating it as sent/),
+      );
     }, 150_000);
 
     test("without ids, a windowed send (count unchanged) is proven by the latest user turn's new text, and its answer is captured", async () => {

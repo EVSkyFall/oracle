@@ -61,6 +61,14 @@ export function buildLatestUserTurnExpression(): string {
       })()`;
 }
 
+/** Browser-context expression for every rendered user turn ({ index, text, messageId }[]). */
+export function buildUserTurnsExpression(): string {
+  return `(() => {
+        ${userTurnsReaderJs()}
+        return readUserTurns();
+      })()`;
+}
+
 /** What identifies the user turn a send produced. */
 export interface SentTurnQuery {
   /** The user turn identities rendered before the send (readUserMessageIds). */
