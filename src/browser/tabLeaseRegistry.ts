@@ -407,6 +407,49 @@ export async function hasOtherActiveBrowserTabLeases(
   });
 }
 
+/**
+ * Whether anything other than `sessionId`'s own dead controller holds a slot on the profile,
+ * for a reattach that harvested that session after its worker died. The session's own leases
+ * count only while their process lives (checked by pid and start time); they are removed once
+ * proven dead. Other leases follow the usual rule: a lease is dropped only when it missed its
+ * heartbeat past the grace and its process is proven gone.
+ */
+export async function hasOtherBrowserTabUsers(
+  profileDir: string,
+  sessionId: string,
+  options: {
+    staleMs?: number;
+    now?: () => number;
+    isProcessAlive?: (pid: number) => boolean;
+    readProcessStartTimeMs?: (pid: number) => Promise<number | null>;
+  } = {},
+): Promise<boolean> {
+  const now = options.now ?? Date.now;
+  const staleMs = Math.max(60_000, options.staleMs ?? DEFAULT_STALE_MS);
+  const liveness = {
+    isProcessAlive: options.isProcessAlive ?? isProcessAlive,
+    readProcessStartTimeMs: options.readProcessStartTimeMs ?? readProcessStartTimeMs,
+  };
+  const probes = await probeStaleLeases(profileDir, { nowMs: now(), staleMs, ...liveness });
+  const ownDead = new Set<string>();
+  const before = await readRegistry(profileDir).catch(() => null);
+  for (const lease of before?.leases ?? []) {
+    if (lease.sessionId === sessionId && !(await isRegistryLockOwnerAlive(lease, liveness))) {
+      ownDead.add(lease.id);
+    }
+  }
+  return withRegistryLock(profileDir, async () => {
+    const registry = await readRegistry(profileDir);
+    const active = pruneStaleLeases(registry.leases, { nowMs: now(), staleMs, probes }).filter(
+      (lease) => !ownDead.has(lease.id),
+    );
+    if (active.length !== registry.leases.length) {
+      await writeRegistry(profileDir, { version: 1, leases: active });
+    }
+    return active.length > 0;
+  });
+}
+
 export async function hasActiveBrowserTargetLease(
   profileDir: string,
   target: { host: string; port: number; targetId: string },

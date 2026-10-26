@@ -179,6 +179,12 @@ the session's browser timeout, and `--harvest` reports that the turn has no
 finished answer and saves nothing. Neither ever saves an earlier turn. An
 explicit `--browser-tab` harvest still snapshots that tab's paired answer.
 
+When the session's worker died before its run ended, a harvest that saves its
+answer releases the Chrome Oracle launched for it as the run's own end would:
+only Oracle's persistent manual-login profile, only when the session does not
+keep its browser, and only when no other run holds a browser slot on that
+profile. A Chrome you attached (attach-running, remote Chrome) is never closed.
+
 Older sessions without a fingerprint retain their existing recovery behavior,
 with a warning that only latest user/assistant pairing can be checked. Their
 submitted file context cannot be reconstructed reliably from saved metadata.

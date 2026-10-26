@@ -245,4 +245,27 @@ describe("a reattach saves only this session's own turn", () => {
     expect(String(outcome.error?.message)).toMatch(/not the one this session submitted/);
     expect(savedTexts()).not.toContain(PREVIOUS);
   });
+
+  test("after saving this turn's answer, the session's Chrome is released like a run's end; never for an explicit tab", async () => {
+    const release = vi.fn(async () => true);
+    vi.doMock("../../src/cli/harvestChromeRelease.js", () => ({
+      releaseHarvestedSessionChrome: release,
+    }));
+    try {
+      mockSession([finished]);
+      const { liveTailSessionBrowserOutput, harvestSessionBrowserOutput } =
+        await import("../../src/cli/browserTabs.js");
+      await liveTailSessionBrowserOutput("sess-turn");
+      await harvestSessionBrowserOutput("sess-turn", { quietOutput: true });
+      expect(release).toHaveBeenCalledTimes(2);
+      expect(release).toHaveBeenCalledWith("sess-turn", expect.any(Function));
+      await harvestSessionBrowserOutput("sess-turn", {
+        quietOutput: true,
+        browserTabRef: "target-x",
+      });
+      expect(release).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.doUnmock("../../src/cli/harvestChromeRelease.js");
+    }
+  });
 });

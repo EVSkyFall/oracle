@@ -23,6 +23,7 @@ import {
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { persistBrowserHarvest } from "./harvestIntegrity.js";
 import { completeOwnedBrowserHarvest } from "./recoveredBrowserHarvest.js";
+import { releaseHarvestedSessionChrome } from "./harvestChromeRelease.js";
 import type { BrowserHarvestIntegrity } from "../sessionManager.js";
 
 const LIVE_POLL_MS = 2000;
@@ -450,6 +451,11 @@ export async function harvestSessionBrowserOutput(
       process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
     }
     await completeOwnedBrowserHarvest(sessionId, harvested, integrity, (line) => console.log(line));
+    if (!options.browserTabRef && !releaseRecoveredChrome) {
+      await releaseHarvestedSessionChrome(sessionId, (line) => console.log(line)).catch(
+        () => false,
+      );
+    }
     return harvested;
   } finally {
     await releaseRecoveredChrome?.(options.closeAfterRecover).catch(() => undefined);
@@ -583,6 +589,11 @@ export async function liveTailSessionBrowserOutput(
       await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, (line) =>
         console.log(line),
       );
+      if (!options.browserTabRef && !releaseRecoveredChrome) {
+        await releaseHarvestedSessionChrome(sessionId, (line) => console.log(line)).catch(
+          () => false,
+        );
+      }
       return finalHarvest;
     }
   } finally {
