@@ -549,20 +549,27 @@ export async function readAssistantSnapshot(
   return null;
 }
 
-export async function captureAssistantMarkdown(
+interface CopiedMarkdown {
+  markdown: string;
+  /** The turn whose copy button was clicked. */
+  owner: { turnIndex?: number; messageId?: string | null; turnId?: string | null } | null;
+}
+
+async function copyTurnMarkdown(
   Runtime: ChromeClient["Runtime"],
   meta: { messageId?: string | null; turnId?: string | null },
   logger: BrowserLogger,
-): Promise<string | null> {
+): Promise<CopiedMarkdown | null> {
   const { result } = await Runtime.evaluate({
     expression: buildCopyExpression(meta),
     returnByValue: true,
     awaitPromise: true,
   });
   if (result?.value?.success && typeof result.value.markdown === "string") {
-    return result.value.fileCard
+    const markdown = result.value.fileCard
       ? result.value.markdown.replace(/:chatgpt-content-reference\{index="\d+"\}/g, "")
       : result.value.markdown;
+    return { markdown, owner: result.value.owner ?? null };
   }
   const status = result?.value?.status;
   if (status && status !== "missing-button") {
@@ -573,6 +580,33 @@ export async function captureAssistantMarkdown(
     await logDomFailure(Runtime, logger, "copy-markdown");
   }
   return null;
+}
+
+export async function captureAssistantMarkdown(
+  Runtime: ChromeClient["Runtime"],
+  meta: { messageId?: string | null; turnId?: string | null },
+  logger: BrowserLogger,
+): Promise<string | null> {
+  return (await copyTurnMarkdown(Runtime, meta, logger))?.markdown ?? null;
+}
+
+/**
+ * The Markdown of exactly the turn `meta` names, from its copy button, or null. The button
+ * lookup falls back to other turns' buttons when this turn shows none, so a copy counts only
+ * when the clicked button belongs to this turn: the same message id, or the same turn id when
+ * the turn has no message id. Null means: use the turn's own text.
+ */
+export async function captureTurnMarkdown(
+  Runtime: ChromeClient["Runtime"],
+  meta: { messageId?: string | null; turnId?: string | null },
+  logger: BrowserLogger,
+): Promise<string | null> {
+  const copied = await copyTurnMarkdown(Runtime, meta, logger);
+  if (!copied) return null;
+  const tied = meta.messageId
+    ? copied.owner?.messageId === meta.messageId
+    : Boolean(meta.turnId) && copied.owner?.turnId === meta.turnId;
+  return tied ? copied.markdown : null;
 }
 
 export function buildAssistantExtractorForTest(name: string): string {
@@ -1809,6 +1843,25 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
       return null;
     };
 
+    // The turn the clicked button belongs to, identified like the assistant extractor identifies
+    // a turn: the turn containing it, else the last turn before it (a bar after its unit).
+    const describeOwner = (button) => {
+      const turns = ${buildConversationTurnListExpression()};
+      let owner = turns.find((turn) => turn === button || turn.contains?.(button)) ?? null;
+      if (!owner) {
+        for (const turn of turns) {
+          if (turn.compareDocumentPosition(button) & 4) owner = turn;
+        }
+      }
+      if (!owner) return null;
+      const root = ${buildLastAssistantMessageExpression("owner")} ?? owner;
+      return {
+        turnIndex: turns.indexOf(owner),
+        messageId: root.getAttribute('data-message-id') || root.getAttribute?.('data-chatgpt-selection-message-id') || root.getAttribute('data-chatgpt-search-message-ids')?.split(' ')[0] || root.getAttribute('data-content-search-unit-key') || root.getAttribute('data-chatgpt-search-unit-key') || null,
+        turnId: owner.getAttribute('data-turn-key') || root.getAttribute('data-testid') || null,
+      };
+    };
+
     const interceptClipboard = () => {
       const clipboard = navigator.clipboard;
       const state = { text: '', updatedAt: 0 };
@@ -1879,7 +1932,7 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
           const readIntercepted = () => {
             const markdown = interception.state.text ?? '';
             const updatedAt = interception.state.updatedAt ?? 0;
-            return { success: Boolean(markdown.trim()), markdown, updatedAt,
+            return { success: Boolean(markdown.trim()), markdown, updatedAt, owner: describeOwner(button),
               fileCard: Boolean((${buildLastAssistantMessageExpression(`button.closest(${JSON.stringify(CONVERSATION_TURN_SELECTOR)})`)})?.querySelector('button[aria-label="Download file"]')) };
           };
 

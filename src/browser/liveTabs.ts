@@ -10,7 +10,7 @@ import {
   STOP_BUTTON_SELECTORS,
 } from "./constants.js";
 import {
-  captureAssistantMarkdown,
+  captureTurnMarkdown,
   confirmAssistantTurnComplete,
   readAssistantSnapshot,
 } from "./actions/assistantResponse.js";
@@ -669,10 +669,14 @@ export async function harvestChatGptTab(
         normalizedSnapshotText.length > 0 &&
         normalizedSnapshotText === normalizedInspectedText);
     let assistantMarkdown: string | null = null;
-    let copiedMessageId: string | null = null;
-    if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
-      copiedMessageId = typeof snapshot.messageId === "string" ? snapshot.messageId : null;
-      assistantMarkdown = await captureAssistantMarkdown(
+    // With the completion proof, the Markdown is copied only from the proven turn, after the
+    // proof: an unfinished turn has no copy button to wait for.
+    if (
+      !options.confirmTurnComplete &&
+      snapshotMatchesLatestTurn &&
+      (snapshot?.messageId || snapshot?.turnId)
+    ) {
+      assistantMarkdown = await captureTurnMarkdown(
         Runtime,
         {
           messageId: snapshot.messageId,
@@ -717,15 +721,10 @@ export async function harvestChatGptTab(
           nowSummary.conversationId,
         ).catch(() => null);
         if (confirmed?.text?.trim()) {
-          // The copy above was of this message with this text: its result stands (a failed copy
-          // falls back to the text, as without the proof), so the slow copy is not repeated.
-          const sameMessage =
-            copiedMessageId !== null &&
-            confirmed.meta.messageId === copiedMessageId &&
-            confirmed.text.trim() === harvested.lastAssistantText.trim();
-          const markdown = sameMessage
-            ? assistantMarkdown
-            : await captureAssistantMarkdown(Runtime, confirmed.meta, noopLogger).catch(() => null);
+          // Only Markdown copied from the proven turn itself; otherwise its proven text.
+          const markdown = await captureTurnMarkdown(Runtime, confirmed.meta, noopLogger).catch(
+            () => null,
+          );
           harvested.lastAssistantFinished = true;
           harvested.lastAssistantText = confirmed.text.trim();
           harvested.lastAssistantSnippet = trimToSnippet(harvested.lastAssistantText);

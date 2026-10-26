@@ -179,6 +179,9 @@ finished: a finished-action bar on that turn, text that stopped changing, no
 stop button and no live thinking. A preamble shown while the stop button is
 briefly gone is not the answer, and placeholder or UI text ("ChatGPT said:",
 "Pro thinking … Answer now", "Stopped thinking Edit") is never an answer.
+Its Markdown is copied after that proof from that turn's own copy button; a
+copy that cannot be tied to that turn is never used, and the turn's text is
+saved instead.
 While ChatGPT still generates the session's turn, `--live` keeps waiting, up to
 the session's browser timeout, showing its progress without saving any of it,
 and `--harvest` reports that the turn has no finished answer and saves nothing.
