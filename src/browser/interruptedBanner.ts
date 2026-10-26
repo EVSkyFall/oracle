@@ -149,8 +149,10 @@ export const INTERRUPTED_BANNER_SURFACES: InterruptedBannerSurfaces = {
 
 /**
  * Page function: the banner when it is shown. Its words ("Connection interrupted" or "Waiting for
- * the complete answer", any case, whitespace folded) open the text of a small visible element
- * (a sentence that mentions or quotes them is not the banner) that sits in the conversation
+ * the complete answer", any case, whitespace folded) open the text of a small visible element and
+ * of its row, every element around it up to the banner's size or its status region (a sentence
+ * or caption that mentions or quotes them, nested spans included, is not the banner), that sits
+ * in the conversation
  * thread below the latest user turn, the turn the banner belongs to, and outside anything a user
  * or the model wrote (user turns, Markdown/prose, reasoning panels, code, quotes), editors, and
  * surfaces whose text stays across reloads (sidebar and header, approval cards and dialogs,
@@ -187,6 +189,23 @@ export function readInterruptedBanner(
   // 4: Node.DOCUMENT_POSITION_FOLLOWING
   const below = (node: Node) =>
     !latestUser.contains(node) && (latestUser.compareDocumentPosition(node) & 4) !== 0;
+  // Whether the banner's words open `folded`: at most one short word (an icon's label such as
+  // "Warning:") may come first, and no quote mark. Null when the words are not in it.
+  const opens = (folded: string): boolean | null => {
+    const at = PHRASES.map((phrase) => folded.indexOf(phrase))
+      .filter((index) => index >= 0)
+      .sort((a, b) => a - b)[0];
+    if (at === undefined) return null;
+    const lead = folded.slice(0, at);
+    return lead.length <= 15 && !/["'“”‘’«»([]/.test(lead) && lead.trim().split(" ").length <= 1;
+  };
+  // Inside the thread, below the latest user turn, and holding no message body.
+  const inScope = (node: Element) =>
+    node !== root &&
+    root.contains(node) &&
+    !node.contains(latestUser) &&
+    !node.querySelector(surfaces.excluded);
+  const REGION = '[role="status"], [role="alert"], [aria-live]';
   // 4: NodeFilter.SHOW_TEXT
   const walker = doc.createTreeWalker(root, 4);
   for (let text = walker.nextNode(); text; text = walker.nextNode()) {
@@ -200,21 +219,30 @@ export function readInterruptedBanner(
       holder && holder !== root && depth < 4;
       depth += 1, holder = holder.parentElement
     ) {
-      if (
-        holder !== parent &&
-        (holder.contains(latestUser) || holder.querySelector(surfaces.excluded))
-      ) {
-        break;
-      }
+      if (holder !== parent && !inScope(holder)) break;
       const folded = fold(holder.textContent);
       if (folded.length > 300) break;
-      const at = PHRASES.map((phrase) => folded.indexOf(phrase))
-        .filter((index) => index >= 0)
-        .sort((a, b) => a - b)[0];
-      if (at === undefined) continue;
-      // The banner's words open its text; a few characters (an icon's label) may come first.
-      const lead = folded.slice(0, at);
-      if (lead.length > 15 || /["'“”‘’«»([]\s*$/.test(lead)) break;
+      const verdict = opens(folded);
+      if (verdict === null) continue;
+      if (!verdict) break;
+      // Its row too: every element around it up to the banner's size must open with the words,
+      // so a caption that mentions them in nested spans ('Searching for "<span>Connection
+      // interrupted</span>"') is not the banner. A status or alert region is the banner's own
+      // box: nothing above it is read.
+      let row: Element = holder;
+      let isBanner = true;
+      while (!row.matches(REGION)) {
+        const up: Element | null = row.parentElement;
+        if (!up || !inScope(up)) break;
+        const around = fold(up.textContent);
+        if (around.length > 300) break;
+        if (opens(around) === false) {
+          isBanner = false;
+          break;
+        }
+        row = up;
+      }
+      if (!isBanner) break;
       return withNode ? { text: folded, node: holder } : { text: folded };
     }
   }

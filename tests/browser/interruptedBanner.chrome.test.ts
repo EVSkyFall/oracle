@@ -33,6 +33,8 @@ const BANNER = `<div class="flex justify-center py-2"><div role="status" class="
 // Text on the page that stays across reloads and must never count as the banner.
 const SIDEBAR_TITLE = `<nav aria-label="Chat history"><a href="/c/other"><div class="truncate">Connection interrupted</div></a></nav>`;
 const ACTIVITY_ROW = `<div class="activity-row">Searching for "Connection interrupted"</div>`;
+// Round 8c (Astra r16): ChatGPT's activity captions are nested spans next to a disclosure.
+const NESTED_ROW = `<div class="activity-row">Searching for "<span>Connection interrupted</span>"</div>`;
 const DISCLOSURE = `<button type="button" aria-expanded="false"><span>Connection interrupted</span></button>`;
 const APPROVAL_CARD = `<div class="rounded-3xl border" data-codex-approval-surface="true"><div role="alert"><div>Connection interrupted</div><div>Allow ChatGPT to use CODEXish?</div></div><form><button type="button">Allow once</button></form></div>`;
 
@@ -79,7 +81,7 @@ ${decoys ? SIDEBAR_TITLE : ""}
   <div data-testid="conversation-turn-1"><div data-message-author-role="user"><div>Earlier question</div></div></div>
   <div data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="m2"><div class="markdown"><p>Earlier answer that is never the answer.</p></div></div>${ACTIONS}${decoys ? BANNER : ""}</div>
   <div data-testid="conversation-turn-3">${userTurn}</div>
-  <div data-testid="conversation-turn-4" id="turn">${decoys ? ACTIVITY_ROW + DISCLOSURE : ""}<div data-message-author-role="assistant" data-message-id="m4"><div class="markdown">${answer}</div></div>${finished ? ACTIONS : ""}${decoys ? APPROVAL_CARD : ""}</div>
+  <div data-testid="conversation-turn-4" id="turn">${decoys ? ACTIVITY_ROW + NESTED_ROW + DISCLOSURE : ""}<div data-message-author-role="assistant" data-message-id="m4"><div class="markdown">${answer}</div></div>${finished ? ACTIONS : ""}${decoys ? APPROVAL_CARD : ""}</div>
   ${story === "banner-then-cleared" && load === 1 ? BANNER : ""}
   ${story === "quoted" ? `<div class="sr-only" aria-live="polite">${BANNER_TEXT}</div>` : ""}
 </main>
@@ -152,6 +154,38 @@ const PLACEMENTS: Array<[string, string, boolean]> = [
   ["a sidebar conversation title", thread("", { outside: SIDEBAR_TITLE }), false],
   ["a sidebar inside the thread area", thread(`<aside><div>${BANNER_TEXT}</div></aside>`), false],
   ["an activity row that quotes it", thread(ACTIVITY_ROW), false],
+  ["an activity row with the words in a nested span", thread(NESTED_ROW), false],
+  [
+    "a quoted caption with the words in a nested span",
+    thread('<div class="caption">“<span>Connection interrupted</span>”</div>'),
+    false,
+  ],
+  [
+    "an activity caption of spans in a flex row",
+    thread(
+      '<div style="display:flex;gap:4px"><span>Searching for</span><span>Connection interrupted</span></div>',
+    ),
+    false,
+  ],
+  [
+    "the banner's sentences in their own spans in a status row",
+    thread(
+      '<div role="status"><span>Connection interrupted.</span> <span>Waiting for the complete answer</span></div>',
+    ),
+    true,
+  ],
+  [
+    "the banner after a one-word label",
+    thread('<div role="alert"><span>Warning:</span> <span>Connection interrupted.</span></div>'),
+    true,
+  ],
+  [
+    "the banner's status region next to other rows of the turn",
+    thread(
+      '<div class="turn"><div>Searching the web</div><div role="status"><span>Connection interrupted.</span> <span>Waiting for the complete answer</span></div></div>',
+    ),
+    true,
+  ],
   ["an activity disclosure", thread(DISCLOSURE), false],
   [
     "a reasoning summary",
