@@ -188,6 +188,10 @@ explicit `--browser-tab` harvest still snapshots that tab's paired answer.
 While `--harvest` or `--live` reads the session's tab on Oracle's persistent
 manual-login profile, it holds a browser slot there like a run does, taking
 over the slot of the session's own worker once that worker is proven gone.
+When the session's tab is gone and its conversation is reopened, that recovery
+uses the same slot, never a second one, and gives it back when it ends; a
+Chrome it launched is closed then, under the same rule, even when the recovery
+failed.
 When the session's worker died before its run ended, a harvest that saves its
 answer releases the Chrome Oracle launched for it as the run's own end would:
 only Oracle's persistent manual-login profile, only when the session does not

@@ -422,7 +422,7 @@ export async function harvestSessionBrowserOutput(
 
   let releaseRecoveredChrome: ((close?: boolean) => Promise<void>) | null = null;
   // Reading the session's tab uses its Chrome like a run does: hold a slot on the profile.
-  const slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
+  let slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
   let saved = false;
   try {
     let harvested: ChatGptTabSummary;
@@ -446,8 +446,13 @@ export async function harvestSessionBrowserOutput(
           `No live ChatGPT tab matched session "${sessionId}". Attempting recovery by reopening the saved conversation URL.`,
         ),
       );
+      // Recovery reuses this command's slot (a second one on the same profile could wait for this
+      // one) and gives it back with the recovery, so it is no longer released here.
+      const heldSlot = slot;
+      slot = null;
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
         existingEndpoint: recordedEndpoint ?? undefined,
+        ...(heldSlot ? { heldLease: heldSlot.lease } : {}),
       });
       releaseRecoveredChrome = recovered.release;
       harvested = await harvestSessionPrompt(meta, {
@@ -513,7 +518,7 @@ export async function liveTailSessionBrowserOutput(
   let recoveredContentDeadlineMs = 0;
   const log = (line: string) => console.log(line);
   // Tailing the session's tab uses its Chrome like a run does: hold a slot on the profile.
-  const slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
+  let slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
   let saved = false;
 
   try {
@@ -533,9 +538,14 @@ export async function liveTailSessionBrowserOutput(
           `No live ChatGPT tab matched session "${sessionId}". Attempting recovery by reopening the saved conversation URL.`,
         ),
       );
+      // Recovery reuses this command's slot (a second one on the same profile could wait for this
+      // one) and gives it back with the recovery, so it is no longer released here.
+      const heldSlot = slot;
+      slot = null;
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
         existingEndpoint: recordedEndpoint ?? undefined,
         waitForReady: false,
+        ...(heldSlot ? { heldLease: heldSlot.lease } : {}),
       });
       releaseRecoveredChrome = recovered.release;
       endpoint = {

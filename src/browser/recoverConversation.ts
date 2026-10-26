@@ -9,6 +9,7 @@ import type { SessionMetadata } from "../sessionStore.js";
 import type { BrowserLogger } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { resolveBrowserConfig } from "./config.js";
+import { acquireProfileRunLock } from "./profileState.js";
 import { acquireManualLoginChromeForRun, isImageOnlyUiChromeText } from "./index.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
 import { harvestChatGptTab, openChatGptTarget, type LiveChromeEndpoint } from "./liveTabs.js";
@@ -143,10 +144,18 @@ export async function recoverConversationTab(
     existingEndpoint?: RecoveryEndpoint;
     readyTimeoutMs?: number;
     waitForReady?: boolean;
+    /**
+     * A browser slot the caller already holds on this session's profile. Recovery uses it
+     * instead of taking a second one, which with the slots full would wait for the caller's own,
+     * and gives it back with the recovery: on failure here, otherwise through `release`. The
+     * caller must not release it itself.
+     */
+    heldLease?: BrowserTabLease;
   } = {},
 ): Promise<RecoveredConversation> {
   const url = resolveRecoveryUrl(meta);
   if (!url) {
+    await options.heldLease?.release().catch(() => undefined);
     throw new Error(
       "Cannot recover conversation: session metadata has no recoverable ChatGPT conversation URL " +
         "(expected browser.harvest.url or browser.runtime.tabUrl to be a chatgpt.com/c/<id> URL).",
@@ -155,7 +164,7 @@ export async function recoverConversationTab(
   const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   const waitForReady = options.waitForReady !== false;
   const config = resolveBrowserConfig(meta.browser?.config);
-  let lease: BrowserTabLease | undefined;
+  let lease: BrowserTabLease | undefined = options.heldLease;
   let profileDir: string | undefined;
   let chrome: Awaited<ReturnType<typeof acquireManualLoginChromeForRun>>["chrome"] | undefined;
   let reused = false;
@@ -169,7 +178,17 @@ export async function recoverConversationTab(
     });
   };
   const release = async (closeAfterRecover = !config.keepBrowser) => {
+    let profileLock: Awaited<ReturnType<typeof acquireProfileRunLock>> = null;
     try {
+      // As at a run's own end: the last-slot decision and the close of the Chrome this recovery
+      // launched happen inside the slot registry's lock, under the profile lock.
+      if (closeAfterRecover && lease && profileDir && (config.profileLockTimeoutMs ?? 0) > 0) {
+        profileLock = await acquireProfileRunLock(profileDir, {
+          timeoutMs: config.profileLockTimeoutMs ?? 0,
+          logger,
+          sessionId: meta.id,
+        }).catch(() => null);
+      }
       await lease?.release({
         onRelease: async ({ isLastLease }) => {
           if (!profileDir) return;
@@ -181,6 +200,7 @@ export async function recoverConversationTab(
         },
       });
     } finally {
+      await profileLock?.release().catch(() => undefined);
       chrome?.process?.unref();
     }
   };
