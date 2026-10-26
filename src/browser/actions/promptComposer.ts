@@ -157,6 +157,11 @@ export async function submitPrompt(
      * latest user turn when it shows the prompt and is not provably an older turn, else null.
      */
     onCommitUnproven?: (turn: PageUserTurn | null) => void;
+    /**
+     * The user turn identities rendered before the send, as the run read them (with its input
+     * timeout) before staging the prompt. Read here once when not given.
+     */
+    baselineUserIds?: readonly string[];
   },
   prompt: string,
   logger: BrowserLogger,
@@ -408,7 +413,7 @@ export async function submitPrompt(
 
   // The user turns rendered before the send: a turn not among them is a new one, even when a
   // long conversation unmounts an old turn for it and the count stays the same.
-  const baselineUserIds = await readUserMessageIds(runtime, 0);
+  const baselineUserIds = deps.baselineUserIds ?? (await readUserMessageIds(runtime, 0));
 
   // Install before the click: a short answer can complete while commit verification runs.
   await runtime
@@ -1298,6 +1303,7 @@ async function verifyPromptCommitted(
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
   const baselineUserIdsLiteral = JSON.stringify(options.baselineUserIds ?? null);
+  const idsKnown = Array.isArray(options.baselineUserIds);
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
   const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
@@ -1430,6 +1436,12 @@ async function verifyPromptCommitted(
     ) {
       return info.latestUserIndex + 1;
     }
+    // With the pre-send identities every decision is made by id: text in older turns and a count
+    // that a re-rendered window can grow prove nothing then.
+    if (idsKnown) {
+      await delay(100);
+      continue;
+    }
     const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
     const baselineUnknown =
       typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
@@ -1449,23 +1461,23 @@ async function verifyPromptCommitted(
     .then((res) => res?.result?.value as CommitProbeState | undefined)
     .catch(() => undefined);
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
-  const promptShown = Boolean(
-    probe?.latestUserMatched || probe?.lastMatched || probe?.userMatched || probe?.prefixMatched,
-  );
-  // The send was dispatched. Only when the prompt never left the composer (its text is still
-  // there and no turn shows it) was it not sent; any other uncertainty never ends the run, and
-  // nothing is ever typed or sent again here.
-  if (probe?.composerCleared !== false || promptShown) {
+  // A new user turn: by id when the pre-send identities are known; without them, only a grown
+  // count. A turn that existed before the send, or an assistant's text, is never one.
+  const newUserTurn = idsKnown
+    ? probe?.latestUserIsNew === true
+    : probe?.hasNewTurn === true && probe?.latestUserMatched === true;
+  // Signs that the prompt left the composer through the page: a new user turn by id, or, without
+  // ids, the latest user turn showing it or a grown count.
+  const sentShown = idsKnown ? newUserTurn : Boolean(probe?.latestUserMatched || probe?.hasNewTurn);
+  // The send was dispatched. When the composer still holds the prompt and no turn above shows it,
+  // the click was lost: today's error, so the wrapper may retry. Any other uncertainty never ends
+  // the run, and nothing is ever typed or sent again here.
+  if (probe?.composerCleared !== false || sentShown) {
     logger?.(
       `[browser] Prompt commit not proven (${probe ? JSON.stringify(summarizeCommitProbe(probe)) : "page unreadable"}); treating it as sent and waiting for the answer`,
     );
-    // The latest user turn stands for the sent one unless it is provably an older turn (it was
-    // rendered before the send); then the answer wait keeps its earlier scope.
     const latestStands =
-      Boolean(probe?.latestUserMatched) &&
-      !probe?.latestUserKnown &&
-      typeof probe?.latestUserIndex === "number" &&
-      probe.latestUserIndex >= 0;
+      newUserTurn && typeof probe?.latestUserIndex === "number" && probe.latestUserIndex >= 0;
     options.onUnproven?.(
       latestStands
         ? {
@@ -1475,11 +1487,7 @@ async function verifyPromptCommitted(
           }
         : null,
     );
-    if (latestStands) return probe!.latestUserIndex! + 1;
-    if (probe?.lastMatched && !probe.latestUserKnown && typeof probe.turnsCount === "number") {
-      return probe.turnsCount;
-    }
-    return null;
+    return latestStands ? probe!.latestUserIndex! + 1 : null;
   }
   if (logger) {
     logger(

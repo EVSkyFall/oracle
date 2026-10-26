@@ -5,15 +5,21 @@ import path from "node:path";
 import CDP from "chrome-remote-interface";
 import * as chromeLauncher from "chrome-launcher";
 import { chatgptDomProvider } from "../../src/browser/providers/chatgptDomProvider.js";
+import { buildConversationTurnCountExpression } from "../../src/browser/conversationTurns.js";
+import { readUserMessageIds } from "../../src/browser/promptFingerprint.js";
 
-// Real-Chrome fixture of a follow-up in a long conversation (2026-10-26, session
-// ask-20261026-152910-ixje): ChatGPT keeps only a window of four exchanges rendered, so the new
-// exchange unmounts the oldest and the turn count stays at four. The send is proven by the new
-// user turn's identity, and the answer that follows it is captured. Run with
-// ORACLE_CHROME_FIXTURES=1.
+// Real-Chrome fixture of sends in a long conversation (2026-10-26: session
+// ask-20261026-152910-ixje, a --followup resume, and window-tall-build, in-run follow-up 4 of a
+// conversation with tall answers): ChatGPT keeps only a window of exchanges rendered, so a new
+// exchange unmounts the oldest and the turn count stays the same. The send is proven by the new
+// user turn's identity, and the answer that follows that turn is captured. Driven through the
+// ChatGPT provider as the run drives it (index.ts: the turn count and the user turn ids read
+// before each send). Run with ORACLE_CHROME_FIXTURES=1.
 const enabled = process.env.ORACLE_CHROME_FIXTURES === "1";
-const PROMPT = "CODEXish Next round: W5sub2 fix round 2";
-const ANSWER = "W5sub2 fix round 2: the fix and its checks.";
+const PROMPT = "CODEXish Next round: W5sub2 fix round 2, with the checks listed in the brief";
+const answerTo = (prompt: string) => `Answer to: ${prompt}`;
+// A round template longer than the 120 characters the text match compares.
+const ROUND_TEMPLATE = `${PROMPT}. Run the full check list, report each failing case with its cause, and keep the notes short.`;
 
 // Exchanges as probed on the real page: div[data-turn-key=<user message id>] holding a
 // div[data-content-search-turn-key], with ":user" / ":assistant" units carrying
@@ -33,7 +39,7 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
   const thread = document.getElementById('thread');
   const editor = document.getElementById('prompt-textarea');
   let counter = 0;
-  let mode = { ids: true, windowed: true };
+  let mode = {};
   const userUnit = (n, text) => mode.ids
     ? '<div data-chatgpt-search-unit-key="u' + n + ':user" data-chatgpt-search-message-ids="u' + n + '"><div data-user-message-bubble="true">' + text + '</div></div>'
     : '<div data-message-author-role="user"><div data-user-message-bubble="true">' + text + '</div></div>';
@@ -48,28 +54,35 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><style>
     else node.setAttribute('data-testid', 'conversation-turn-' + counter);
     node.innerHTML = '<div data-content-search-turn-key="k' + counter + '">' + userUnit(counter, user) + (answer ? assistantUnit(counter, answer) : '') + '</div>';
     thread.append(node);
+    // The window keeps the latest exchanges only: the oldest unmounts.
+    while (mode.window && thread.children.length > mode.window) thread.firstElementChild.remove();
     return { node, n: counter };
   };
-  window.setup = (ids, windowed) => {
-    mode = { ids, windowed };
-    for (let i = 1; i <= 4; i += 1) exchange('Earlier question ' + i, 'Earlier answer ' + i);
+  // ids: message ids on the units; window: exchanges kept rendered (0: all); initial: the earlier
+  // turns' prompts; lost: the click sends nothing; lateMs: the new exchange mounts this late.
+  window.setup = (options) => {
+    mode = options;
+    for (const [i, text] of options.initial.entries()) exchange(text, 'Earlier answer ' + (i + 1));
     return true;
   };
   document.querySelector('[data-testid="send-button"]').addEventListener('click', (event) => {
-    if (!event.isTrusted) return;
+    if (!event.isTrusted || mode.lost) return;
     const sent = editor.innerText.trim();
     editor.textContent = '';
-    const { node, n } = exchange(sent, null);
-    // The window keeps four exchanges: the oldest unmounts for the new one.
-    if (mode.windowed) thread.firstElementChild.remove();
     setTimeout(() => {
-      node.firstElementChild.insertAdjacentHTML('beforeend', assistantUnit(n, ${JSON.stringify(ANSWER)}));
-    }, 1500);
+      const { node, n } = exchange(sent, null);
+      setTimeout(() => {
+        node.firstElementChild.insertAdjacentHTML('beforeend', assistantUnit(n, 'Answer to: ' + sent));
+      }, 1500);
+    }, mode.lateMs ?? 0);
   });
 </script></body></html>`;
 
+const earlier = (count: number) =>
+  Array.from({ length: count }, (_, i) => `Earlier question ${i + 1}`);
+
 describe.runIf(enabled)(
-  "a send in a long conversation with a window of rendered turns (real Chrome)",
+  "sends in a long conversation with a window of rendered turns (real Chrome)",
   () => {
     let chrome: chromeLauncher.LaunchedChrome;
     let client: Awaited<ReturnType<typeof CDP>>;
@@ -91,13 +104,21 @@ describe.runIf(enabled)(
       await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
     });
 
-    /** The run's submission and answer wait through the ChatGPT provider (as index.ts drives it). */
-    async function sendAndWait(ids: boolean, windowed: boolean) {
+    async function open(options: Record<string, unknown>) {
       await client.Page.navigate({
         url: `data:text/html;base64,${Buffer.from(FIXTURE).toString("base64")}`,
       });
       await client.Page.loadEventFired();
-      await client.Runtime.evaluate({ expression: `window.setup(${ids}, ${windowed})` });
+      await client.Runtime.evaluate({ expression: `window.setup(${JSON.stringify(options)})` });
+    }
+
+    /** One send as the run makes it: the count and the user turn ids before, then the provider. */
+    async function send(prompt: string) {
+      const { result } = await client.Runtime.evaluate({
+        expression: buildConversationTurnCountExpression(),
+        returnByValue: true,
+      });
+      const previousUserMessageIds = await readUserMessageIds(client.Runtime, 1_000);
       const logger = Object.assign(vi.fn(), { verbose: false });
       const state: Record<string, unknown> = {
         runtime: client.Runtime,
@@ -105,44 +126,84 @@ describe.runIf(enabled)(
         logger,
         timeoutMs: 30_000,
         inputTimeoutMs: 1_000,
-        // The run reads the count before the send: four rendered exchanges.
-        baselineTurns: 4,
+        baselineTurns: result.value,
+        previousUserMessageIds,
       };
-      const ctx = { prompt: PROMPT, evaluate: async () => undefined, delay: async () => {}, state };
+      const ctx = { prompt, evaluate: async () => undefined, delay: async () => {}, state };
       const startedAt = Date.now();
-      await chatgptDomProvider.submitPrompt(ctx as never);
-      const submitMs = Date.now() - startedAt;
-      const answer = await chatgptDomProvider.waitForResponse(ctx as never);
-      return { state, answer, logger, submitMs };
+      const outcome = await chatgptDomProvider.submitPrompt(ctx as never).then(
+        () => ({ sent: true as const }),
+        (error: unknown) => ({ error: error as Error }),
+      );
+      return {
+        ctx,
+        state,
+        logger,
+        outcome,
+        previousUserMessageIds,
+        submitMs: Date.now() - startedAt,
+      };
     }
+    const answerOf = async (ctx: unknown) =>
+      (await chatgptDomProvider.waitForResponse(ctx as never)).text.trim();
 
     test("with message ids, the new user turn proves the send at once, and its answer is captured", async () => {
-      const { state, answer, submitMs } = await sendAndWait(true, true);
+      await open({ ids: true, window: 4, initial: earlier(4) });
+      const { ctx, state, submitMs } = await send(PROMPT);
       expect(state.committedTurns).toBe(4);
       // The answer wait starts at the sent user turn, below the count before the send.
       expect(state.baselineTurns).toBe(3);
       expect(state.commitUnproven).toBeUndefined();
       expect(submitMs).toBeLessThan(20_000);
-      expect(answer.text.trim()).toBe(ANSWER);
+      expect(await answerOf(ctx)).toBe(answerTo(PROMPT));
     }, 150_000);
 
-    test("without ids, an unproven send that shows the prompt goes on to the answer", async () => {
-      const { state, answer, logger } = await sendAndWait(false, true);
+    test("in-run follow-ups on a growing conversation stay proven when the window starts unmounting turns", async () => {
+      // window-tall-build: the 5th turn (follow-up 4) was the first whose send unmounted turn 1.
+      await open({ ids: true, window: 4, initial: earlier(1) });
+      for (let followUp = 1; followUp <= 4; followUp += 1) {
+        const prompt = `Follow-up ${followUp}: print 1..150, one per line`;
+        const { ctx, state, submitMs } = await send(prompt);
+        expect(state.commitUnproven, `follow-up ${followUp}`).toBeUndefined();
+        expect(submitMs).toBeLessThan(20_000);
+        expect(await answerOf(ctx), `follow-up ${followUp}`).toBe(answerTo(prompt));
+      }
+    }, 300_000);
+
+    test("a lost click is not sent, even when an older user turn shares the prompt's first 120 characters", async () => {
+      await open({
+        ids: true,
+        window: 4,
+        initial: [...earlier(3), `${ROUND_TEMPLATE} Previous round.`],
+        lost: true,
+      });
+      const { outcome, state } = await send(`${ROUND_TEMPLATE} This round.`);
+      expect("error" in outcome && outcome.error.message).toMatch(
+        /Prompt did not appear in conversation before timeout/,
+      );
+      expect(state.commitUnproven).toBeUndefined();
+    }, 150_000);
+
+    test("without ids, an unproven windowed send goes on but never lowers the scope onto an older turn", async () => {
+      await open({ ids: false, window: 4, initial: earlier(4) });
+      const { state, outcome, logger } = await send(PROMPT);
+      expect(outcome).toEqual({ sent: true });
       expect(state.commitUnproven).toBe(true);
-      expect(state.unprovenCommitTurn).toEqual({ index: 3, text: PROMPT, messageId: null });
-      expect(state.baselineTurns).toBe(3);
+      // With the count unchanged, the latest user turn could be an older one: no stand-in.
+      expect(state.unprovenCommitTurn).toBeNull();
+      expect(state.baselineTurns).toBe(4);
       expect(logger).toHaveBeenCalledWith(
         expect.stringMatching(/^\[browser\] Prompt commit not proven \(.*\); treating it as sent/),
       );
-      expect(answer.text.trim()).toBe(ANSWER);
     }, 150_000);
 
     test("without ids on a page whose turn count grows, the count still proves the send", async () => {
-      const { state, answer, submitMs } = await sendAndWait(false, false);
+      await open({ ids: false, window: 0, initial: earlier(4) });
+      const { ctx, state, submitMs } = await send(PROMPT);
       expect(state.committedTurns).toBe(5);
       expect(state.commitUnproven).toBeUndefined();
       expect(submitMs).toBeLessThan(20_000);
-      expect(answer.text.trim()).toBe(ANSWER);
+      expect(await answerOf(ctx)).toBe(answerTo(PROMPT));
     }, 150_000);
   },
 );

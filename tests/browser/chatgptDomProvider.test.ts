@@ -28,4 +28,24 @@ describe("ChatGPT DOM provider", () => {
       expect.any(Function),
     );
   });
+
+  test("passes the run's pre-send user turn ids to the send instead of a second, single read", async () => {
+    await chatgptDomProvider.submitPrompt({
+      prompt: "hello",
+      evaluate: async () => undefined,
+      delay: async () => undefined,
+      state: {
+        runtime: {},
+        input: {},
+        logger: Object.assign(vi.fn(), { verbose: false }),
+        timeoutMs: 1_000,
+        previousUserMessageIds: ["u1", "u2"],
+      },
+    });
+    expect(submitPrompt).toHaveBeenLastCalledWith(
+      expect.objectContaining({ baselineUserIds: ["u1", "u2"] }),
+      "hello",
+      expect.any(Function),
+    );
+  });
 });

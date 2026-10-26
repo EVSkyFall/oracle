@@ -3,26 +3,29 @@ import { __test__ as promptComposer } from "../../src/browser/actions/promptComp
 
 // The commit check after the send click, against canned page probes. A long conversation keeps
 // only a window of turns rendered, so a new turn can unmount an old one and the count stays the
-// same; the latest user turn's identity tells a new turn apart.
+// same; the latest user turn's identity tells a new turn apart. With the pre-send identities
+// every decision is made by id: older turns with similar text (round templates, "continue", a
+// retried prompt) never count.
 const PROMPT = "CODEXish Next round: W5sub2 fix round 2, with the checks in the brief.";
+const PRESEND_IDS = ["u1", "u2", "u3", "u4"];
 
 const probe = (overrides: Record<string, unknown>) => ({
   baseline: 4,
   turnsCount: 4,
-  userMatched: true,
-  prefixMatched: true,
-  lastMatched: true,
+  userMatched: false,
+  prefixMatched: false,
+  lastMatched: false,
   hasNewTurn: false,
   stopVisible: false,
   assistantVisible: true,
   composerCleared: true,
   inConversation: true,
-  latestUserMatched: true,
+  latestUserMatched: false,
   latestUserIsNew: false,
-  latestUserKnown: false,
+  latestUserKnown: true,
   latestUserIndex: 3,
-  latestUserId: null,
-  latestUserRawText: PROMPT,
+  latestUserId: "u4",
+  latestUserRawText: "Earlier question 4",
   ...overrides,
 });
 const runtimeShowing = (value: Record<string, unknown>) =>
@@ -30,11 +33,16 @@ const runtimeShowing = (value: Record<string, unknown>) =>
     evaluate: vi.fn(async () => ({ result: { value } })),
   }) as never;
 
-async function verify(value: Record<string, unknown>, onUnproven = vi.fn()) {
+async function verify(
+  value: Record<string, unknown>,
+  // null: the page's user turns had no ids before the send.
+  { ids = PRESEND_IDS as readonly string[] | null } = {},
+) {
   const logger = Object.assign(vi.fn(), { verbose: false });
+  const onUnproven = vi.fn();
   const outcome = await promptComposer
     .verifyPromptCommitted(runtimeShowing(value), PROMPT, 300, logger, 4, {
-      baselineUserIds: ["u1", "u2", "u3", "u4"],
+      baselineUserIds: ids ?? undefined,
       onUnproven,
     })
     .then(
@@ -43,54 +51,163 @@ async function verify(value: Record<string, unknown>, onUnproven = vi.fn()) {
     );
   return { outcome, logger, onUnproven };
 }
+const notSent = (outcome: unknown) =>
+  expect((outcome as { error?: Error }).error?.message).toMatch(
+    /Prompt did not appear in conversation before timeout/,
+  );
 
 describe("the commit check proves a send by the latest user turn's identity", () => {
   test("a new user turn on a page that unmounted its oldest turn (count unchanged) is a proven commit", async () => {
     const { outcome, onUnproven } = await verify(
-      probe({ latestUserIsNew: true, latestUserId: "u5", latestUserIndex: 3 }),
+      probe({
+        latestUserMatched: true,
+        latestUserIsNew: true,
+        latestUserKnown: false,
+        latestUserId: "u5",
+        latestUserRawText: PROMPT,
+      }),
     );
     // The committed count ends at the sent user turn: the answer wait starts at index 3.
     expect(outcome).toEqual({ committed: 4 });
     expect(onUnproven).not.toHaveBeenCalled();
   });
 
-  test("an identical prompt that is still the baseline's latest user turn is not proven, and never stands for the send", async () => {
-    const { outcome, onUnproven, logger } = await verify(
-      probe({ latestUserKnown: true, latestUserId: "u4" }),
+  test("with the ids known, a grown count and text in older turns prove nothing", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({ hasNewTurn: true, turnsCount: 5, userMatched: true, prefixMatched: true }),
     );
-    // The run goes on (the composer was cleared), with the answer wait's scope unchanged.
+    // Not proven: the run goes on (the composer was cleared) with its scope unchanged.
     expect(outcome).toEqual({ committed: null });
     expect(onUnproven).toHaveBeenCalledWith(null);
+  });
+});
+
+describe("a lost click (the composer still holds the prompt, no new user turn by id) is not sent", () => {
+  test("even when an older user turn shares the prompt's first 120 characters", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({
+        composerCleared: false,
+        userMatched: true,
+        prefixMatched: true,
+        lastMatched: true,
+        latestUserMatched: true,
+        latestUserRawText: `${PROMPT.slice(0, 60)} (the previous round)`,
+      }),
+    );
+    notSent(outcome);
+    expect(onUnproven).not.toHaveBeenCalled();
+  });
+
+  test("even when a short prompt is contained in an older assistant answer", async () => {
+    const { outcome } = await verify(
+      probe({ composerCleared: false, userMatched: true, lastMatched: true }),
+    );
+    notSent(outcome);
+  });
+
+  test("even when it retries the previous prompt, which is the latest user turn", async () => {
+    const { outcome } = await verify(
+      probe({
+        composerCleared: false,
+        userMatched: true,
+        prefixMatched: true,
+        lastMatched: true,
+        latestUserMatched: true,
+        latestUserRawText: PROMPT,
+      }),
+    );
+    notSent(outcome);
+  });
+
+  test("still in the composer and in no turn: today's error", async () => {
+    const { outcome, onUnproven } = await verify(probe({ composerCleared: false }));
+    notSent(outcome);
+    expect(onUnproven).not.toHaveBeenCalled();
+  });
+});
+
+describe("an unproven send whose composer was cleared goes on, scoped only to a new turn", () => {
+  test("a user turn that is new by id stands for the send even when its text differs", async () => {
+    const { outcome, onUnproven, logger } = await verify(
+      probe({
+        latestUserIsNew: true,
+        latestUserKnown: false,
+        latestUserId: "u5",
+        latestUserRawText: "ChatGPT rendered it differently",
+      }),
+    );
+    expect(outcome).toEqual({ committed: 4 });
+    expect(onUnproven).toHaveBeenCalledWith({
+      index: 3,
+      text: "ChatGPT rendered it differently",
+      messageId: "u5",
+    });
     expect(logger).toHaveBeenCalledWith(
       expect.stringMatching(
         /^\[browser\] Prompt commit not proven \(.*\); treating it as sent and waiting for the answer$/,
       ),
     );
   });
-});
 
-describe("an unproven send never ends the run unless the prompt never left the composer", () => {
-  test("shown in the latest user turn with the composer cleared: the run goes on from that turn", async () => {
-    const { outcome, onUnproven } = await verify(probe({}));
-    expect(outcome).toEqual({ committed: 4 });
-    expect(onUnproven).toHaveBeenCalledWith({ index: 3, text: PROMPT, messageId: null });
+  test("an older user turn showing the same prompt never stands for the send", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({ latestUserMatched: true, latestUserRawText: PROMPT, userMatched: true }),
+    );
+    expect(outcome).toEqual({ committed: null });
+    expect(onUnproven).toHaveBeenCalledWith(null);
   });
 
-  test("still in the composer and in no turn: not sent, today's error", async () => {
+  test("with ids known, a latest user turn without an id never stands for the send", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({ latestUserMatched: true, latestUserKnown: false, latestUserId: null }),
+    );
+    expect(outcome).toEqual({ committed: null });
+    expect(onUnproven).toHaveBeenCalledWith(null);
+  });
+
+  test("without ids, the previous assistant's text showing the prompt never lowers the scope", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({ lastMatched: true, userMatched: true, latestUserKnown: false, latestUserId: null }),
+      { ids: null },
+    );
+    // Not turnsCount: that would start the answer wait at the previous exchange.
+    expect(outcome).toEqual({ committed: null });
+    expect(onUnproven).toHaveBeenCalledWith(null);
+  });
+
+  test("without ids, the latest user turn showing the prompt after a grown count stands for the send", async () => {
     const { outcome, onUnproven } = await verify(
       probe({
-        userMatched: false,
-        prefixMatched: false,
-        lastMatched: false,
-        latestUserMatched: false,
-        composerCleared: false,
-        editorValue: PROMPT,
+        hasNewTurn: true,
+        turnsCount: 5,
+        latestUserIndex: 4,
+        latestUserKnown: false,
+        latestUserId: null,
+        latestUserMatched: true,
+        latestUserRawText: PROMPT,
+        // No other sign, so the in-loop count rules did not take it.
+        assistantVisible: false,
+        inConversation: false,
       }),
+      { ids: null },
     );
-    expect((outcome as { error?: Error }).error?.message).toMatch(
-      /Prompt did not appear in conversation before timeout/,
+    expect(outcome).toEqual({ committed: 5 });
+    expect(onUnproven).toHaveBeenCalledWith({ index: 4, text: PROMPT, messageId: null });
+  });
+
+  test("without ids and without a grown count, a latest user turn showing the prompt never stands", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({
+        latestUserKnown: false,
+        latestUserId: null,
+        latestUserMatched: true,
+        latestUserRawText: PROMPT,
+      }),
+      { ids: null },
     );
-    expect(onUnproven).not.toHaveBeenCalled();
+    // It could be an older identical turn.
+    expect(outcome).toEqual({ committed: null });
+    expect(onUnproven).toHaveBeenCalledWith(null);
   });
 });
 
@@ -101,7 +218,7 @@ describe("the fingerprint of an unproven send", () => {
     expect(fingerprintOfUserTurn({ text: PROMPT, messageId: "u5" })).toBe(
       browserPromptFingerprint(PROMPT, "u5"),
     );
-    // Without an identity there is no fingerprint; the session is then found by its text.
+    // Without an identity there is no fingerprint.
     expect(fingerprintOfUserTurn({ text: PROMPT, messageId: null })).toBeUndefined();
     expect(fingerprintOfUserTurn(null)).toBeUndefined();
   });

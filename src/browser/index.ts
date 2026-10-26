@@ -1898,6 +1898,7 @@ async function runBrowserModeInternal(
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
       const previousUserMessageIds = await readUserMessageIds(Runtime, config.inputTimeoutMs);
+      providerState.previousUserMessageIds = previousUserMessageIds;
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,
@@ -3653,6 +3654,7 @@ async function runRemoteBrowserMode(
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
       const previousUserMessageIds = await readUserMessageIds(Runtime, config.inputTimeoutMs);
+      providerState.previousUserMessageIds = previousUserMessageIds;
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,

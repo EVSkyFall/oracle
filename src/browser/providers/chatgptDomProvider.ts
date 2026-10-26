@@ -24,6 +24,8 @@ interface ChatgptDomProviderState {
   deepResearch?: boolean;
   apps?: BrowserAppMention[];
   maxThinkingTime?: ThinkingTimeLevel;
+  /** The user turn identities rendered before the send (the run's readUserMessageIds). */
+  previousUserMessageIds?: readonly string[];
   /** The send's commit was not proven; the run went on (see submitPrompt's onCommitUnproven). */
   commitUnproven?: boolean;
   /** With commitUnproven: the latest user turn standing for the sent one, if any. */
@@ -65,6 +67,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       deepResearch: state.deepResearch,
       apps: state.apps,
       maxThinkingTime: state.maxThinkingTime,
+      baselineUserIds: state.previousUserMessageIds,
       onCommitUnproven: (turn) => {
         state.commitUnproven = true;
         state.unprovenCommitTurn = turn;
