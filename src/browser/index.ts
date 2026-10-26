@@ -86,6 +86,10 @@ import {
   waitForDeepResearchWithRecovery,
 } from "./deepResearchWait.js";
 import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
+import {
+  saveInterruptedBannerDiagnostic,
+  type InterruptedBannerDiagnostic,
+} from "./interruptedBanner.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
 import { formatModelPickerEvidence, readModelPickerEvidence } from "./actions/modelPickerState.js";
@@ -2026,6 +2030,13 @@ async function runBrowserModeInternal(
       <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
       (attempt: TurnResyncAttempt): Promise<T> =>
         waitAtSentTurn(Runtime, sentTurnScope(), attempt, timeoutMs ?? config.timeoutMs, operation);
+    // The "Connection interrupted" banner's diagnostic: one per run, on its first sighting.
+    let interruptedBannerDiagnosed = false;
+    const saveBannerDiagnostic = (diagnostic: InterruptedBannerDiagnostic) => {
+      if (interruptedBannerDiagnosed) return Promise.resolve(undefined);
+      interruptedBannerDiagnosed = true;
+      return saveInterruptedBannerDiagnostic(options.sessionId, diagnostic);
+    };
     await acquireProfileLockIfNeeded();
     try {
       pendingPromptIndex = 0;
@@ -2087,6 +2098,7 @@ async function runBrowserModeInternal(
           conversationUrl: () => lastUrl,
           timeLimit: runClient ?? undefined,
           replaceTab: replaceFrozenTab,
+          saveInterruptedBannerDiagnostic: saveBannerDiagnostic,
           timeoutMs: config.timeoutMs,
           minTurnIndex: baselineTurns,
           resolveMinTurnIndex: async () => {
@@ -2196,6 +2208,7 @@ async function runBrowserModeInternal(
         conversationUrl: () => lastUrl,
         timeLimit: runClient ?? undefined,
         replaceTab: replaceFrozenTab,
+        saveInterruptedBannerDiagnostic: saveBannerDiagnostic,
       });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
@@ -3824,6 +3837,13 @@ async function runRemoteBrowserMode(
       <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
       (attempt: TurnResyncAttempt): Promise<T> =>
         waitAtSentTurn(Runtime, sentTurnScope(), attempt, timeoutMs ?? config.timeoutMs, operation);
+    // The "Connection interrupted" banner's diagnostic: one per run, on its first sighting.
+    let interruptedBannerDiagnosed = false;
+    const saveBannerDiagnostic = (diagnostic: InterruptedBannerDiagnostic) => {
+      if (interruptedBannerDiagnosed) return Promise.resolve(undefined);
+      interruptedBannerDiagnosed = true;
+      return saveInterruptedBannerDiagnostic(options.sessionId, diagnostic);
+    };
     pendingPromptIndex = 0;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
@@ -3876,6 +3896,7 @@ async function runRemoteBrowserMode(
         conversationUrl: () => lastUrl,
         timeLimit: runClient ?? undefined,
         replaceTab: replaceFrozenTab,
+        saveInterruptedBannerDiagnostic: saveBannerDiagnostic,
         timeoutMs: config.timeoutMs,
         minTurnIndex: baselineTurns,
         resolveMinTurnIndex: async () => {
@@ -3982,6 +4003,7 @@ async function runRemoteBrowserMode(
         conversationUrl: () => lastUrl,
         timeLimit: runClient ?? undefined,
         replaceTab: replaceFrozenTab,
+        saveInterruptedBannerDiagnostic: saveBannerDiagnostic,
       });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {

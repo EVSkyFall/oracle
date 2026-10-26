@@ -53,7 +53,7 @@ import {
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
-import { createTurnResync } from "./turnResync.js";
+import { createTurnResync, type TurnResyncOptions } from "./turnResync.js";
 import { createRunClient } from "./runClient.js";
 import { waitForDeepResearchWithRecovery } from "./deepResearchWait.js";
 import { clientTargetId, moveRunToNewTab, type ReplacementTab } from "./tabReplacement.js";
@@ -85,6 +85,8 @@ export interface ReattachDeps {
   onAppApproval?: (record: BrowserAppApprovalRecord) => void | Promise<void>;
   /** Saves a diagnostic of an approval card that was not taken or not clicked (session files). */
   saveAppApprovalDiagnostic?: AppApprovalMonitorOptions["saveDiagnostic"];
+  /** Saves the "Connection interrupted" banner's diagnostic (session files). */
+  saveInterruptedBannerDiagnostic?: TurnResyncOptions["saveInterruptedBannerDiagnostic"];
   /**
    * Called when the wait moved to a new tab because the page stopped answering: the new target
    * (and the session's owned recovery target, when it moved with it) for the session runtime.
@@ -381,6 +383,7 @@ async function resumeBrowserSessionInternal(
             conversationUrl: () => expectedConversationUrl,
             timeLimit: runClient,
             replaceTab: replaceFrozenTab,
+            saveInterruptedBannerDiagnostic: deps.saveInterruptedBannerDiagnostic,
             timeoutMs,
             minTurnIndex: minTurnIndex ?? undefined,
             options: { requireScopedTargetOwner: true },
@@ -414,6 +417,7 @@ async function resumeBrowserSessionInternal(
       conversationUrl: () => expectedConversationUrl,
       timeLimit: runClient,
       replaceTab: replaceFrozenTab,
+      saveInterruptedBannerDiagnostic: deps.saveInterruptedBannerDiagnostic,
     });
     const answer = await withTimeout(
       cancellation.call(() =>
@@ -756,6 +760,7 @@ async function resumeBrowserSessionViaNewChrome(
           conversationUrl: () => conversationUrl,
           timeLimit: runClient,
           replaceTab: replaceFrozenTab,
+          saveInterruptedBannerDiagnostic: deps.saveInterruptedBannerDiagnostic,
           timeoutMs,
           minTurnIndex: minTurnIndex ?? undefined,
           options: { requireScopedTargetOwner: true },
@@ -782,6 +787,7 @@ async function resumeBrowserSessionViaNewChrome(
       conversationUrl: () => conversationUrl,
       timeLimit: runClient,
       replaceTab: replaceFrozenTab,
+      saveInterruptedBannerDiagnostic: deps.saveInterruptedBannerDiagnostic,
     });
     const answer = await cancellation.call(() =>
       withAppApprovalMonitor(

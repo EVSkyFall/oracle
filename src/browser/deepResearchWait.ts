@@ -37,6 +37,7 @@ export function waitForDeepResearchWithRecovery(params: {
   conversationUrl: () => string | null | undefined;
   timeLimit?: TurnResyncOptions["timeLimit"];
   replaceTab?: TurnResyncOptions["replaceTab"];
+  saveInterruptedBannerDiagnostic?: TurnResyncOptions["saveInterruptedBannerDiagnostic"];
   timeoutMs: number;
   minTurnIndex?: number | null;
   /** Resolved again for every attempt; minTurnIndex when it is not given or fails. */
@@ -57,6 +58,7 @@ export function waitForDeepResearchWithRecovery(params: {
     conversationUrl: params.conversationUrl,
     timeLimit: params.timeLimit,
     replaceTab: params.replaceTab,
+    saveInterruptedBannerDiagnostic: params.saveInterruptedBannerDiagnostic,
     frozenOnly: true,
   });
   let attempts = 0;

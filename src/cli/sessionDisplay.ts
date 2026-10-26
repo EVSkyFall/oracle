@@ -15,6 +15,10 @@ import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
 import { withAppApprovals } from "../browser/appApprovalRecords.js";
 import { saveAppApprovalDiagnostic } from "../browser/appApprovalDiagnostics.js";
+import {
+  saveInterruptedBannerDiagnostic,
+  type InterruptedBannerDiagnostic,
+} from "../browser/interruptedBanner.js";
 import { retireRecoveredBrowserTarget } from "../browser/recoveryTarget.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
@@ -369,6 +373,15 @@ export async function attachSession(
           promptPreview: metadata.promptPreview,
           saveAppApprovalDiagnostic: (diagnostic) =>
             saveAppApprovalDiagnostic(sessionId, diagnostic),
+          // One "Connection interrupted" diagnostic per reattach, on its first sighting.
+          saveInterruptedBannerDiagnostic: (() => {
+            let diagnosed = false;
+            return (diagnostic: InterruptedBannerDiagnostic) => {
+              if (diagnosed) return Promise.resolve(undefined);
+              diagnosed = true;
+              return saveInterruptedBannerDiagnostic(sessionId, diagnostic);
+            };
+          })(),
           onAppApproval: async (record) => {
             knownRuntime = withAppApprovals(
               { ...knownRuntime, appApprovals: [record] },

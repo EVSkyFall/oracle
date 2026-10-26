@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import { conversationIdFromUrl } from "./actions/navigation.js";
+import {
+  createInterruptedBannerTracker,
+  INTERRUPTED_BANNER_REASON,
+  readInterruptedBanner,
+  readInterruptedBannerDiagnostic,
+  type InterruptedBannerDiagnostic,
+} from "./interruptedBanner.js";
 import type { ReplacementTab } from "./tabReplacement.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 
@@ -29,6 +36,8 @@ export interface TurnProgressSample {
   key: string;
   length: number;
   url: string;
+  /** The "Connection interrupted" banner's text while it is shown (interruptedBanner.ts). */
+  interrupted?: string | null;
 }
 
 /**
@@ -92,7 +101,14 @@ export function readTurnProgress(doc: Document): TurnProgressSample {
 }
 
 export function buildTurnProgressExpression(): string {
-  return `(${readTurnProgress.toString()})(document)`;
+  // A banner read that fails never costs the progress read.
+  return `((sample) => {
+    let banner = null;
+    try {
+      banner = (${readInterruptedBanner.toString()})(document);
+    } catch {}
+    return { ...sample, interrupted: banner ? banner.text : null };
+  })((${readTurnProgress.toString()})(document))`;
 }
 
 /**
@@ -155,6 +171,13 @@ export interface TurnResyncOptions {
    * reasons to reload (Deep Research can be quiet for many minutes while it researches).
    */
   frozenOnly?: boolean;
+  /**
+   * Saves the "Connection interrupted" banner's diagnostic, read on its first sighting in this
+   * wait (the caller keeps one per run); returns the file's path.
+   */
+  saveInterruptedBannerDiagnostic?: (
+    diagnostic: InterruptedBannerDiagnostic,
+  ) => Promise<string | undefined | void>;
 }
 
 export interface TurnResync {
@@ -185,7 +208,7 @@ export interface TurnResync {
 type Trigger = {
   url: string | null;
   reason: string;
-  kind: "stall" | "hidden" | "frozen";
+  kind: "stall" | "hidden" | "frozen" | "banner";
   /** When the frozen page was last asked something (kind "frozen"). */
   since?: number;
 };
@@ -234,6 +257,167 @@ function formatQuiet(ms: number): string {
   return ms >= 60_000 ? `${Math.floor(ms / 60_000)}m` : `${Math.floor(ms / 1_000)}s`;
 }
 
+/**
+ * `start()` raced against `capMs` and the time left until `deadline`; once that time is spent it
+ * rejects with RunTimeSpent, so no step of a reload outlives the run.
+ */
+function boundedBy<T>(
+  deadline: number,
+  what: string,
+  start: () => Promise<T>,
+  capMs: number,
+): Promise<T> {
+  const left = deadline - Date.now();
+  if (left <= 0) return Promise.reject(new RunTimeSpent(what));
+  const byRunTime = left <= capMs;
+  return withTimeout(
+    (async () => start())(),
+    Math.max(1, Math.floor(byRunTime ? left : capMs)),
+    what,
+  ).catch((error: unknown) => {
+    if (byRunTime && Date.now() >= deadline) throw new RunTimeSpent(what);
+    throw error;
+  });
+}
+
+interface ReloadPage {
+  Runtime: ChromeClient["Runtime"];
+  Page: ChromeClient["Page"];
+  logger: BrowserLogger;
+  settleMs: number;
+}
+
+const readPageWith = async (
+  Runtime: ChromeClient["Runtime"],
+  expression: string,
+): Promise<unknown> => {
+  const { result } = await Runtime.evaluate({ expression, returnByValue: true });
+  return result?.value;
+};
+
+/**
+ * Waits until `settleBy` for a document that has parsed (with `mark`: a new one, the mark gone)
+ * and a turn count that holds for three reads in a row; returns that count (-1 unknown).
+ */
+async function settleTurns(
+  Runtime: ChromeClient["Runtime"],
+  step: Step,
+  settleBy: number,
+  mark?: string,
+): Promise<number> {
+  const settleLeft = () => Math.max(1, settleBy - Date.now());
+  const readiness = mark
+    ? `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`
+    : "document.readyState";
+  while (Date.now() < settleBy) {
+    const state = await orElse(
+      step("reading the new page", () => readPageWith(Runtime, readiness), settleLeft()),
+      "old",
+    );
+    if (state === "interactive" || state === "complete") break;
+    await idle(250);
+  }
+  let turns = -1;
+  let steady = 0;
+  while (Date.now() < settleBy && steady < 3) {
+    const count = await orElse(
+      step(
+        "counting the turns",
+        () => readPageWith(Runtime, buildConversationTurnCountExpression()),
+        settleLeft(),
+      ),
+      -1,
+    );
+    const next = typeof count === "number" ? count : -1;
+    steady = next > 0 && next === turns ? steady + 1 : 0;
+    turns = next;
+    await idle(250);
+  }
+  return turns;
+}
+
+/**
+ * Reloads the conversation (or opens it again when the reload fails or the tab shows another
+ * page) and waits until the new page shows its turns. Every step goes through `step`, which
+ * bounds it by the run's remaining time. Never resubmits and never types.
+ */
+async function markedReload(page: ReloadPage, url: string, step: Step): Promise<void> {
+  const { Runtime, Page, logger } = page;
+  const mark = randomUUID();
+  await orElse(
+    step(
+      "marking the page",
+      () => readPageWith(Runtime, `window.__oracleResyncMark = ${JSON.stringify(mark)}`),
+      PAGE_COMMAND_MS,
+    ),
+    undefined,
+  );
+  const current = await orElse(
+    step("reading the page URL", () => readPageWith(Runtime, "location.href"), PAGE_COMMAND_MS),
+    null,
+  );
+  const sameConversation =
+    typeof current === "string" && conversationIdFromUrl(current) === conversationIdFromUrl(url);
+  let how = "reloaded";
+  try {
+    if (!sameConversation) throw new Error("the tab shows another page");
+    await step("Page.reload", () => Page.reload({}), PAGE_COMMAND_MS);
+  } catch (reloadError) {
+    if (endsReload(reloadError)) throw reloadError;
+    how = "opened again";
+    try {
+      await step("Page.navigate", () => Page.navigate({ url }), PAGE_COMMAND_MS);
+    } catch (navigateError) {
+      if (endsReload(navigateError)) throw navigateError;
+      logger(
+        `[browser] Conversation reload failed (${message(reloadError)}; ${message(navigateError)}); waiting on the page as it is.`,
+      );
+      return;
+    }
+  }
+  const turns = await settleTurns(Runtime, step, Date.now() + page.settleMs, mark);
+  logger(
+    `[browser] Conversation ${how}${turns > 0 ? ` (${turns} turns on the page)` : ""}; waiting for the turn again.`,
+  );
+}
+
+/**
+ * The turn resync's marked conversation reload for a tab outside a run's wait (the --live tail):
+ * every step is bounded by `deadline`; never resubmits and never types. False when it could not
+ * reload (the reason is logged).
+ */
+export async function reloadConversationPage(params: {
+  Runtime: ChromeClient["Runtime"];
+  Page: ChromeClient["Page"];
+  logger: BrowserLogger;
+  url: string;
+  deadline?: number;
+  settleMs?: number;
+}): Promise<boolean> {
+  const deadline = params.deadline ?? Number.POSITIVE_INFINITY;
+  const step: Step = (what, start, capMs) => boundedBy(deadline, what, start, capMs);
+  try {
+    await markedReload(
+      {
+        Runtime: params.Runtime,
+        Page: params.Page,
+        logger: params.logger,
+        settleMs: Math.max(0, params.settleMs ?? RELOAD_SETTLE_MS),
+      },
+      params.url,
+      step,
+    );
+    return true;
+  } catch (error) {
+    params.logger(
+      endsReload(error)
+        ? "[browser] The time for the answer ran out during the conversation reload."
+        : `[browser] Conversation reload failed (${message(error)}); waiting on the page as it is.`,
+    );
+    return false;
+  }
+}
+
 export function createTurnResync(options: TurnResyncOptions): TurnResync {
   const { Runtime, Page, logger } = options;
   const stallMs = Math.max(1, options.stallMs ?? TURN_STALL_MS);
@@ -262,30 +446,38 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   const gate = createPageGate();
   // When the run's time for the wait is spent (set by run).
   let deadline = Number.POSITIVE_INFINITY;
+  // The "Connection interrupted" banner, on its own backoff apart from the stall one.
+  const banner = createInterruptedBannerTracker();
 
-  /**
-   * `start()` raced against `capMs` and the run's remaining time; once that time is spent it
-   * rejects with RunTimeSpent, so no step of a reload outlives the run.
-   */
-  const bounded = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> => {
-    const left = deadline - Date.now();
-    if (left <= 0) return Promise.reject(new RunTimeSpent(what));
-    const byRunTime = left <= capMs;
-    return withTimeout(
-      (async () => start())(),
-      Math.max(1, Math.floor(byRunTime ? left : capMs)),
-      what,
-    ).catch((error: unknown) => {
-      if (byRunTime && Date.now() >= deadline) throw new RunTimeSpent(what);
-      throw error;
-    });
-  };
+  const bounded = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
+    boundedBy(deadline, what, start, capMs);
 
   const progressed = (now: number) => {
     lastChangeAt = now;
     stallReloads = 0;
     stallAnchor = now;
     hiddenReloads = 0;
+  };
+
+  const diagnoseBanner = async (): Promise<void> => {
+    const save = options.saveInterruptedBannerDiagnostic;
+    if (!save) return;
+    try {
+      const diagnostic = await readInterruptedBannerDiagnostic(
+        (expression) =>
+          bounded("reading the banner", () => readPageWith(Runtime, expression), PAGE_COMMAND_MS),
+        INTERRUPTED_BANNER_REASON,
+      );
+      const saved = await save(diagnostic);
+      if (saved) logger(`[browser] "Connection interrupted" diagnostic saved: ${saved}`);
+    } catch (error) {
+      logger(`[browser] "Connection interrupted" diagnostic could not be saved: ${message(error)}`);
+    }
+  };
+
+  const noteBanner = (text: string | null) => {
+    if (banner.note(text)) void diagnoseBanner();
+    if (banner.due()) void decide();
   };
 
   const sample = async (): Promise<void> => {
@@ -313,6 +505,9 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         baseline = value.key;
         progressed(Date.now());
       }
+      noteBanner(
+        typeof value.interrupted === "string" && value.interrupted ? value.interrupted : null,
+      );
     } catch (error) {
       // A failed read is not a change; the next poll reads again. A read that never answers
       // means the renderer stopped: the page is recovered (see recoverFrozen).
@@ -354,8 +549,13 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       if (frozenSince !== null) {
         kind = "frozen";
         reason = formatQuiet(now - frozenSince);
-      } else if (options.frozenOnly) {
-        // only a page that stops answering is recovered
+      } else if (banner.due(now)) {
+        // An explicit sign that the page lost the stream: no quiet time is waited for.
+        kind = "banner";
+        reason = INTERRUPTED_BANNER_REASON;
+      } else if (options.frozenOnly || banner.active()) {
+        // only a page that stops answering is recovered; while the banner shows, its own backoff
+        // decides (a stall reload would only reload the same page again)
       } else if (now - stallAnchor >= stallMs * 2 ** stallReloads) {
         reason = `no change for ${formatQuiet(quiet)}`;
       } else if (
@@ -384,7 +584,9 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         if (!reportedNoUrl.has(kind)) {
           reportedNoUrl.add(kind);
           logger(
-            `[browser] Turn looks stalled (${reason}), but no conversation URL is known, so the page is not reloaded.`,
+            kind === "banner"
+              ? `[browser] ${reason}, but no conversation URL is known, so the page is not reloaded.`
+              : `[browser] Turn looks stalled (${reason}), but no conversation URL is known, so the page is not reloaded.`,
           );
         }
         return;
@@ -394,8 +596,13 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         stallAnchor = now;
       } else if (kind === "hidden") {
         hiddenReloads += 1;
+      } else if (kind === "banner") {
+        // Its own backoff: the stall one is not advanced, its clock starts again from this load.
+        stallAnchor = now;
       }
-      if (kind !== "frozen") {
+      if (kind === "banner") {
+        logger(banner.reloading());
+      } else if (kind !== "frozen") {
         logger(`[browser] Turn looks stalled (${reason}); reloading the conversation to resync`);
       }
       const wake = waiter;
@@ -406,90 +613,14 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     }
   };
 
-  const readPage = async (expression: string): Promise<unknown> => {
-    const { result } = await Runtime.evaluate({ expression, returnByValue: true });
-    return result?.value;
-  };
+  const readPage = (expression: string): Promise<unknown> => readPageWith(Runtime, expression);
+  const reloadPage: ReloadPage = { Runtime, Page, logger, settleMs };
 
-  /**
-   * Waits until `settleBy` for a document that has parsed (with `mark`: a new one, the mark
-   * gone) and a turn count that holds for three reads in a row; returns that count (-1 unknown).
-   */
-  const settleTurns = async (step: Step, settleBy: number, mark?: string): Promise<number> => {
-    const settleLeft = () => Math.max(1, settleBy - Date.now());
-    const readiness = mark
-      ? `window.__oracleResyncMark === ${JSON.stringify(mark)} ? 'old' : document.readyState`
-      : "document.readyState";
-    while (Date.now() < settleBy) {
-      const state = await orElse(
-        step("reading the new page", () => readPage(readiness), settleLeft()),
-        "old",
-      );
-      if (state === "interactive" || state === "complete") break;
-      await idle(250);
-    }
-    let turns = -1;
-    let steady = 0;
-    while (Date.now() < settleBy && steady < 3) {
-      const count = await orElse(
-        step(
-          "counting the turns",
-          () => readPage(buildConversationTurnCountExpression()),
-          settleLeft(),
-        ),
-        -1,
-      );
-      const next = typeof count === "number" ? count : -1;
-      steady = next > 0 && next === turns ? steady + 1 : 0;
-      turns = next;
-      await idle(250);
-    }
-    return turns;
-  };
-
-  /**
-   * Reloads the conversation and waits until the new page shows its turns. Every step is bounded
-   * by the run's remaining time and stops once `abandoned()` (RunTimeSpent / ReloadAbandoned).
-   */
+  /** The marked reload of the conversation, its steps bounded by the run's remaining time. */
   const reload = async ({ url }: { url: string }, abandoned: () => boolean): Promise<void> => {
     const step: Step = (what, start, capMs) =>
       abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
-    const mark = randomUUID();
-    await orElse(
-      step(
-        "marking the page",
-        () => readPage(`window.__oracleResyncMark = ${JSON.stringify(mark)}`),
-        PAGE_COMMAND_MS,
-      ),
-      undefined,
-    );
-    const current = await orElse(
-      step("reading the page URL", () => readPage("location.href"), PAGE_COMMAND_MS),
-      null,
-    );
-    const sameConversation =
-      typeof current === "string" && conversationIdFromUrl(current) === conversationIdFromUrl(url);
-    let how = "reloaded";
-    try {
-      if (!sameConversation) throw new Error("the tab shows another page");
-      await step("Page.reload", () => Page.reload({}), PAGE_COMMAND_MS);
-    } catch (reloadError) {
-      if (endsReload(reloadError)) throw reloadError;
-      how = "opened again";
-      try {
-        await step("Page.navigate", () => Page.navigate({ url }), PAGE_COMMAND_MS);
-      } catch (navigateError) {
-        if (endsReload(navigateError)) throw navigateError;
-        logger(
-          `[browser] Conversation reload failed (${message(reloadError)}; ${message(navigateError)}); waiting on the page as it is.`,
-        );
-        return;
-      }
-    }
-    const turns = await settleTurns(step, Date.now() + settleMs, mark);
-    logger(
-      `[browser] Conversation ${how}${turns > 0 ? ` (${turns} turns on the page)` : ""}; waiting for the turn again.`,
-    );
+    await markedReload(reloadPage, url, step);
   };
 
   /**
@@ -552,7 +683,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         if (answered) break;
         await idle(250);
       }
-      if (answered) turnsAfterReload = await settleTurns(step, Date.now() + settleMs);
+      if (answered) turnsAfterReload = await settleTurns(Runtime, step, Date.now() + settleMs);
     }
     if (await answers(PAGE_ANSWER_WAIT_MS)) {
       said(
@@ -580,7 +711,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       return;
     }
     // The new tab: it has parsed and its turn count holds.
-    const turns = await settleTurns(step, Date.now() + settleMs);
+    const turns = await settleTurns(Runtime, step, Date.now() + settleMs);
     if (replacement.ready) {
       await orElse(
         step("readying the new tab", () => Promise.resolve(replacement.ready!()), PAGE_COMMAND_MS),
@@ -697,6 +828,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
             baseline = undefined;
             hidden = null;
             frozenSince = null;
+            banner.reloaded(outcome.trigger.kind === "banner");
             epoch += 1;
             reloading = false;
           }
