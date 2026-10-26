@@ -64,8 +64,11 @@ export interface AppApprovalCard {
   button: { label: string; rank: number; index: number };
   /** Index of the card element in the remembered subject list (for diagnostics). */
   subject?: number;
-  /** The card's identity in the page across polls (set by the scan expression). */
-  id?: number;
+  /**
+   * The card's identity across polls (set by the scan expression): the document's own random
+   * token and a number, so a card of a reloaded page never takes an earlier page's identity.
+   */
+  id?: string | number;
 }
 
 /** An allow-looking button, or an allowed app's prompt, that the scan does not take. */
@@ -86,8 +89,8 @@ export interface AppApprovalSkip {
   detail: string;
   /** Index of the element to describe in a diagnostic. */
   subject: number;
-  /** That element's identity in the page across polls (set by the scan expression). */
-  id?: number;
+  /** That element's identity across polls (set by the scan expression), per document. */
+  id?: string | number;
 }
 
 /**
@@ -104,7 +107,7 @@ export interface AppApprovalHidden {
   /** True when it holds an enabled allow button: a prompt that waits for an answer. */
   pending: boolean;
   subject: number;
-  id?: number;
+  id?: string | number;
 }
 
 /** What a diagnostic file holds about a card that was not taken or not clicked. */
@@ -892,10 +895,15 @@ export function buildAppApprovalScanExpression(
     const { cards, buttons, skipped, hidden, subjects, labelOf } = scan(document, ${JSON.stringify(allowApps)}, ${JSON.stringify(APP_APPROVAL_VOCABULARY)});
     window.__oracleApprovalButtons = { token: ${JSON.stringify(token)}, nodes: buttons, subjects, labelOf };
     // A card's identity across polls, kept beside the page (the DOM is never marked).
-    const ids = window.__oracleApprovalIds || (window.__oracleApprovalIds = { map: new WeakMap(), next: 1 });
+    // Per document: a reload gives the page a new token, so its numbers start again unmistaken.
+    const ids = window.__oracleApprovalIds || (window.__oracleApprovalIds = {
+      map: new WeakMap(),
+      next: 1,
+      page: globalThis.crypto?.randomUUID?.() ?? (Math.random().toString(36).slice(2) + Date.now().toString(36)),
+    });
     const idOf = (node) => {
       let id = ids.map.get(node);
-      if (id === undefined) { id = ids.next++; ids.map.set(node, id); }
+      if (id === undefined) { id = ids.page + ':' + ids.next++; ids.map.set(node, id); }
       return id;
     };
     return {
