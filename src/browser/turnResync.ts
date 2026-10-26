@@ -242,17 +242,12 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       if (!waiter || reloading) return;
       if (!url) {
         // Reloading a page that is not the conversation would lose the turn.
+        // Nothing was reloaded, so nothing is counted: the next poll asks again.
         if (!reportedNoUrl.has(kind)) {
           reportedNoUrl.add(kind);
           logger(
             `[browser] Turn looks stalled (${reason}), but no conversation URL is known, so the page is not reloaded.`,
           );
-        }
-        if (kind === "stall") {
-          stallReloads += 1;
-          stallAnchor = now;
-        } else {
-          hiddenReloads += 1;
         }
         return;
       }

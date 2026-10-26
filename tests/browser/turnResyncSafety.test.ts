@@ -1,6 +1,6 @@
 import vm from "node:vm";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { createTurnResync } from "../../src/browser/turnResync.js";
+import { createTurnResync, type TurnResyncAttempt } from "../../src/browser/turnResync.js";
 import { withAppApprovalMonitor } from "../../src/browser/actions/appApprovals.js";
 import type { BrowserAppApprovalRecord, ChromeClient } from "../../src/browser/types.js";
 import { DomNode, FakeDocument } from "./domFixture.js";
@@ -63,6 +63,19 @@ function fakePage(options: {
     },
   };
 }
+
+// The attempt with no time left ends as the response wait does at its timeout.
+const timedWait =
+  (attempts: TurnResyncAttempt[], totalMs: number) => (attempt: TurnResyncAttempt) => {
+    attempts.push(attempt);
+    if (attempt.remainingMs(totalMs) <= 0) {
+      return Promise.reject(new Error("Response timeout"));
+    }
+    return new Promise<string>((_, reject) => {
+      attempt.signal.addEventListener("abort", () => reject(attempt.signal.reason));
+      setTimeout(() => reject(new Error("Response timeout")), attempt.remainingMs(totalMs));
+    });
+  };
 
 describe("card identity per document", () => {
   beforeEach(() => {
@@ -183,5 +196,44 @@ describe("card identity per document", () => {
     expect(String(approved)).toMatch(/:1$/);
     expect(String(hiddenOnReload)).toMatch(/:1$/);
     expect(hiddenOnReload).not.toBe(approved);
+  });
+});
+
+describe("a hidden-prompt reload and the conversation URL", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("a hidden prompt seen before the conversation URL is known reloads as soon as it is known", async () => {
+    let url = "https://chatgpt.com/";
+    const tab = fakePage({ scan: () => ({ cards: [], skipped: [], hidden: [] }), url: () => url });
+    const reload = vi.fn(async () => {
+      tab.newDocument();
+      return {};
+    });
+    const logger = quietLogger();
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: { reload, navigate: vi.fn() } as unknown as ChromeClient["Page"],
+      logger,
+      hiddenQuietMs: 0,
+    });
+    void resync.run(timedWait([], 30 * MINUTE), { timeoutMs: 30 * MINUTE }).catch(() => undefined);
+    const report = setInterval(
+      () => resync.reportHiddenApproval({ app: "CODEXish", state: "zero-size" }),
+      1_000,
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reload).not.toHaveBeenCalled();
+    url = CONVERSATION;
+    await vi.advanceTimersByTimeAsync(10_000);
+    clearInterval(report);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(
+      lines(logger).filter((line) => line.includes("no conversation URL is known")),
+    ).toHaveLength(1);
   });
 });
