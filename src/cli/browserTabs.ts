@@ -22,6 +22,7 @@ import {
 } from "../browser/recoverConversation.js";
 import { isAnswerNowPlaceholderText } from "../browser/actions/assistantResponse.js";
 import { isImageOnlyUiChromeText } from "../browser/index.js";
+import { promptAppearsInText } from "../browser/promptMatch.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { persistBrowserHarvest } from "./harvestIntegrity.js";
 import { completeOwnedBrowserHarvest } from "./recoveredBrowserHarvest.js";
@@ -46,13 +47,27 @@ function isRecoverableMissingTabError(message: string): boolean {
   );
 }
 
+/**
+ * How this session's submitted user turn is recognized: its fingerprint (committed text and stable
+ * message id), or, when no fingerprint was recorded for a sent prompt, the prompt's text.
+ * Undefined: a legacy session or an explicit tab, where only the pairing is checked.
+ */
+type SessionTurnIdentity = { fingerprint: string } | { promptText: string };
+
 /** Whether the latest user turn on the page is the one this session submitted. */
 function latestUserIsSessionTurn(
   harvested: ChatGptTabSummary,
-  fingerprint: string | undefined,
+  identity: SessionTurnIdentity | undefined,
 ): boolean {
+  if (identity === undefined) return true;
+  if ("promptText" in identity) {
+    // The same match the run's commit check uses on the latest user turn.
+    return [harvested.lastUserTextRaw, harvested.lastUserText, harvested.lastUserContentText].some(
+      (text) => typeof text === "string" && promptAppearsInText(identity.promptText, text),
+    );
+  }
+  const fingerprint = identity.fingerprint;
   return (
-    fingerprint === undefined ||
     (typeof harvested.lastUserMessageId === "string" &&
       harvested.lastUserMessageId.trim().length > 0 &&
       // ChatGPT can append transient status text outside the user's content after submission.
@@ -78,10 +93,10 @@ type SessionTurnState = "answer" | "generating" | "no-answer" | "other-turn";
 
 function sessionTurnState(
   harvested: ChatGptTabSummary,
-  fingerprint: string | undefined,
+  identity: SessionTurnIdentity | undefined,
   requireFinished: boolean,
 ): SessionTurnState {
-  if (!latestUserIsSessionTurn(harvested, fingerprint)) return "other-turn";
+  if (!latestUserIsSessionTurn(harvested, identity)) return "other-turn";
   const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
   if (
     harvested.assistantFollowsLatestUser !== true ||
@@ -108,23 +123,44 @@ function describeSessionTurn(state: SessionTurnState): string {
   }
 }
 
-/** This session's submitted-turn fingerprint (undefined: legacy session or an explicit tab). */
-function sessionFingerprint(
+/** The text of the last prompt this session sends: its last in-run follow-up, else its prompt. */
+function sessionLastPromptText(meta: SessionMetadata): string | undefined {
+  const options = (meta.options ?? {}) as { prompt?: unknown; browserFollowUps?: unknown };
+  const followUps = Array.isArray(options.browserFollowUps)
+    ? options.browserFollowUps.filter(
+        (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+      )
+    : [];
+  const prompt = followUps.at(-1) ?? options.prompt;
+  return typeof prompt === "string" && prompt.trim() ? prompt : undefined;
+}
+
+/** How this session's submitted turn is recognized (undefined: legacy session or an explicit tab). */
+function sessionTurnIdentity(
   meta: SessionMetadata,
   requireSessionPrompt: boolean,
-): string | undefined {
-  const fingerprint = requireSessionPrompt ? meta.browser?.runtime?.submittedPromptHash : undefined;
+): SessionTurnIdentity | undefined {
+  if (!requireSessionPrompt) return undefined;
+  const runtime = meta.browser?.runtime;
+  const fingerprint = runtime?.submittedPromptHash;
+  if (typeof fingerprint === "string") return { fingerprint };
   if (fingerprint === null) {
+    // The prompt was sent but its commit was not proven, so no fingerprint was recorded.
+    const promptText = runtime?.promptSubmitted === true ? sessionLastPromptText(meta) : undefined;
+    if (promptText) {
+      console.log(
+        "[reattach] No submitted-turn fingerprint was recorded for this session; its turn is identified by its prompt text.",
+      );
+      return { promptText };
+    }
     throw new Error(
       "This browser session has no confirmed submitted user turn; retry after submission or use --browser-tab to inspect a specific tab.",
     );
   }
-  if (requireSessionPrompt && fingerprint === undefined) {
-    console.warn(
-      "Legacy browser session: submitted-turn identity is unavailable; verifying only latest user/assistant pairing.",
-    );
-  }
-  return fingerprint;
+  console.warn(
+    "Legacy browser session: submitted-turn identity is unavailable; verifying only latest user/assistant pairing.",
+  );
+  return undefined;
 }
 
 async function harvestSessionPrompt(
@@ -132,7 +168,7 @@ async function harvestSessionPrompt(
   options: Parameters<typeof harvestChatGptTab>[0],
   requireSessionPrompt = true,
 ): Promise<ChatGptTabSummary> {
-  const fingerprint = sessionFingerprint(meta, requireSessionPrompt);
+  const identity = sessionTurnIdentity(meta, requireSessionPrompt);
   // This session's turn is saved only once it has finished; an explicit tab is a snapshot.
   const requireFinished = requireSessionPrompt;
   const harvestOptions = requireFinished
@@ -141,11 +177,11 @@ async function harvestSessionPrompt(
   const freshnessTimeoutMs = resolveBrowserConfig(meta.browser?.config).inputTimeoutMs;
   const deadline = Date.now() + freshnessTimeoutMs;
   let harvested = await harvestChatGptTab(harvestOptions);
-  let state = sessionTurnState(harvested, fingerprint, requireFinished);
+  let state = sessionTurnState(harvested, identity, requireFinished);
   while (state !== "answer" && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, HARVEST_FRESHNESS_POLL_MS));
     harvested = await harvestChatGptTab(harvestOptions);
-    state = sessionTurnState(harvested, fingerprint, requireFinished);
+    state = sessionTurnState(harvested, identity, requireFinished);
   }
   if (state !== "answer") {
     throw new Error(
@@ -508,7 +544,7 @@ export async function liveTailSessionBrowserOutput(
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
   let releaseRecoveredChrome: ((close?: boolean) => Promise<void>) | null = null;
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
-  const fingerprint = sessionFingerprint(meta, !options.browserTabRef);
+  const identity = sessionTurnIdentity(meta, !options.browserTabRef);
   // The live tail waits for this session's answer as long as the run itself would have.
   const waitMs = options.waitMs ?? resolveBrowserConfig(meta.browser?.config).timeoutMs;
   const waitUntil = Date.now() + waitMs;
@@ -576,7 +612,7 @@ export async function liveTailSessionBrowserOutput(
       requireRecoveredContent = false;
       // Only an answer after this session's own user turn counts; the page's last assistant
       // message can be an earlier turn's while this one is still being generated.
-      const turnState = sessionTurnState(harvested, fingerprint, true);
+      const turnState = sessionTurnState(harvested, identity, true);
       // While this turn is generating, the text is its own only once its answer follows it.
       const ownText =
         turnState === "answer" ||

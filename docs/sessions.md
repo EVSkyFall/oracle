@@ -167,7 +167,14 @@ Implicit harvest also waits for an assistant answer paired with the latest user
 turn, up to the saved browser input timeout. New browser sessions record a
 fingerprint of each rendered, committed user turn and its stable message ID
 before waiting for its answer, including repeated follow-ups. A mismatch preserves the original output; an unconfirmed
-submission requires waiting or explicit tab inspection.
+submission requires waiting or explicit tab inspection. When a prompt was sent
+(`promptSubmitted`) but no fingerprint was recorded because its commit could
+not be proven, `--harvest` and `--live` identify the session's turn by its
+prompt text instead (its last in-run follow-up, else its prompt): the latest
+user turn must show it, matched as the run's commit check matches it, and the
+log says so. Every other rule stays: the completion proof, the turn-tied
+Markdown, never an older turn. Without the prompt text the session is refused
+as before.
 
 Both `--harvest` and `--live` save only an answer that follows the session's
 own submitted user turn; the last assistant message on the page can belong to
