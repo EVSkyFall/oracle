@@ -466,6 +466,40 @@ describe("runBrowserMode no-focus wiring", () => {
     },
   );
 
+  test.each(["local", "remote"])(
+    "a %s run waits for the answer under the stalled-turn resync (an abort signal, the run's timeout)",
+    async (mode) => {
+      const pageActions = await import("../../src/browser/pageActions.js");
+      const providerDomFlow = await import("../../src/browser/providerDomFlow.js");
+      vi.mocked(providerDomFlow.runProviderSubmissionFlow).mockImplementationOnce(async () => {
+        steps.order.push("submit");
+      });
+      const WAIT_REACHED = new Error("stop at the response wait");
+      const waits: unknown[][] = [];
+      vi.mocked(pageActions.waitForAssistantResponse).mockImplementationOnce(
+        async (...args: unknown[]) => {
+          waits.push(args);
+          throw WAIT_REACHED;
+        },
+      );
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "resync wiring",
+          config: runConfig(mode, { timeoutMs: 600_000, inputTimeoutMs: 200 }),
+          log: vi.fn<(message: string) => void>(),
+        }),
+      ).rejects.toBeTruthy();
+      expect(waits).toHaveLength(1);
+      const [, timeoutMs, , , , signal] = waits[0]!;
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect((signal as AbortSignal).aborted).toBe(false);
+      expect(timeoutMs).toBeGreaterThan(590_000);
+      expect(timeoutMs).toBeLessThanOrEqual(600_000);
+    },
+    60_000,
+  );
+
   test.each([true, false])(
     "moves a hidden window on-screen for a local Cloudflare check only when noFocus=%s",
     async (noFocus) => {

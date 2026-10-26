@@ -452,7 +452,18 @@ describe("resumeBrowserSession", () => {
       promptPreview: "live reattach pro 123",
     });
 
-    expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
+    // The wait gets what is left of the timeout and the signal that a conversation reload aborts.
+    expect(waitForAssistantResponse).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Number),
+      logger,
+      3,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    const timeoutArgument = (waitForAssistantResponse.mock.calls[0] as unknown[])[1] as number;
+    expect(timeoutArgument).toBeGreaterThan(1_900);
+    expect(timeoutArgument).toBeLessThanOrEqual(2_000);
   });
 
   test("a Deep Research reattach whose prompt preview matches no turn is scoped to the last user turn", async () => {

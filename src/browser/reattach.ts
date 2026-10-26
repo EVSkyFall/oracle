@@ -49,6 +49,7 @@ import {
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
+import { createTurnResync } from "./turnResync.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
@@ -313,10 +314,33 @@ async function resumeBrowserSessionInternal(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    // A stalled turn (or a prompt hidden in the page) is reloaded and waited for again.
+    const resync = createTurnResync({
+      Runtime,
+      Page,
+      logger,
+      conversationUrl: () => expectedConversationUrl,
+    });
     const answer = await withTimeout(
       cancellation.call(() =>
-        withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
-          waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+        withAppApprovalMonitor(
+          Runtime,
+          client.Input,
+          {
+            ...approvalMonitor,
+            onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+          },
+          () =>
+            resync.run((attempt) =>
+              waitForResponse(
+                Runtime,
+                attempt.remainingMs(timeoutMs),
+                logger,
+                minTurnIndex ?? undefined,
+                undefined,
+                attempt.signal,
+              ),
+            ),
         ),
       ),
       timeoutMs + 5_000,
@@ -590,9 +614,28 @@ async function resumeBrowserSessionViaNewChrome(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    const resync = createTurnResync({
+      Runtime,
+      Page,
+      logger,
+      conversationUrl: () => conversationUrl,
+    });
     const answer = await cancellation.call(() =>
-      withAppApprovalMonitor(Runtime, client.Input, approvalMonitor, () =>
-        waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+      withAppApprovalMonitor(
+        Runtime,
+        client.Input,
+        { ...approvalMonitor, onHiddenSurface: (surface) => resync.reportHiddenApproval(surface) },
+        () =>
+          resync.run((attempt) =>
+            waitForResponse(
+              Runtime,
+              attempt.remainingMs(timeoutMs),
+              logger,
+              minTurnIndex ?? undefined,
+              undefined,
+              attempt.signal,
+            ),
+          ),
       ),
     );
     const recovered = await cancellation.call(() =>

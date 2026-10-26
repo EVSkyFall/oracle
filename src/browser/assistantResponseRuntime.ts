@@ -3,6 +3,7 @@
 // of these closures; they now live here and receive the mode-specific pieces
 // (connection domains, conversation hint emitters, runtime diagnostics) as
 // parameters so both modes run one implementation.
+import type { TurnResyncAttempt } from "./turnResync.js";
 import { readAssistantSnapshot, throwIfAssistantUiError } from "./actions/assistantResponse.js";
 import { waitForResumedConversationHydration } from "./actions/navigation.js";
 import { isStableConversationUrl as isConversationUrl } from "./conversationUrl.js";
@@ -97,8 +98,11 @@ export interface AssistantRecheckEnv {
   recheckTimeoutMs: number;
   fallbackTimeoutMs: number;
   raceWithDisconnect: <T>(operation: Promise<T>) => Promise<T>;
-  waitResponse: (timeoutMs: number) => Promise<AssistantAnswerSnapshot>;
-  waitWithThinkingMonitor: <T>(operation: () => Promise<T>) => Promise<T>;
+  waitResponse: (timeoutMs: number, signal?: AbortSignal) => Promise<AssistantAnswerSnapshot>;
+  /** Runs the wait; it may abort an attempt to reload a stalled conversation and run it again. */
+  waitWithThinkingMonitor: <T>(
+    operation: (attempt?: TurnResyncAttempt) => Promise<T>,
+  ) => Promise<T>;
   onRecheckDelayElapsed?: () => Promise<unknown>;
   onConversationUrlResolved?: (url: string) => void;
   onSessionInvalid: () => Promise<unknown>;
@@ -163,7 +167,9 @@ export function createAttemptAssistantRecheck(
     }
     await env.onRecheckReady?.();
     const timeoutMs = env.recheckTimeoutMs > 0 ? env.recheckTimeoutMs : env.fallbackTimeoutMs;
-    const rechecked = await env.waitWithThinkingMonitor(() => env.waitResponse(timeoutMs));
+    const rechecked = await env.waitWithThinkingMonitor((attempt) =>
+      env.waitResponse(attempt ? attempt.remainingMs(timeoutMs) : timeoutMs, attempt?.signal),
+    );
     env.logger("Recovered assistant response after delayed recheck");
     return rechecked;
   };

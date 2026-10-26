@@ -66,7 +66,8 @@ import {
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
 import { closeComposerPlusPanel } from "./actions/composerTools.js";
-import { withAppApprovalMonitor } from "./actions/appApprovals.js";
+import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
+import { createTurnResync, type TurnResyncAttempt } from "./turnResync.js";
 import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
@@ -315,6 +316,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
   expectedConversationId?: string;
   imageOutputRequested: boolean;
   logger: BrowserLogger;
+  signal?: AbortSignal;
 }): Promise<AssistantAnswer> {
   if (!params.imageOutputRequested) {
     return params.waitForText();
@@ -326,7 +328,11 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
     params.timeoutMs,
     params.minTurnIndex,
     params.expectedConversationId,
+    params.signal,
   );
+  if (params.signal?.aborted) {
+    throw params.signal.reason ?? new Error("The wait for the ChatGPT response was aborted.");
+  }
   if (response) {
     if (response.text.trim() === "Generated image" || isGeneratedImageAssistantAnswer(response)) {
       params.logger("[browser] Captured generated image response before text appeared.");
@@ -355,9 +361,10 @@ async function pollGeneratedImageOrTextAssistantResponse(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  signal?: AbortSignal,
 ): Promise<AssistantAnswer | null> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     let snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId).catch(
       () => null,
     );
@@ -1295,7 +1302,10 @@ async function runBrowserModeInternal(
       cancellation.race(Promise.race([promise, disconnectPromise]));
     const { Network, Page, Runtime, Input, DOM, Target } = client;
     const loginClient = client;
-    const watchAppApprovals = <T>(operation: () => Promise<T>): Promise<T> =>
+    const watchAppApprovals = <T>(
+      operation: () => Promise<T>,
+      extra: Partial<AppApprovalMonitorOptions> = {},
+    ): Promise<T> =>
       withAppApprovalMonitor(
         Runtime,
         Input,
@@ -1308,6 +1318,7 @@ async function runBrowserModeInternal(
             await emitRuntimeHint();
           },
           saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic(options.sessionId, diagnostic),
+          ...extra,
         },
         operation,
       );
@@ -2013,13 +2024,20 @@ async function runBrowserModeInternal(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitWithThinkingMonitor = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
+    // the page) and waits again on the reloaded page; see turnResync.ts.
+    const waitWithThinkingMonitor = async <T>(
+      operation: (attempt: TurnResyncAttempt) => Promise<T>,
+    ): Promise<T> => {
+      const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,
       });
       try {
-        return await watchAppApprovals(operation);
+        return await watchAppApprovals(() => resync.run(operation), {
+          onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+        });
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -2035,7 +2053,7 @@ async function runBrowserModeInternal(
       recheckTimeoutMs,
       fallbackTimeoutMs: config.timeoutMs,
       raceWithDisconnect,
-      waitResponse: (timeoutMs) =>
+      waitResponse: (timeoutMs, signal) =>
         raceWithDisconnect(
           waitForAssistantOrGeneratedImageResponse({
             Runtime,
@@ -2047,12 +2065,14 @@ async function runBrowserModeInternal(
                 logger,
                 baselineTurns ?? undefined,
                 expectedConversationId(),
+                signal,
               ),
             timeoutMs,
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: expectedConversationId(),
             imageOutputRequested,
+            signal,
           }),
         ),
       waitWithThinkingMonitor,
@@ -2078,7 +2098,7 @@ async function runBrowserModeInternal(
       let turnAnswer: AssistantAnswer;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor(() =>
+        turnAnswer = await waitWithThinkingMonitor((attempt) =>
           raceWithDisconnect(
             waitForAssistantOrGeneratedImageResponse({
               Runtime,
@@ -2086,16 +2106,18 @@ async function runBrowserModeInternal(
                 waitForAssistantResponseWithReload(
                   Runtime,
                   Page,
-                  config.timeoutMs,
+                  attempt.remainingMs(config.timeoutMs),
                   logger,
                   baselineTurns ?? undefined,
                   expectedConversationId(),
+                  attempt.signal,
                 ),
-              timeoutMs: config.timeoutMs,
+              timeoutMs: attempt.remainingMs(config.timeoutMs),
               logger,
               minTurnIndex: baselineTurns ?? undefined,
               expectedConversationId: expectedConversationId(),
               imageOutputRequested,
+              signal: attempt.signal,
             }),
           ),
         );
@@ -3168,7 +3190,10 @@ async function runRemoteBrowserMode(
     };
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
-    const watchAppApprovals = <T>(operation: () => Promise<T>): Promise<T> =>
+    const watchAppApprovals = <T>(
+      operation: () => Promise<T>,
+      extra: Partial<AppApprovalMonitorOptions> = {},
+    ): Promise<T> =>
       withAppApprovalMonitor(
         Runtime,
         Input,
@@ -3181,6 +3206,7 @@ async function runRemoteBrowserMode(
             await emitRuntimeHint();
           },
           saveDiagnostic: (diagnostic) => saveAppApprovalDiagnostic(options.sessionId, diagnostic),
+          ...extra,
         },
         operation,
       );
@@ -3636,13 +3662,20 @@ async function runRemoteBrowserMode(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitWithThinkingMonitor = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
+    // the page) and waits again on the reloaded page; see turnResync.ts.
+    const waitWithThinkingMonitor = async <T>(
+      operation: (attempt: TurnResyncAttempt) => Promise<T>,
+    ): Promise<T> => {
+      const resync = createTurnResync({ Runtime, Page, logger, conversationUrl: () => lastUrl });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,
       });
       try {
-        return await watchAppApprovals(operation);
+        return await watchAppApprovals(() => resync.run(operation), {
+          onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+        });
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -3658,7 +3691,7 @@ async function runRemoteBrowserMode(
       recheckTimeoutMs,
       fallbackTimeoutMs: config.timeoutMs,
       raceWithDisconnect: <T>(operation: Promise<T>) => operation,
-      waitResponse: (timeoutMs) =>
+      waitResponse: (timeoutMs, signal) =>
         waitForAssistantOrGeneratedImageResponse({
           Runtime,
           waitForText: () =>
@@ -3669,12 +3702,14 @@ async function runRemoteBrowserMode(
               logger,
               baselineTurns ?? undefined,
               expectedConversationId(),
+              signal,
             ),
           timeoutMs,
           logger,
           minTurnIndex: baselineTurns ?? undefined,
           expectedConversationId: expectedConversationId(),
           imageOutputRequested,
+          signal,
         }),
       waitWithThinkingMonitor,
       onSessionInvalid: emitRuntimeHint,
@@ -3699,23 +3734,25 @@ async function runRemoteBrowserMode(
       let turnAnswer: AssistantAnswer;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor(() =>
+        turnAnswer = await waitWithThinkingMonitor((attempt) =>
           waitForAssistantOrGeneratedImageResponse({
             Runtime,
             waitForText: () =>
               waitForAssistantResponseWithReload(
                 Runtime,
                 Page,
-                config.timeoutMs,
+                attempt.remainingMs(config.timeoutMs),
                 logger,
                 baselineTurns ?? undefined,
                 expectedConversationId(),
+                attempt.signal,
               ),
-            timeoutMs: config.timeoutMs,
+            timeoutMs: attempt.remainingMs(config.timeoutMs),
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: expectedConversationId(),
             imageOutputRequested,
+            signal: attempt.signal,
           }),
         );
       } catch (error) {
@@ -4223,6 +4260,7 @@ async function waitForAssistantResponseWithReload(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  signal?: AbortSignal,
 ) {
   try {
     return await waitForAssistantResponse(
@@ -4231,9 +4269,11 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      signal,
     );
   } catch (error) {
-    if (!shouldReloadAfterAssistantError(error)) {
+    // An aborted wait belongs to a reload the run is doing itself.
+    if (signal?.aborted || !shouldReloadAfterAssistantError(error)) {
       throw error;
     }
     const conversationUrl = await readConversationUrl(Runtime);
@@ -4253,6 +4293,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      signal,
     );
   }
 }

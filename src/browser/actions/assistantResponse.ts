@@ -288,17 +288,33 @@ export function buildActiveThinkingStatusPredicateJsForTest(fnName: string): str
   return buildActiveThinkingStatusPredicateJs(fnName);
 }
 
+/** What an aborted wait rejects with; its message names no timeout, so no caller retries it. */
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error("The wait for the ChatGPT response was aborted.");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+/**
+ * Waits for the assistant turn after `minTurnIndex` to finish. `signal` ends the wait (the run
+ * aborts it to reload a stalled conversation and then waits again): every poll stops and the
+ * returned promise rejects with the signal's reason.
+ */
 export async function waitForAssistantResponse(
   Runtime: ChromeClient["Runtime"],
   timeoutMs: number,
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  signal?: AbortSignal,
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
+  throwIfAborted(signal);
   const start = Date.now();
   logger("Waiting for ChatGPT response");
   // Learned: two paths are needed:
@@ -323,6 +339,8 @@ export async function waitForAssistantResponse(
   // Use AbortController to stop the poller when the evaluation wins the race,
   // preventing abandoned polling loops from consuming resources.
   const pollerAbort = new AbortController();
+  const stopPoller = () => pollerAbort.abort();
+  signal?.addEventListener("abort", stopPoller, { once: true });
   const pollerPromise = pollAssistantCompletion(
     Runtime,
     timeoutMs,
@@ -335,10 +353,24 @@ export async function waitForAssistantResponse(
       throw { source: "poll" as const, error };
     },
   );
+  const abortedPromise = signal
+    ? new Promise<never>((_, reject) => {
+        const rejectAborted = () =>
+          reject({ source: "abort" as const, error: abortReason(signal) });
+        if (signal.aborted) rejectAborted();
+        else signal.addEventListener("abort", rejectAborted, { once: true });
+      })
+    : null;
+  // The page side of an aborted wait ends with the reload that follows the abort.
+  abortedPromise?.catch(() => undefined);
 
   let evaluation: Awaited<ReturnType<ChromeClient["Runtime"]["evaluate"]>> | null = null;
   try {
-    const winner = await Promise.race([raceReadyEvaluation, pollerPromise]);
+    const winner = await Promise.race(
+      abortedPromise
+        ? [raceReadyEvaluation, pollerPromise, abortedPromise]
+        : [raceReadyEvaluation, pollerPromise],
+    );
     if (winner.kind === "poll") {
       if (!winner.value) {
         throw { source: "poll" as const, error: new Error(ASSISTANT_POLL_TIMEOUT_ERROR) };
@@ -359,6 +391,11 @@ export async function waitForAssistantResponse(
       "error" in wrappedError
     ) {
       const { source, error } = wrappedError as { source: string; error: unknown };
+      if (source === "abort") {
+        evaluationPromise.catch(() => undefined);
+        pollerPromise.catch(() => undefined);
+        throw error;
+      }
       if (
         source === "poll" &&
         error instanceof Error &&
@@ -381,10 +418,12 @@ export async function waitForAssistantResponse(
           logger,
           minTurnIndex,
           expectedConversationId,
+          signal,
         );
         if (recovered) {
           return recovered;
         }
+        throwIfAborted(signal);
         await logDomFailure(Runtime, logger, "assistant-response");
         throw error ?? new Error("Failed to capture assistant response");
       }
@@ -408,6 +447,7 @@ export async function waitForAssistantResponse(
         logger,
         minTurnIndex,
         expectedConversationId,
+        signal,
       );
       if (recovered) {
         return recovered;
@@ -417,12 +457,14 @@ export async function waitForAssistantResponse(
         const polled = await Promise.race([
           pollerPromise.catch(() => null),
           delay(remainingMs).then(() => null),
+          ...(abortedPromise ? [abortedPromise.catch(() => null)] : []),
         ]);
         if (polled && polled.kind === "poll" && polled.value) {
           return polled.value;
         }
       }
     }
+    throwIfAborted(signal);
     await logDomFailure(Runtime, logger, "assistant-response");
     throw new Error("Unable to capture assistant response");
   }
@@ -433,7 +475,9 @@ export async function waitForAssistantResponse(
     logger,
     minTurnIndex,
     expectedConversationId,
+    signal,
   );
+  throwIfAborted(signal);
   const candidate = refreshed ?? parsed;
   if (isGeneratedImageAssistantAnswer(candidate)) {
     logger("Captured assistant generated image response");
@@ -455,10 +499,12 @@ export async function waitForAssistantResponse(
       remainingMs,
       minTurnIndex,
       expectedConversationId,
+      signal,
     );
     if (completed) {
       return completed;
     }
+    throwIfAborted(signal);
     // Could not prove completion within the budget: refuse rather than finalize a possibly
     // incomplete capture. A clean, fast failure is recoverable (retry/salvage) and never
     // ships a preamble as if it were the answer.
@@ -567,6 +613,7 @@ async function recoverAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  signal?: AbortSignal,
 ): Promise<{
   text: string;
   html?: string;
@@ -584,7 +631,9 @@ async function recoverAssistantResponse(
     },
     recoveryTimeoutMs,
     400,
+    signal,
   );
+  throwIfAborted(signal);
   if (recovered) {
     // Route EVERY recovered snapshot through the terminal-only poller (not just short ones):
     // a recovered long preamble is exactly the raw-return bug this gate exists to prevent.
@@ -596,7 +645,9 @@ async function recoverAssistantResponse(
         remainingMs,
         minTurnIndex,
         expectedConversationId,
+        signal,
       );
+      throwIfAborted(signal);
       if (confirmed) {
         logger("Recovered and confirmed assistant response via polling fallback");
         return confirmed;
@@ -672,6 +723,7 @@ async function refreshAssistantSnapshot(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  signal?: AbortSignal,
 ): Promise<{
   text: string;
   html?: string;
@@ -685,7 +737,7 @@ async function refreshAssistantSnapshot(
   } | null = null;
   let stableCycles = 0;
   const stableTarget = 3;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     // Learned: short/fast answers can race; poll a few extra cycles to pick up messageId + full text.
     const latestSnapshot = await readAssistantSnapshot(
       Runtime,
@@ -1070,9 +1122,10 @@ async function waitForCondition<T>(
   getter: () => Promise<T | null>,
   timeoutMs: number,
   pollIntervalMs = 400,
+  signal?: AbortSignal,
 ): Promise<T | null> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     const value = await getter();
     if (value) {
       return value;
