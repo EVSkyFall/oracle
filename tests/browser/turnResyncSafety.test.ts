@@ -64,6 +64,16 @@ function fakePage(options: {
   };
 }
 
+const card = (id: string) => ({
+  key: `codexish-${id}`,
+  app: "CODEXish",
+  title: "CODEXish",
+  toolText: "Allow ChatGPT to use CODEXish? ChatGPT will call CODEXish's Fs Read tool.",
+  button: { label: "Always allow", rank: 0, index: 0 },
+  subject: 0,
+  id,
+});
+
 // The attempt with no time left ends as the response wait does at its timeout.
 const timedWait =
   (attempts: TurnResyncAttempt[], totalMs: number) => (attempt: TurnResyncAttempt) => {
@@ -235,5 +245,97 @@ describe("a hidden-prompt reload and the conversation URL", () => {
     expect(
       lines(logger).filter((line) => line.includes("no conversation URL is known")),
     ).toHaveLength(1);
+  });
+});
+
+describe("approval clicks and conversation reloads", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("a reload asked for between mouseMoved and mousePressed waits for the click; the monitor goes on on the new document", async () => {
+    let page = 1;
+    const clickedOn = new Set<number>();
+    const events: string[] = [];
+    const tab = fakePage({
+      scan: () => ({
+        cards: clickedOn.has(page) ? [] : [card(`page${page}:1`)],
+        skipped: [],
+        hidden: [],
+      }),
+      onClickDelivered: () => {
+        clickedOn.add(page);
+      },
+    });
+    const logger = quietLogger();
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: {
+        reload: vi.fn(async () => {
+          events.push("reload");
+          page += 1;
+          tab.newDocument();
+          return {};
+        }),
+        navigate: vi.fn(),
+      } as unknown as ChromeClient["Page"],
+      logger,
+      conversationUrl: () => CONVERSATION,
+      hiddenQuietMs: 0,
+    });
+    const Input = {
+      dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+        events.push(`${type}@page${page}`);
+        if (type === "mouseMoved" && page === 1) {
+          // The reload is asked for right after the pointer moved onto the button.
+          resync.reportHiddenApproval({ app: "CODEXish", state: "zero-size" });
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+        }
+        return {};
+      }),
+    };
+    const records: BrowserAppApprovalRecord[] = [];
+    const answer = withAppApprovalMonitor(
+      tab.Runtime,
+      Input as unknown as ChromeClient["Input"],
+      {
+        allowApps: ["CODEXish"],
+        logger,
+        onApproval: (record) => {
+          records.push(record);
+        },
+        onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+        gate: resync.gate,
+      },
+      () =>
+        resync.run(
+          (attempt) =>
+            new Promise<string>((resolve, reject) => {
+              attempt.signal.addEventListener("abort", () => reject(attempt.signal.reason));
+              const check = setInterval(() => {
+                if (clickedOn.has(2)) {
+                  clearInterval(check);
+                  resolve("approved on the reloaded page");
+                }
+              }, 250);
+            }),
+          { timeoutMs: 30 * MINUTE },
+        ),
+    );
+    await vi.advanceTimersByTimeAsync(MINUTE);
+    await expect(answer).resolves.toBe("approved on the reloaded page");
+    expect(events).toEqual([
+      "mouseMoved@page1",
+      "mousePressed@page1",
+      "mouseReleased@page1",
+      "reload",
+      "mouseMoved@page2",
+      "mousePressed@page2",
+      "mouseReleased@page2",
+    ]);
+    expect(records).toHaveLength(2);
   });
 });

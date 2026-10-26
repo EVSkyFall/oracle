@@ -2038,6 +2038,7 @@ async function runBrowserModeInternal(
       try {
         return await watchAppApprovals(() => resync.run(operation), {
           onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+          gate: resync.gate,
         });
       } finally {
         stopThinkingMonitor?.();
@@ -3677,6 +3678,7 @@ async function runRemoteBrowserMode(
       try {
         return await watchAppApprovals(() => resync.run(operation), {
           onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+          gate: resync.gate,
         });
       } finally {
         stopThinkingMonitor?.();

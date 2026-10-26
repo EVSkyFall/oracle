@@ -329,6 +329,7 @@ async function resumeBrowserSessionInternal(
           {
             ...approvalMonitor,
             onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+            gate: resync.gate,
           },
           () =>
             resync.run((attempt) =>
@@ -624,7 +625,11 @@ async function resumeBrowserSessionViaNewChrome(
       withAppApprovalMonitor(
         Runtime,
         client.Input,
-        { ...approvalMonitor, onHiddenSurface: (surface) => resync.reportHiddenApproval(surface) },
+        {
+          ...approvalMonitor,
+          onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+          gate: resync.gate,
+        },
         () =>
           resync.run((attempt) =>
             waitForResponse(

@@ -85,6 +85,30 @@ export function buildTurnProgressExpression(): string {
   return `(${readTurnProgress.toString()})(document)`;
 }
 
+/**
+ * One page action at a time. An approval click (a guarded trusted click is several CDP events)
+ * and a conversation reload never interleave: events of a click that began on one document must
+ * never land on the next at the old coordinates.
+ */
+export interface PageGate {
+  /** Runs `action` once no other action holds the page, in the order they asked. */
+  exclusive<T>(action: () => Promise<T>): Promise<T>;
+}
+
+export function createPageGate(): PageGate {
+  let tail: Promise<void> = Promise.resolve();
+  return {
+    exclusive<T>(action: () => Promise<T>): Promise<T> {
+      const turn = tail.then(() => action());
+      tail = turn.then(
+        () => undefined,
+        () => undefined,
+      );
+      return turn;
+    },
+  };
+}
+
 export interface TurnResyncAttempt {
   /** Aborted when the conversation is reloaded; that attempt ends and a new one starts. */
   signal: AbortSignal;
@@ -105,6 +129,8 @@ export interface TurnResyncOptions {
 }
 
 export interface TurnResync {
+  /** Shared with the approval monitor: its polls and the reloads take turns on the page. */
+  gate: PageGate;
   /** When the thread last changed (also the heartbeat's "last change"). */
   lastChangedAt(): number;
   /** The approval monitor found an allowed app's pending prompt hidden in the page. */
@@ -170,6 +196,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   let deciding = false;
   let waiter: ((trigger: Trigger) => void) | null = null;
   const reportedNoUrl = new Set<string>();
+  const gate = createPageGate();
 
   const progressed = (now: number) => {
     lastChangeAt = now;
@@ -317,7 +344,19 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     );
   };
 
+  /** The reload, after any approval click in flight has finished (the gate). */
+  const reloadInTurn = async (trigger: Trigger): Promise<void> => {
+    try {
+      await gate.exclusive(() => reload(trigger));
+    } catch (error) {
+      logger(
+        `[browser] Conversation reload failed (${message(error)}); waiting on the page as it is.`,
+      );
+    }
+  };
+
   const resync: TurnResync = {
+    gate,
     lastChangedAt: () => lastChangeAt,
     reportHiddenApproval(surface) {
       if (reloading) return;
@@ -362,7 +401,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
           reloading = true;
           epoch += 1;
           try {
-            await reload(outcome.trigger);
+            await reloadInTurn(outcome.trigger);
           } finally {
             baseline = undefined;
             hidden = null;

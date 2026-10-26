@@ -1027,6 +1027,12 @@ export interface AppApprovalMonitorOptions {
   onHiddenSurface?: (surface: AppApprovalHidden) => void;
   /** How long a prompt must stay hidden before it counts (a card may mount hidden and fade in). */
   hiddenSettleMs?: number;
+  /**
+   * Shared with the run's conversation reloads: each poll (its scan and its clicks) holds the page,
+   * so a reload waits for a click in flight and no click starts during a reload; the next poll
+   * reads the new document.
+   */
+  gate?: { exclusive<T>(action: () => Promise<T>): Promise<T> };
 }
 
 const HIDDEN_SETTLE_MS = 5_000;
@@ -1291,7 +1297,7 @@ export function startAppApprovalMonitor(
   const loop = (async () => {
     while (!stopped) {
       try {
-        await poll();
+        await (options.gate ? options.gate.exclusive(poll) : poll());
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!reportedErrors.has(message)) {
