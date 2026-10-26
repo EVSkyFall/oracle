@@ -62,18 +62,34 @@ export async function waitForDetachedSessionCancellation({
   markerPath,
   signal,
   pollIntervalMs = 100,
+  accessFile = access,
+  onCheckFailed,
 }: {
   markerPath: string;
   signal: AbortSignal;
   pollIntervalMs?: number;
+  accessFile?: (path: string) => Promise<void>;
+  /** Called once per distinct failure of the marker check other than "not there". */
+  onCheckFailed?: (error: unknown) => void;
 }): Promise<boolean> {
+  const reported = new Set<string>();
   while (!signal.aborted) {
     try {
-      await access(markerPath);
+      await accessFile(markerPath);
       return true;
     } catch (error) {
+      // "Not there" is the normal answer. Any other failure (a transient EPERM or EBUSY while
+      // the session directory is busy) is checked again on the next poll: over a run of hours
+      // this check runs tens of thousands of times, and one failure must never end the run.
       if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
+        const key =
+          error instanceof Error
+            ? `${(error as NodeJS.ErrnoException).code ?? ""}:${error.message}`
+            : String(error);
+        if (!reported.has(key)) {
+          reported.add(key);
+          onCheckFailed?.(error);
+        }
       }
     }
     try {

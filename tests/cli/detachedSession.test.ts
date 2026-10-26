@@ -205,4 +205,38 @@ describe("detached session launcher", () => {
     )[2].stdio;
     expect(stdio).toEqual(["pipe", "ignore", "ignore"]);
   });
+
+  test("a transient failure of the cancellation check never ends it, and a later request is still seen", async () => {
+    let call = 0;
+    const failures: unknown[] = [];
+    const accessFile = async () => {
+      call += 1;
+      if (call === 3 || call === 4) {
+        throw Object.assign(new Error("EPERM: operation not permitted, access"), { code: "EPERM" });
+      }
+      if (call < 8) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    };
+    await expect(
+      waitForDetachedSessionCancellation({
+        markerPath: "unused",
+        signal: new AbortController().signal,
+        pollIntervalMs: 1,
+        accessFile,
+        onCheckFailed: (error) => failures.push(error),
+      }),
+    ).resolves.toBe(true);
+    expect(call).toBe(8);
+    // Reported once per distinct failure.
+    expect(failures).toHaveLength(1);
+  });
+
+  test("the worker handles its cancellation monitor's failure where it creates it, not only after the run", async () => {
+    const source = await readFile(path.join(process.cwd(), "bin", "oracle-cli.ts"), "utf8");
+    const worker = source.slice(source.indexOf("async function executeSession("));
+    const created = worker.indexOf("cancellationMonitor = waitForDetachedSessionCancellation(");
+    const handled = worker.indexOf("cancellationMonitor.catch(");
+    expect(created).toBeGreaterThan(0);
+    expect(handled).toBeGreaterThan(created);
+    expect(handled).toBeLessThan(worker.indexOf("await performSessionRun("));
+  });
 });

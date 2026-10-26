@@ -2997,13 +2997,23 @@ async function executeSession(sessionId: string) {
     if (sessionMode === "browser") {
       const paths = await sessionStore.getPaths(sessionId);
       cancellationMarker = detachedSessionCancellationPath(paths.dir, process.pid);
+      const monitorLog = writer.logLine;
       cancellationMonitor = waitForDetachedSessionCancellation({
         markerPath: cancellationMarker,
         signal: stopCancellationMonitor.signal,
+        onCheckFailed: (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          monitorLog(`[worker] Cancellation check failed (checked again): ${message}`);
+        },
       }).then((requested) => {
         if (requested) {
           cancellation.abort(new BrowserRunCancelledError("Browser run cancelled by the user."));
         }
+      });
+      // It is awaited only after the run; a failure meanwhile must not be an unhandled rejection.
+      cancellationMonitor.catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        monitorLog(`ERROR: Detached cancellation monitor failed: ${message}`);
       });
     }
     const userConfig = (await loadUserConfig()).config;
@@ -3049,10 +3059,8 @@ async function executeSession(sessionId: string) {
     }
   } finally {
     stopCancellationMonitor.abort();
-    await cancellationMonitor?.catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      writer?.logLine(`ERROR: Detached cancellation monitor failed: ${message}`);
-    });
+    // Its failure was logged when it happened.
+    await cancellationMonitor?.catch(() => undefined);
     if (cancellationMarker) {
       await clearDetachedSessionCancellation(cancellationMarker).catch(() => undefined);
     }
