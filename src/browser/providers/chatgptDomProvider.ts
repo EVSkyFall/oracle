@@ -66,10 +66,9 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
   );
   state.committedTurns =
     typeof committedTurns === "number" && Number.isFinite(committedTurns) ? committedTurns : null;
-  if (
-    state.committedTurns != null &&
-    (state.baselineTurns == null || state.committedTurns > state.baselineTurns)
-  ) {
+  // The committed count ends at the sent user turn, so the answer wait starts there. It can be
+  // lower than the count before the send: a long conversation unmounts old turns for new ones.
+  if (state.committedTurns != null) {
     state.baselineTurns = Math.max(0, state.committedTurns - 1);
   }
 }

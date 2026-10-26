@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import type { ChromeClient } from "./types.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 
+const USER_TURN_SELECTOR =
+  ':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])';
+
 export function browserPromptFingerprint(value: unknown, messageId: string): string {
   return createHash("sha256")
     .update(JSON.stringify([messageId, String(value ?? "").replace(/\r\n?/g, "\n")]))
@@ -23,6 +26,31 @@ export function readUserMessageIds(
   );
 }
 
+/** A user turn as read from the page: its index in the turn list, raw text and identity. */
+export interface PageUserTurn {
+  index: number;
+  text: string | null;
+  messageId: string | null;
+}
+
+/**
+ * Browser-context expression for the latest user turn ({ index, text, messageId } or null). The
+ * identity is the one readUserMessageIds records, so a turn can be told apart from the turns
+ * rendered before a send.
+ */
+export function buildLatestUserTurnExpression(): string {
+  const userSelector = JSON.stringify(USER_TURN_SELECTOR);
+  return `(() => {
+        const turns = ${buildConversationTurnListExpression()};
+        for (let index = turns.length - 1; index >= 0; index--) {
+          const turn = turns[index];
+          const user = turn.matches?.(${userSelector}) ? turn : turn.querySelector?.(${userSelector});
+          if (user) return { index, text: (user.querySelector?.('[data-user-message-bubble="true"]') || user).textContent ?? null, messageId: user.getAttribute?.('data-message-id') || user.getAttribute?.('data-chatgpt-selection-message-id') || user.getAttribute?.('data-chatgpt-search-message-ids')?.split(' ')[0] || user.closest?.('[data-turn-key]')?.getAttribute('data-turn-key') || (user.getAttribute?.('data-content-search-unit-key') || user.getAttribute?.('data-chatgpt-search-unit-key')) || null };
+        }
+        return null;
+      })()`;
+}
+
 export async function readSubmittedPromptFingerprint(
   runtime: ChromeClient["Runtime"],
   previousMessageIds: readonly string[] | undefined,
@@ -30,31 +58,18 @@ export async function readSubmittedPromptFingerprint(
 ): Promise<string | undefined> {
   if (previousMessageIds === undefined) return undefined;
   const previous = new Set(previousMessageIds);
-  return readDomUntil(
-    runtime,
-    `(() => {
-        const turns = ${buildConversationTurnListExpression()};
-        for (let index = turns.length - 1; index >= 0; index--) {
-          const turn = turns[index];
-          const user = turn.matches(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])') ? turn : turn.querySelector(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])');
-          if (user) return { text: (user.querySelector('[data-user-message-bubble="true"]') || user).textContent, messageId: user.getAttribute('data-message-id') || user.getAttribute('data-chatgpt-selection-message-id') || user.getAttribute('data-chatgpt-search-message-ids')?.split(' ')[0] || user.closest('[data-turn-key]')?.getAttribute('data-turn-key') || (user.getAttribute('data-content-search-unit-key') || user.getAttribute('data-chatgpt-search-unit-key')) };
-        }
-        return null;
-      })()`,
-    timeoutMs,
-    (value) => {
-      const turn = value as { text?: unknown; messageId?: unknown } | null;
-      if (
-        typeof turn?.text === "string" &&
-        turn.text.trim() &&
-        typeof turn.messageId === "string" &&
-        turn.messageId.trim() &&
-        !previous.has(turn.messageId)
-      )
-        return browserPromptFingerprint(turn.text, turn.messageId);
-      return undefined;
-    },
-  );
+  return readDomUntil(runtime, buildLatestUserTurnExpression(), timeoutMs, (value) => {
+    const turn = value as { text?: unknown; messageId?: unknown } | null;
+    if (
+      typeof turn?.text === "string" &&
+      turn.text.trim() &&
+      typeof turn.messageId === "string" &&
+      turn.messageId.trim() &&
+      !previous.has(turn.messageId)
+    )
+      return browserPromptFingerprint(turn.text, turn.messageId);
+    return undefined;
+  });
 }
 
 async function readDomUntil<T>(

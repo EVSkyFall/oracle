@@ -41,6 +41,8 @@ import {
 import { hasDeepResearchMention } from "./deepResearch.js";
 import { assertAppMentionsPresent, insertAppMentions } from "./appMentions.js";
 import { assertComposerTierWithinCap } from "./thinkingTimeCap.js";
+import { normalizePromptText } from "../promptMatch.js";
+import { buildLatestUserTurnExpression, readUserMessageIds } from "../promptFingerprint.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
 
 const ENTER_KEY_EVENT = {
@@ -395,6 +397,10 @@ export async function submitPrompt(
   await assertAppMentionsPresent(runtime, apps);
   await warnIfChatListRateLimited(runtime, logger);
 
+  // The user turns rendered before the send: a turn not among them is a new one, even when a
+  // long conversation unmounts an old turn for it and the count stays the same.
+  const baselineUserIds = await readUserMessageIds(runtime, 0);
+
   // Install before the click: a short answer can complete while commit verification runs.
   await runtime
     .evaluate({
@@ -437,6 +443,7 @@ export async function submitPrompt(
     commitTimeoutMs,
     logger,
     deps.baselineTurns ?? undefined,
+    { baselineUserIds },
   );
 }
 
@@ -1273,9 +1280,14 @@ async function verifyPromptCommitted(
   timeoutMs: number,
   logger?: BrowserLogger,
   baselineTurns?: number,
+  options: {
+    /** The user turn identities rendered before the send (readUserMessageIds). */
+    baselineUserIds?: readonly string[];
+  } = {},
 ): Promise<number | null> {
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
+  const baselineUserIdsLiteral = JSON.stringify(options.baselineUserIds ?? null);
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
   const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
@@ -1305,14 +1317,8 @@ async function verifyPromptCommitted(
 		    const editor = (${findComposerEditor.toString()})(document, [${primarySelectorLiteral}]);
 		    const fallback = document.querySelector(${fallbackSelectorLiteral});
 		    const inputSelectors = ${inputSelectorsLiteral};
-	    const normalize = (value) => {
-	      let text = value?.toLowerCase?.() ?? '';
-	      // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
-	      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-	      text = text.replace(/\`\`\`/g, ' ');
-	      text = text.replace(/\`([^\`]*)\`/g, '$1');
-	      return text.replace(/\\s+/g, ' ').trim();
-	    };
+	    // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
+	    const normalize = ${normalizePromptText.toString()};
 	    const normalizedPrompt = normalize(${encodedPrompt});
 	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
 	    const articles = ${buildConversationTurnListExpression()};
@@ -1357,8 +1363,29 @@ async function verifyPromptCommitted(
       const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
       const href = typeof location === 'object' && location.href ? location.href : '';
       const inConversation = /\\/c\\//.test(href);
+      // A long conversation keeps only a window of turns rendered: a new turn can unmount an old
+      // one, so the count stays the same. The latest user turn's identity tells a new turn apart.
+      const baselineUserIds = ${baselineUserIdsLiteral};
+      const latestUser = ${buildLatestUserTurnExpression()};
+      const latestUserText = normalize(latestUser?.text ?? '');
+      const latestUserMatched =
+        normalizedPrompt.length > 0 &&
+        (latestUserText.includes(normalizedPrompt) ||
+          (normalizedPromptPrefix.length > 30 && latestUserText.includes(normalizedPromptPrefix)));
+      const latestUserKnown =
+        Boolean(latestUser?.messageId) &&
+        Array.isArray(baselineUserIds) &&
+        baselineUserIds.includes(latestUser.messageId);
+      const latestUserIsNew =
+        Boolean(latestUser?.messageId) && Array.isArray(baselineUserIds) && !latestUserKnown;
 		    return {
         baseline,
+        latestUserMatched,
+        latestUserIsNew,
+        latestUserKnown,
+        latestUserIndex: typeof latestUser?.index === 'number' ? latestUser.index : -1,
+        latestUserId: latestUser?.messageId ?? null,
+        latestUserRawText: latestUser?.text ?? null,
 	      userMatched,
 	      prefixMatched,
 	      lastMatched,
@@ -1383,6 +1410,16 @@ async function verifyPromptCommitted(
       lastProbe = info;
     }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
+    // Proven by identity: the latest user turn shows the prompt and was not rendered before the
+    // send. The answer follows that turn, wherever the window of rendered turns puts it.
+    if (
+      info?.latestUserMatched &&
+      info.latestUserIsNew &&
+      typeof info.latestUserIndex === "number" &&
+      info.latestUserIndex >= 0
+    ) {
+      return info.latestUserIndex + 1;
+    }
     const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
     const baselineUnknown =
       typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
@@ -1424,6 +1461,12 @@ async function verifyPromptCommitted(
 
 interface CommitProbeState {
   baseline?: number;
+  latestUserMatched?: boolean;
+  latestUserIsNew?: boolean;
+  latestUserKnown?: boolean;
+  latestUserIndex?: number;
+  latestUserId?: string | null;
+  latestUserRawText?: string | null;
   userMatched?: boolean;
   prefixMatched?: boolean;
   lastMatched?: boolean;
@@ -1448,6 +1491,10 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     prefixMatched: probe.prefixMatched,
     lastMatched: probe.lastMatched,
     hasNewTurn: probe.hasNewTurn,
+    latestUserMatched: probe.latestUserMatched,
+    latestUserIsNew: probe.latestUserIsNew,
+    latestUserKnown: probe.latestUserKnown,
+    latestUserIndex: probe.latestUserIndex,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,
     composerCleared: probe.composerCleared,
