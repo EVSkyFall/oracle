@@ -386,9 +386,10 @@ describe("a conversation reload within the run's time", () => {
     );
   });
 
-  test("a reload that waits on an approval poll that never finishes ends at the run's timeout too", async () => {
+  test("(e) a reload that waits on an approval poll that never finishes goes ahead once it is given up, and the run ends at its deadline", async () => {
     let scans = 0;
-    // The first poll reads the page; the second one never gets an answer and keeps the page.
+    // The first poll reads the page; later ones never get an answer and hold the page until a
+    // minute without an answer gives them up.
     const tab = fakePage({
       scan: () => ({ cards: [], skipped: [], hidden: [] }),
       hang: (expression) =>
@@ -408,7 +409,12 @@ describe("a conversation reload within the run's time", () => {
     void withAppApprovalMonitor(
       tab.Runtime,
       undefined,
-      { allowApps: ["CODEXish"], logger, gate: resync.gate },
+      {
+        allowApps: ["CODEXish"],
+        logger,
+        gate: resync.gate,
+        deadline: () => resync.deadlineAt(),
+      },
       () => resync.run(timedWait(attempts, 5 * MINUTE), { timeoutMs: 5 * MINUTE }),
     ).then(
       (value) => {
@@ -418,11 +424,12 @@ describe("a conversation reload within the run's time", () => {
         settled = error;
       },
     );
-    await vi.advanceTimersByTimeAsync(5 * MINUTE + 5_000);
-    // The run ended; its monitor is still stuck on the page read, as it would be today.
-    expect(reload).not.toHaveBeenCalled();
-    expect(attempts).toHaveLength(2);
-    expect(attempts[1]!.remainingMs(5 * MINUTE)).toBe(0);
-    expect(settled).toBe("pending");
+    // The stall is due at one minute; the frozen check gives the page back a minute after it began.
+    await vi.advanceTimersByTimeAsync(MINUTE + 10_000);
+    expect(reload).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5 * MINUTE - (MINUTE + 10_000) + 2_000);
+    // The run and its monitor ended at the run's deadline, as its timeout.
+    expect(settled).toBeInstanceOf(Error);
+    expect((settled as Error).message).toBe("Response timeout");
   });
 });

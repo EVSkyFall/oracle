@@ -1033,6 +1033,13 @@ export interface AppApprovalMonitorOptions {
    * reads the new document.
    */
   gate?: { exclusive<T>(action: () => Promise<T>): Promise<T> };
+  /**
+   * How long one page call of a check may go unanswered before the check counts as frozen and is
+   * given up (default 60 s, see POLL_FROZEN_MS).
+   */
+  frozenMs?: number;
+  /** When the run's time for the answer is spent: stop() never waits past it for a check. */
+  deadline?: () => number;
 }
 
 const HIDDEN_SETTLE_MS = 5_000;
@@ -1062,6 +1069,17 @@ const idle = (ms: number) =>
   });
 
 const RECLICK_AFTER_MS = 3_000;
+/**
+ * A check's page call (a scan, a click's measurement or its input events) normally answers in
+ * milliseconds and even a busy ChatGPT page answers within a few seconds; one minute without an
+ * answer is a renderer that stopped (an endless script), not a slow page.
+ */
+const POLL_FROZEN_MS = 60_000;
+
+/** A check whose page call got no answer for the frozen time. */
+class ApprovalCheckFrozen extends Error {}
+/** A call of a check that was given up (frozen, or past the run's time at stop). */
+class ApprovalCheckAbandoned extends Error {}
 
 /**
  * Watches the tab for tool-permission prompts of the allowed apps and approves them with a
@@ -1069,13 +1087,19 @@ const RECLICK_AFTER_MS = 3_000;
  * Returns a stop function that waits for an in-flight poll.
  */
 export function startAppApprovalMonitor(
-  runtime: ChromeClient["Runtime"],
-  input: ChromeClient["Input"] | undefined,
+  pageRuntime: ChromeClient["Runtime"],
+  pageInput: ChromeClient["Input"] | undefined,
   options: AppApprovalMonitorOptions,
 ): () => Promise<void> {
   const allowApps = options.allowApps.map((app) => app.trim()).filter(Boolean);
   if (allowApps.length === 0) return async () => {};
   const intervalMs = Math.max(250, options.intervalMs ?? 1_500);
+  const frozenMs = Math.max(1, options.frozenMs ?? POLL_FROZEN_MS);
+  // The page as one check sees it: every call is watched (see pollOnce).
+  let runtime = pageRuntime;
+  let input = pageInput;
+  // The check in flight; aborting it makes its pending and later calls reject without sending.
+  let current: AbortController | null = null;
   // Each distinct outcome is logged once per card, and again only when it changes.
   const reported = new Set<string>();
   const diagnosed = new Set<string>();
@@ -1294,15 +1318,103 @@ export function startAppApprovalMonitor(
     }
   };
 
+  /**
+   * `start` (one page call of a check) raced against the frozen time: unanswered by then, the
+   * whole check is given up (`abort`), so none of its calls answers into it and none of its later
+   * calls is sent: a late answer never leads to a click.
+   */
+  const watched =
+    (abort: AbortController) =>
+    <T>(start: () => Promise<T>): Promise<T> => {
+      if (abort.signal.aborted) return Promise.reject(new ApprovalCheckAbandoned("given up"));
+      return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new ApprovalCheckAbandoned("given up"));
+        };
+        const timer = setTimeout(() => {
+          abort.signal.removeEventListener("abort", onAbort);
+          abort.abort();
+          reject(new ApprovalCheckFrozen(`no answer for ${Math.round(frozenMs / 1000)}s`));
+        }, frozenMs);
+        timer.unref?.();
+        abort.signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve()
+          .then(start)
+          .then(
+            (value) => {
+              clearTimeout(timer);
+              abort.signal.removeEventListener("abort", onAbort);
+              resolve(value);
+            },
+            (error: unknown) => {
+              clearTimeout(timer);
+              abort.signal.removeEventListener("abort", onAbort);
+              reject(error);
+            },
+          );
+      });
+    };
+
+  /** One check with its own watch: a frozen one gives the page (the gate) back when given up. */
+  const pollOnce = async (): Promise<void> => {
+    if (stopped) return;
+    const abort = new AbortController();
+    current = abort;
+    const call = watched(abort);
+    runtime = {
+      evaluate: (params: Parameters<ChromeClient["Runtime"]["evaluate"]>[0]) =>
+        call(() => pageRuntime.evaluate(params)),
+    } as ChromeClient["Runtime"];
+    input = pageInput
+      ? ({
+          dispatchMouseEvent: (
+            params: Parameters<ChromeClient["Input"]["dispatchMouseEvent"]>[0],
+          ) => call(() => pageInput.dispatchMouseEvent(params)),
+        } as ChromeClient["Input"])
+      : undefined;
+    try {
+      await poll();
+    } finally {
+      if (current === abort) current = null;
+    }
+  };
+
+  /** After a frozen check: waits for the page to answer at all, without holding the page. */
+  const pageAnswers = async (): Promise<void> => {
+    const abort = new AbortController();
+    current = abort;
+    try {
+      await watched(abort)(() => pageRuntime.evaluate({ expression: "1", returnByValue: true }));
+    } finally {
+      if (current === abort) current = null;
+    }
+  };
+
+  let silent = false;
   const loop = (async () => {
     while (!stopped) {
       try {
-        await (options.gate ? options.gate.exclusive(poll) : poll());
+        if (silent) {
+          await pageAnswers();
+          silent = false;
+          options.logger("[browser] App approval check: the page answers again.");
+        }
+        await (options.gate ? options.gate.exclusive(pollOnce) : pollOnce());
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!reportedErrors.has(message)) {
-          reportedErrors.add(message);
-          options.logger(`[browser] App approval check failed (will keep watching): ${message}`);
+        if (error instanceof ApprovalCheckFrozen) {
+          if (!silent) {
+            options.logger(
+              `[browser] App approval check got no answer from the page for ${Math.round(frozenMs / 1000)}s; it is given up (it never clicks) and the page is checked again.`,
+            );
+          }
+          silent = true;
+        } else if (!(error instanceof ApprovalCheckAbandoned)) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!reportedErrors.has(message)) {
+            reportedErrors.add(message);
+            options.logger(`[browser] App approval check failed (will keep watching): ${message}`);
+          }
         }
       }
       if (stopped) break;
@@ -1313,7 +1425,23 @@ export function startAppApprovalMonitor(
   const stop = async () => {
     stopped = true;
     options.registry?.delete(stop);
-    await loop.catch(() => undefined);
+    const until = options.deadline?.();
+    if (until === undefined || !Number.isFinite(until)) {
+      // A frozen check is given up within the frozen time, so this ends too.
+      await loop.catch(() => undefined);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      loop.catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, until - Date.now()));
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    // Past the run's time a check still running is given up: it never sends anything again.
+    current?.abort();
   };
   options.registry?.add(stop);
   return stop;

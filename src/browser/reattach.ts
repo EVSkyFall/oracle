@@ -333,6 +333,7 @@ async function resumeBrowserSessionInternal(
             ...approvalMonitor,
             onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
             gate: resync.gate,
+            deadline: () => resync.deadlineAt(),
           },
           () =>
             resync.run(
@@ -636,6 +637,7 @@ async function resumeBrowserSessionViaNewChrome(
           ...approvalMonitor,
           onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
           gate: resync.gate,
+          deadline: () => resync.deadlineAt(),
         },
         () =>
           resync.run(
