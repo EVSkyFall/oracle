@@ -225,3 +225,25 @@ describe("process-owned browser connection", () => {
     await page.close();
   });
 });
+
+describe("closing a tab of a Chrome reached only through its browser WebSocket", () => {
+  test("closeRemoteChromeTarget closes it with Target.closeTarget on that connection and releases it", async () => {
+    const browser = browserFixture();
+    cdp.mockResolvedValue(browser);
+    const logged: string[] = [];
+    const { closeRemoteChromeTarget } = await lifecycle();
+    await closeRemoteChromeTarget(
+      "127.0.0.1",
+      9222,
+      "frozen",
+      Object.assign((line: string) => logged.push(line), { verbose: false }),
+      { browserWSEndpoint: endpoint },
+    );
+    expect(browser.Target.closeTarget).toHaveBeenCalledWith({ targetId: "frozen" });
+    expect(cdp).toHaveBeenCalledWith({ target: endpoint, local: true });
+    expect(logged).toEqual([]);
+    // The shared connection is released, not closed.
+    expect(browser.close).not.toHaveBeenCalled();
+    expect(browser._ws._socket.unref).toHaveBeenCalled();
+  });
+});

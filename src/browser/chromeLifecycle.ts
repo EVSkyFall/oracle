@@ -575,11 +575,35 @@ export async function closeRemoteChromeTarget(
   port: number,
   targetId: string | undefined,
   logger: BrowserLogger,
+  options: {
+    /**
+     * A Chrome reached only through its browser WebSocket (DevToolsActivePort, M136+) has no
+     * HTTP /json/close: the tab is closed with Target.closeTarget on that connection instead.
+     */
+    browserWSEndpoint?: string;
+  } = {},
 ): Promise<void> {
   if (!targetId) {
     return;
   }
   try {
+    if (options.browserWSEndpoint) {
+      const browser = await connectToBrowserWebSocket(
+        host,
+        port,
+        options.browserWSEndpoint,
+        logger,
+      );
+      try {
+        await browser.Target.closeTarget({ targetId });
+      } finally {
+        await browser.close().catch(() => undefined);
+      }
+      if (logger.verbose) {
+        logger(`Closed remote Chrome tab ${targetId}`);
+      }
+      return;
+    }
     await CDP.Close({ host, port, id: targetId });
     if (logger.verbose) {
       logger(`Closed remote Chrome tab ${targetId}`);

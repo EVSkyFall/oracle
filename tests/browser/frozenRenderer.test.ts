@@ -478,6 +478,17 @@ describe("a page that stops answering while the answer is awaited", () => {
     }
   });
 
+  test("reattach closes a frozen owned tab through the browser WebSocket when it has one", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(
+      new URL("../../src/browser/reattach.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain(
+      "closeRemoteChromeTarget(host, port ?? 9222, frozenId, logger, { browserWSEndpoint })",
+    );
+  });
+
   test("the delayed recheck of both runs gets the run client for its fresh bound", async () => {
     const { readFile } = await import("node:fs/promises");
     const source = await readFile(new URL("../../src/browser/index.ts", import.meta.url), "utf8");

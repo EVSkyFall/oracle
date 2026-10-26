@@ -364,7 +364,9 @@ async function resumeBrowserSessionInternal(
           const frozenId = currentTargetId;
           const steps: Array<() => Promise<unknown>> = [() => retired.close()];
           if (frozenId && ownedTarget?.targetId === frozenId) {
-            steps.push(() => closeRemoteChromeTarget(host, port ?? 9222, frozenId, logger));
+            steps.push(() =>
+              closeRemoteChromeTarget(host, port ?? 9222, frozenId, logger, { browserWSEndpoint }),
+            );
           } else if (frozenId) {
             logger(
               `[browser] The frozen tab (target ${frozenId}) was not opened by this session; it is left open.`,
