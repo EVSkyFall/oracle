@@ -116,6 +116,19 @@ describe("turn progress", () => {
     ]) as unknown as Document;
     expect(readTurnProgress(card).key).not.toBe(base.key);
   });
+
+  test("a reasoning panel outside the main area streams progress too", () => {
+    const withPanel = (summary: string) =>
+      new FakeDocument([
+        ...(thread(["Running command"]) as unknown as FakeDocument).body.children,
+        new DomNode("aside", { "data-testid": "thinking-sidecar" }, [
+          new DomNode("div", { "data-testid": "reasoning-step" }, [summary]),
+        ]),
+      ]) as unknown as Document;
+    const first = readTurnProgress(withPanel("Checking the CODEXish output"));
+    const next = readTurnProgress(withPanel("Checking the CODEXish output. Comparing the lines"));
+    expect(next.key).not.toBe(first.key);
+  });
 });
 
 describe("stalled-turn resync", () => {
@@ -234,6 +247,37 @@ describe("stalled-turn resync", () => {
     expect(logLines(logger)).toEqual([
       "[browser] Turn looks stalled (no change for 8m), but no conversation URL is known, so the page is not reloaded.",
     ]);
+  });
+
+  test("a wait that ends while the stall is being decided is neither reloaded nor said to be", async () => {
+    const tab = fakeTab(() => thread(["Running command"]));
+    const pageAnswers = tab.evaluate.getMockImplementation()!;
+    // The page is slow to say where it is: the stall decision waits two seconds on location.href.
+    tab.evaluate.mockImplementation(async (call: { expression: string }) =>
+      call.expression === "location.href"
+        ? new Promise((resolve) => {
+            setTimeout(() => resolve({ result: { value: CONVERSATION } }), 2_000);
+          })
+        : pageAnswers(call),
+    );
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: tab.Page,
+      logger,
+      stallMs: 10_000,
+      pollMs: 1_000,
+    });
+    const answer = resync.run(
+      () =>
+        new Promise<string>((resolve) => {
+          setTimeout(() => resolve("answer"), 10_500);
+        }),
+    );
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(answer).resolves.toBe("answer");
+    expect(tab.reload).not.toHaveBeenCalled();
+    expect(logLines(logger).filter((line) => line.includes("stalled"))).toEqual([]);
   });
 
   test("a failed reload falls back to opening the conversation URL", async () => {

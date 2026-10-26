@@ -24,14 +24,15 @@ export interface TurnProgressSample {
 /**
  * Page function: what the thread shows. The visible text of the main area (activity rows such as
  * "Running command" included, editors left out) with digit runs folded, so a ticking timer is not
- * progress, and the approval prompts that are shown anywhere in the page. Injected into the page
- * with Function.prototype.toString.
+ * progress, a reasoning or thinking panel that sits outside it, and the approval prompts that are
+ * shown anywhere in the page. Injected into the page with Function.prototype.toString.
  */
 export function readTurnProgress(doc: Document): TurnProgressSample {
   const EDITABLE =
     '[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], [role="textbox"], textarea';
   const SURFACE =
     '[data-codex-approval-surface="true"], [class*="approval-card"], [role="alert"], [role="alertdialog"]';
+  const PANEL = '[data-testid*="thinking"], [data-testid*="reasoning"], [class*="sidecar"]';
   const fold = (value: unknown) =>
     String(value ?? "")
       .replace(/\d+/g, "0")
@@ -61,6 +62,11 @@ export function readTurnProgress(doc: Document): TurnProgressSample {
       if (typed.trim()) text = text.split(typed).join("");
     }
   }
+  // A reasoning sidecar outside the main area streams too; nested panels count once.
+  const panels = Array.from(doc.querySelectorAll(PANEL)).filter(
+    (node) => !root?.contains(node) && !node.parentElement?.closest(PANEL) && shown(node),
+  );
+  if (panels.length > 0) text += `\n${panels.map(textOf).join("\n")}`;
   const surfaces = Array.from(doc.querySelectorAll(SURFACE))
     .filter(shown)
     .map((node) => fold(textOf(node)))
@@ -232,6 +238,8 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       }
       if (!reason) return;
       const url = await resolveUrl();
+      // The wait may have ended (or a reload begun) while the URL was read.
+      if (!waiter || reloading) return;
       if (!url) {
         // Reloading a page that is not the conversation would lose the turn.
         if (!reportedNoUrl.has(kind)) {
