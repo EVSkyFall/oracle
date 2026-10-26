@@ -2033,6 +2033,7 @@ async function runBrowserModeInternal(
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,
+        progress: resync,
       });
       try {
         return await watchAppApprovals(() => resync.run(operation), {
@@ -3671,6 +3672,7 @@ async function runRemoteBrowserMode(
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
         intervalMs: options.heartbeatIntervalMs,
+        progress: resync,
       });
       try {
         return await watchAppApprovals(() => resync.run(operation), {

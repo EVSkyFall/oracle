@@ -20,6 +20,12 @@ export interface ThinkingStatusSnapshot {
 interface ThinkingStatusMonitorOptions {
   intervalMs?: number;
   now?: () => number;
+  /**
+   * The thread's progress as the stalled-turn resync measures it (activity rows included).
+   * When given, "last change" and the stale hint come from it, so a Pro agent turn whose rows
+   * keep changing is never reported as unchanged; without it, from the status read here.
+   */
+  progress?: { lastChangedAt(): number };
 }
 
 export function startThinkingStatusMonitor(
@@ -58,7 +64,8 @@ export function startThinkingStatusMonitor(
         if (stopped) {
           return;
         }
-        logger(formatThinkingLog(startedAt, tickAt, snapshot, "", tickAt - lastChangedAt));
+        const changedAt = options.progress ? options.progress.lastChangedAt() : lastChangedAt;
+        logger(formatThinkingLog(startedAt, tickAt, snapshot, "", Math.max(0, tickAt - changedAt)));
       } else {
         logger(formatThinkingWaitingLog(startedAt, tickAt));
       }

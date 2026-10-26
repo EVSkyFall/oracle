@@ -6,6 +6,7 @@ import {
 } from "../../src/browser/turnResync.js";
 import { withAppApprovalMonitor } from "../../src/browser/actions/appApprovals.js";
 import { waitForAssistantResponse } from "../../src/browser/actions/assistantResponse.js";
+import { startThinkingStatusMonitor } from "../../src/browser/actions/thinkingStatus.js";
 import type { BrowserAppApprovalRecord, ChromeClient } from "../../src/browser/types.js";
 import { DomNode, FakeDocument } from "./domFixture.js";
 
@@ -385,6 +386,78 @@ describe("stalled-turn resync", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     }
     expect(tab.reload).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the heartbeat's last change", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("(b) a Pro agent turn whose activity rows keep changing is never reported unchanged", async () => {
+    // The thinking status never changes ("response streaming": only the stop button is seen), as
+    // in the 2026-10-26 run; only the activity rows move, every two minutes.
+    const rows = ["Used CODEXish integration"];
+    const tab = fakeTab(() => thread(rows));
+    const progressAndPage = tab.evaluate.getMockImplementation()!;
+    tab.evaluate.mockImplementation(async (call: { expression: string; awaitPromise?: boolean }) =>
+      call.expression.includes("thinking sidecar active")
+        ? { result: { value: { message: "response streaming", source: "inline" } } }
+        : progressAndPage(call),
+    );
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const resync = createTurnResync({ Runtime: tab.Runtime, Page: tab.Page, logger });
+    void resync.run(waitUntilAborted([])).catch(() => undefined);
+    const stop = startThinkingStatusMonitor(tab.Runtime, logger, {
+      intervalMs: MINUTE,
+      progress: resync,
+    });
+    for (let minute = 2; minute <= 20; minute += 2) {
+      await vi.advanceTimersByTimeAsync(2 * MINUTE);
+      rows.push(minute % 4 === 0 ? "Running command" : "Used CODEXish integration");
+    }
+    stop();
+    const heartbeats = logLines(logger).filter((line) => line.includes("ChatGPT thinking"));
+    expect(heartbeats.length).toBeGreaterThanOrEqual(19);
+    expect(heartbeats.filter((line) => line.includes("stale-hint"))).toEqual([]);
+    // "last change" never says more than the two minutes between rows (and a poll).
+    const agoSeconds = heartbeats.map((line) => {
+      const ago = /last change (?:(\d+)m )?(\d+)s ago/.exec(line);
+      return ago ? Number(ago[1] ?? 0) * 60 + Number(ago[2]) : 0;
+    });
+    expect(agoSeconds.filter((seconds) => seconds > 0).length).toBeGreaterThan(5);
+    expect(Math.max(...agoSeconds)).toBeLessThanOrEqual(130);
+    expect(tab.reload).not.toHaveBeenCalled();
+  });
+
+  test("a turn that stopped moving says so: last change grows and the stale hint appears", async () => {
+    const tab = fakeTab(() => thread(["Running command"]));
+    const progressAndPage = tab.evaluate.getMockImplementation()!;
+    tab.evaluate.mockImplementation(async (call: { expression: string; awaitPromise?: boolean }) =>
+      call.expression.includes("thinking sidecar active")
+        ? { result: { value: { message: "response streaming", source: "inline" } } }
+        : progressAndPage(call),
+    );
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    // A stall time beyond the window, so the turn is not reloaded while it is watched.
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: tab.Page,
+      logger,
+      stallMs: 60 * MINUTE,
+    });
+    void resync.run(waitUntilAborted([])).catch(() => undefined);
+    const stop = startThinkingStatusMonitor(tab.Runtime, logger, {
+      intervalMs: MINUTE,
+      progress: resync,
+    });
+    await vi.advanceTimersByTimeAsync(11 * MINUTE + 1_000);
+    stop();
+    const heartbeats = logLines(logger).filter((line) => line.includes("ChatGPT thinking"));
+    expect(heartbeats.at(-1)).toContain("last change 11m 0s ago; stale-hint=no UI progress change");
   });
 });
 
