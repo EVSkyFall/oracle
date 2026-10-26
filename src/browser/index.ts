@@ -1,4 +1,9 @@
-import { readSubmittedPromptFingerprint, readUserMessageIds } from "./promptFingerprint.js";
+import {
+  fingerprintOfUserTurn,
+  readSubmittedPromptFingerprint,
+  readUserMessageIds,
+  type PageUserTurn,
+} from "./promptFingerprint.js";
 import {
   createAttemptAssistantRecheck,
   createBlockingUiWarningCheck,
@@ -1902,11 +1907,16 @@ async function runBrowserModeInternal(
       });
       await markPromptSubmitted();
       const providerBaselineTurns = providerState.baselineTurns;
-      const renderedPromptHash = await readSubmittedPromptFingerprint(
-        Runtime,
-        previousUserMessageIds,
-        config.inputTimeoutMs,
-      );
+      // An unproven commit already waited out its window; its fingerprint is the turn the
+      // commit check found standing for the sent one (none when it could not tell).
+      const renderedPromptHash =
+        providerState.commitUnproven === true
+          ? fingerprintOfUserTurn(providerState.unprovenCommitTurn as PageUserTurn | null)
+          : await readSubmittedPromptFingerprint(
+              Runtime,
+              previousUserMessageIds,
+              config.inputTimeoutMs,
+            );
       if (renderedPromptHash) {
         submittedPromptHash = renderedPromptHash;
         await emitRuntimeHint();
@@ -3652,11 +3662,16 @@ async function runRemoteBrowserMode(
       });
       await markPromptSubmitted();
       const providerBaselineTurns = providerState.baselineTurns;
-      const renderedPromptHash = await readSubmittedPromptFingerprint(
-        Runtime,
-        previousUserMessageIds,
-        config.inputTimeoutMs,
-      );
+      // An unproven commit already waited out its window; its fingerprint is the turn the
+      // commit check found standing for the sent one (none when it could not tell).
+      const renderedPromptHash =
+        providerState.commitUnproven === true
+          ? fingerprintOfUserTurn(providerState.unprovenCommitTurn as PageUserTurn | null)
+          : await readSubmittedPromptFingerprint(
+              Runtime,
+              previousUserMessageIds,
+              config.inputTimeoutMs,
+            );
       if (renderedPromptHash) {
         submittedPromptHash = renderedPromptHash;
         await emitRuntimeHint();

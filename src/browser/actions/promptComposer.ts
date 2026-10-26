@@ -42,7 +42,11 @@ import { hasDeepResearchMention } from "./deepResearch.js";
 import { assertAppMentionsPresent, insertAppMentions } from "./appMentions.js";
 import { assertComposerTierWithinCap } from "./thinkingTimeCap.js";
 import { normalizePromptText } from "../promptMatch.js";
-import { buildLatestUserTurnExpression, readUserMessageIds } from "../promptFingerprint.js";
+import {
+  buildLatestUserTurnExpression,
+  readUserMessageIds,
+  type PageUserTurn,
+} from "../promptFingerprint.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
 
 const ENTER_KEY_EVENT = {
@@ -148,6 +152,11 @@ export async function submitPrompt(
     apps?: readonly BrowserAppMention[];
     /** --browser-max-thinking-time: the composer button is checked once more before the click. */
     maxThinkingTime?: ThinkingTimeLevel;
+    /**
+     * The send went out but its commit could not be proven; the run goes on. Called with the
+     * latest user turn when it shows the prompt and is not provably an older turn, else null.
+     */
+    onCommitUnproven?: (turn: PageUserTurn | null) => void;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -443,7 +452,7 @@ export async function submitPrompt(
     commitTimeoutMs,
     logger,
     deps.baselineTurns ?? undefined,
-    { baselineUserIds },
+    { baselineUserIds, onUnproven: deps.onCommitUnproven },
   );
 }
 
@@ -1283,6 +1292,7 @@ async function verifyPromptCommitted(
   options: {
     /** The user turn identities rendered before the send (readUserMessageIds). */
     baselineUserIds?: readonly string[];
+    onUnproven?: (turn: PageUserTurn | null) => void;
   } = {},
 ): Promise<number | null> {
   const deadline = Date.now() + timeoutMs;
@@ -1439,6 +1449,38 @@ async function verifyPromptCommitted(
     .then((res) => res?.result?.value as CommitProbeState | undefined)
     .catch(() => undefined);
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
+  const promptShown = Boolean(
+    probe?.latestUserMatched || probe?.lastMatched || probe?.userMatched || probe?.prefixMatched,
+  );
+  // The send was dispatched. Only when the prompt never left the composer (its text is still
+  // there and no turn shows it) was it not sent; any other uncertainty never ends the run, and
+  // nothing is ever typed or sent again here.
+  if (probe?.composerCleared !== false || promptShown) {
+    logger?.(
+      `[browser] Prompt commit not proven (${probe ? JSON.stringify(summarizeCommitProbe(probe)) : "page unreadable"}); treating it as sent and waiting for the answer`,
+    );
+    // The latest user turn stands for the sent one unless it is provably an older turn (it was
+    // rendered before the send); then the answer wait keeps its earlier scope.
+    const latestStands =
+      Boolean(probe?.latestUserMatched) &&
+      !probe?.latestUserKnown &&
+      typeof probe?.latestUserIndex === "number" &&
+      probe.latestUserIndex >= 0;
+    options.onUnproven?.(
+      latestStands
+        ? {
+            index: probe!.latestUserIndex!,
+            text: probe!.latestUserRawText ?? null,
+            messageId: probe!.latestUserId ?? null,
+          }
+        : null,
+    );
+    if (latestStands) return probe!.latestUserIndex! + 1;
+    if (probe?.lastMatched && !probe.latestUserKnown && typeof probe.turnsCount === "number") {
+      return probe.turnsCount;
+    }
+    return null;
+  }
   if (logger) {
     logger(
       `Prompt commit check failed; latest state: ${probe ? JSON.stringify(probe) : "unavailable"}`,

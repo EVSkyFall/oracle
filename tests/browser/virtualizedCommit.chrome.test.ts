@@ -126,6 +126,17 @@ describe.runIf(enabled)(
       expect(answer.text.trim()).toBe(ANSWER);
     }, 150_000);
 
+    test("without ids, an unproven send that shows the prompt goes on to the answer", async () => {
+      const { state, answer, logger } = await sendAndWait(false, true);
+      expect(state.commitUnproven).toBe(true);
+      expect(state.unprovenCommitTurn).toEqual({ index: 3, text: PROMPT, messageId: null });
+      expect(state.baselineTurns).toBe(3);
+      expect(logger).toHaveBeenCalledWith(
+        expect.stringMatching(/^\[browser\] Prompt commit not proven \(.*\); treating it as sent/),
+      );
+      expect(answer.text.trim()).toBe(ANSWER);
+    }, 150_000);
+
     test("without ids on a page whose turn count grows, the count still proves the send", async () => {
       const { state, answer, submitMs } = await sendAndWait(false, false);
       expect(state.committedTurns).toBe(5);

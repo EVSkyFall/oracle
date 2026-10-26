@@ -139,7 +139,7 @@ describe("promptComposer", () => {
     );
   });
 
-  test("does not treat historical assistant content as committed without a new turn", async () => {
+  test("does not treat historical assistant content as the committed turn without a new turn", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -168,11 +168,21 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
-      // Attach the rejection handler before timers advance to avoid unhandled-rejection warnings.
-      const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
+      const onUnproven = vi.fn();
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        undefined,
+        { onUnproven },
+      );
+      // The composer was cleared after the send: the run goes on, but no turn stands for the
+      // sent one and the answer wait keeps its scope.
+      const assertion = expect(promise).resolves.toBeNull();
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
+      expect(onUnproven).toHaveBeenCalledWith(null);
     } finally {
       vi.useRealTimers();
     }
@@ -212,16 +222,20 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
+      const onUnproven = vi.fn();
       const promise = promptComposer.verifyPromptCommitted(
         runtime as never,
         "new prompt",
         150,
         undefined,
         2,
+        { onUnproven },
       );
-      const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
+      // Not proven (nested matches are not new turns); the run goes on with its scope unchanged.
+      const assertion = expect(promise).resolves.toBeNull();
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
+      expect(onUnproven).toHaveBeenCalledWith(null);
     } finally {
       vi.useRealTimers();
     }
@@ -241,9 +255,10 @@ describe("promptComposer", () => {
           hasNewTurn: false,
           stopVisible: false,
           assistantVisible: false,
-          composerCleared: true,
+          // The prompt never left the composer and no turn shows it: it was not sent.
+          composerCleared: false,
           inConversation: false,
-          editorValue: "",
+          editorValue: "x".repeat(length),
           lastTurn: "previous turn text",
         };
         const runtime = {
@@ -281,7 +296,7 @@ describe("promptComposer", () => {
           code: "prompt-commit-timeout",
           commitProbe: expect.objectContaining({
             hasNewTurn: false,
-            composerCleared: true,
+            composerCleared: false,
             turnsCount: 10,
             lastTurnLength: "previous turn text".length,
           }),

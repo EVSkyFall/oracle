@@ -4,6 +4,7 @@ import { ensurePromptReady } from "../actions/navigation.js";
 import { submitPrompt, type AttachmentReadyExpectation } from "../actions/promptComposer.js";
 import { waitForAssistantResponse } from "../actions/assistantResponse.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
+import type { PageUserTurn } from "../promptFingerprint.js";
 
 interface ChatgptDomProviderState {
   runtime: ChromeClient["Runtime"];
@@ -23,6 +24,10 @@ interface ChatgptDomProviderState {
   deepResearch?: boolean;
   apps?: BrowserAppMention[];
   maxThinkingTime?: ThinkingTimeLevel;
+  /** The send's commit was not proven; the run went on (see submitPrompt's onCommitUnproven). */
+  commitUnproven?: boolean;
+  /** With commitUnproven: the latest user turn standing for the sent one, if any. */
+  unprovenCommitTurn?: PageUserTurn | null;
 }
 
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
@@ -60,6 +65,10 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       deepResearch: state.deepResearch,
       apps: state.apps,
       maxThinkingTime: state.maxThinkingTime,
+      onCommitUnproven: (turn) => {
+        state.commitUnproven = true;
+        state.unprovenCommitTurn = turn;
+      },
     },
     ctx.prompt,
     state.logger,

@@ -51,6 +51,14 @@ export function buildLatestUserTurnExpression(): string {
       })()`;
 }
 
+/** The submitted-turn fingerprint of a user turn already read from the page, if it has one. */
+export function fingerprintOfUserTurn(
+  turn: { text?: string | null; messageId?: string | null } | null | undefined,
+): string | undefined {
+  if (!turn?.text?.trim() || !turn.messageId?.trim()) return undefined;
+  return browserPromptFingerprint(turn.text, turn.messageId);
+}
+
 export async function readSubmittedPromptFingerprint(
   runtime: ChromeClient["Runtime"],
   previousMessageIds: readonly string[] | undefined,
