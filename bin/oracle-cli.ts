@@ -2991,6 +2991,9 @@ async function executeSession(sessionId: string) {
     const sessionMode = getSessionMode(metadata);
     const browserConfig = getBrowserConfigFromMetadata(metadata);
     writer = sessionStore.createLogWriter(sessionId);
+    // A stray rejection must not end the run, and a crash must leave its stack behind.
+    const { installDetachedWorkerHandlers } = await import("../src/cli/workerSafety.js");
+    installDetachedWorkerHandlers({ outputLogPath: writer.logPath });
     if (sessionMode === "browser") {
       const paths = await sessionStore.getPaths(sessionId);
       cancellationMarker = detachedSessionCancellationPath(paths.dir, process.pid);
