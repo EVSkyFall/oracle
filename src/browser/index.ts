@@ -2,6 +2,7 @@ import {
   fingerprintOfUserTurn,
   readSubmittedPromptFingerprint,
   readUserMessageIds,
+  waitForSentUserTurn,
   type PageUserTurn,
 } from "./promptFingerprint.js";
 import {
@@ -543,6 +544,8 @@ export function maybeArchiveCompletedConversationForTest(
 
 type BrowserSubmissionResult = {
   baselineTurns: number | null;
+  /** The user turn identities rendered before the send. */
+  presendUserTurnIds?: readonly string[] | null;
   baselineAssistantText: string | null;
   deepResearchTargetKeys?: string[];
   deepResearchTargetBaselineCaptured?: boolean;
@@ -1969,6 +1972,7 @@ async function runBrowserModeInternal(
       return {
         baselineTurns,
         baselineAssistantText,
+        presendUserTurnIds: previousUserMessageIds ?? null,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
@@ -1983,6 +1987,27 @@ async function runBrowserModeInternal(
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
+    let sentTurnUserIds: readonly string[] | null = null;
+    let imageArtifactMinTurnIndex: number | null = null;
+    // The answer follows the user turn this run sent, found by its identity at every attempt: it
+    // can mount after the commit window, and a reload renders a different window of turns.
+    const scopeAnswerToSentTurn = async (signal?: AbortSignal, timeoutMs?: number) => {
+      if (!sentTurnUserIds) return;
+      const index = await waitForSentUserTurn(Runtime, sentTurnUserIds, { signal, timeoutMs });
+      if (index === null || index === baselineTurns) return;
+      logger(`[browser] The sent turn is at turn ${index}; waiting for its answer after it.`);
+      baselineTurns = index;
+      if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+    };
+    const scopedToSentTurn =
+      <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
+      async (attempt: TurnResyncAttempt): Promise<T> => {
+        await scopeAnswerToSentTurn(
+          attempt.signal,
+          attempt.remainingMs(timeoutMs ?? config.timeoutMs),
+        );
+        return operation(attempt);
+      };
     await acquireProfileLockIfNeeded();
     try {
       pendingPromptIndex = 0;
@@ -2000,15 +2025,17 @@ async function runBrowserModeInternal(
         logger,
       });
       baselineTurns = submission.baselineTurns;
+      sentTurnUserIds = submission.presendUserTurnIds ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
       await releaseProfileLockIfHeld();
     }
-    const imageArtifactMinTurnIndex = baselineTurns;
+    imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
+      await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());
       // No call of the plan wait outlives its own time (deepResearchWait.ts).
       const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
       runClient?.setDeadline(planWaitUntil);
@@ -2154,11 +2181,14 @@ async function runBrowserModeInternal(
         progress: resync,
       });
       try {
-        return await watchAppApprovals(() => resync.run(operation, { timeoutMs }), {
-          onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
-          gate: resync.gate,
-          deadline: () => resync.deadlineAt(),
-        });
+        return await watchAppApprovals(
+          () => resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs }),
+          {
+            onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+            gate: resync.gate,
+            deadline: () => resync.deadlineAt(),
+          },
+        );
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -2458,6 +2488,7 @@ async function runBrowserModeInternal(
           logger,
         });
         baselineTurns = submission.baselineTurns;
+        sentTurnUserIds = submission.presendUserTurnIds ?? null;
         baselineAssistantText = submission.baselineAssistantText;
       } finally {
         await releaseProfileLockIfHeld();
@@ -3722,6 +3753,7 @@ async function runRemoteBrowserMode(
       return {
         baselineTurns,
         baselineAssistantText,
+        presendUserTurnIds: previousUserMessageIds ?? null,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
@@ -3736,6 +3768,27 @@ async function runRemoteBrowserMode(
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
+    let sentTurnUserIds: readonly string[] | null = null;
+    let imageArtifactMinTurnIndex: number | null = null;
+    // The answer follows the user turn this run sent, found by its identity at every attempt: it
+    // can mount after the commit window, and a reload renders a different window of turns.
+    const scopeAnswerToSentTurn = async (signal?: AbortSignal, timeoutMs?: number) => {
+      if (!sentTurnUserIds) return;
+      const index = await waitForSentUserTurn(Runtime, sentTurnUserIds, { signal, timeoutMs });
+      if (index === null || index === baselineTurns) return;
+      logger(`[browser] The sent turn is at turn ${index}; waiting for its answer after it.`);
+      baselineTurns = index;
+      if (submittedPromptIndex === 0) imageArtifactMinTurnIndex = index;
+    };
+    const scopedToSentTurn =
+      <T>(operation: (attempt: TurnResyncAttempt) => Promise<T>, timeoutMs?: number) =>
+      async (attempt: TurnResyncAttempt): Promise<T> => {
+        await scopeAnswerToSentTurn(
+          attempt.signal,
+          attempt.remainingMs(timeoutMs ?? config.timeoutMs),
+        );
+        return operation(attempt);
+      };
     pendingPromptIndex = 0;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
@@ -3750,12 +3803,14 @@ async function runRemoteBrowserMode(
       logger,
     });
     baselineTurns = submission.baselineTurns;
+    sentTurnUserIds = submission.presendUserTurnIds ?? null;
     baselineAssistantText = submission.baselineAssistantText;
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
-    const imageArtifactMinTurnIndex = baselineTurns;
+    imageArtifactMinTurnIndex = baselineTurns;
     const researchClient = client;
     if (deepResearch) {
+      await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());
       // No call of the plan wait outlives its own time (deepResearchWait.ts).
       const planWaitUntil = Date.now() + deepResearchPlanWaitBoundMs();
       runClient?.setDeadline(planWaitUntil);
@@ -3895,11 +3950,14 @@ async function runRemoteBrowserMode(
         progress: resync,
       });
       try {
-        return await watchAppApprovals(() => resync.run(operation, { timeoutMs }), {
-          onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
-          gate: resync.gate,
-          deadline: () => resync.deadlineAt(),
-        });
+        return await watchAppApprovals(
+          () => resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs }),
+          {
+            onHiddenSurface: (surface) => resync.reportHiddenApproval(surface),
+            gate: resync.gate,
+            deadline: () => resync.deadlineAt(),
+          },
+        );
       } finally {
         stopThinkingMonitor?.();
         stopThinkingMonitor = null;
@@ -4159,6 +4217,7 @@ async function runRemoteBrowserMode(
         logger,
       });
       baselineTurns = submission.baselineTurns;
+      sentTurnUserIds = submission.presendUserTurnIds ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
       turns.push({ ...turn, prompt: followUpPrompt });

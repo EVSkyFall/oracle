@@ -51,6 +51,53 @@ export function buildLatestUserTurnExpression(): string {
       })()`;
 }
 
+/**
+ * The index of the latest user turn whose identity was not rendered before the send, waiting
+ * while the page shows none (the new exchange can mount late, or after a reload in a different
+ * window of turns). Null when the wait ends first: its time is up or `signal` aborts.
+ */
+export async function waitForSentUserTurn(
+  runtime: ChromeClient["Runtime"],
+  previousMessageIds: readonly string[],
+  options: { timeoutMs?: number; signal?: AbortSignal; pollMs?: number } = {},
+): Promise<number | null> {
+  const previous = new Set(previousMessageIds);
+  const deadline = Date.now() + Math.max(0, options.timeoutMs ?? 0);
+  const pollMs = Math.max(10, options.pollMs ?? 500);
+  for (;;) {
+    if (options.signal?.aborted) return null;
+    try {
+      const { result } = await runtime.evaluate({
+        expression: buildLatestUserTurnExpression(),
+        returnByValue: true,
+      });
+      const turn = result?.value as PageUserTurn | null | undefined;
+      if (
+        typeof turn?.messageId === "string" &&
+        turn.messageId &&
+        !previous.has(turn.messageId) &&
+        typeof turn.index === "number" &&
+        turn.index >= 0
+      ) {
+        return turn.index;
+      }
+    } catch {
+      // A reload or navigation in progress: read again.
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(done, Math.min(pollMs, remaining));
+      function done() {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", done);
+        resolve();
+      }
+      options.signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+}
+
 /** The submitted-turn fingerprint of a user turn already read from the page, if it has one. */
 export function fingerprintOfUserTurn(
   turn: { text?: string | null; messageId?: string | null } | null | undefined,

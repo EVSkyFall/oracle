@@ -234,3 +234,30 @@ describe("the fingerprint of an unproven send", () => {
     ).toHaveLength(2);
   });
 });
+
+describe("the run decides by id on every send, local and remote, initial and in-run follow-ups", () => {
+  test("pre-send ids, the submitted prompt's index and the id-scoped answer wait are wired in both runs", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const path = await import("node:path");
+    const index = await readFile(path.join(process.cwd(), "src", "browser", "index.ts"), "utf8");
+    const count = (pattern: string) => index.split(pattern).length - 1;
+    // The ids the run read before the send go to the send (no second, single read).
+    expect(count("providerState.previousUserMessageIds = previousUserMessageIds;")).toBe(2);
+    // Each answer wait attempt, the recheck included, starts at the sent turn found by id.
+    expect(count("resync.run(scopedToSentTurn(operation, timeoutMs), { timeoutMs })")).toBe(2);
+    expect(count("await scopeAnswerToSentTurn(undefined, deepResearchPlanWaitBoundMs());")).toBe(2);
+    // Initial sends and in-run follow-ups (local and remote) record their scope and prompt index.
+    expect(count("sentTurnUserIds = submission.presendUserTurnIds ?? null;")).toBe(4);
+    expect(count("pendingPromptIndex = 0;") - count("let pendingPromptIndex = 0;")).toBe(2);
+    expect(count("pendingPromptIndex = index + 1;")).toBe(2);
+    // Recorded with promptSubmitted, and carried wherever the submitted-turn hash goes.
+    expect(count("presendUserTurnIds = pendingPresendUserTurnIds;")).toBe(2);
+    const withHash = index.match(/\n\s+submittedPromptHash,\n/g) ?? [];
+    const withAll =
+      index.match(
+        /\n\s+submittedPromptHash,\n\s+presendUserTurnIds,\n\s+submittedPromptIndex,\n/g,
+      ) ?? [];
+    expect(withHash.length).toBe(12);
+    expect(withAll.length).toBe(withHash.length);
+  });
+});
