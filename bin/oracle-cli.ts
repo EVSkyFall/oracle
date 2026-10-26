@@ -1329,12 +1329,12 @@ program
   .option("--path", "Print the stored session paths instead of attaching.", false)
   .option(
     "--harvest",
-    "Re-read the bound browser tab and print/save the latest assistant output.",
+    "Re-read the bound browser tab and print/save this session's finished answer.",
     false,
   )
   .option(
     "--live",
-    "Tail the live browser tab for this session until it completes, stalls, or detaches.",
+    "Tail the live browser tab until this session's turn has its answer (up to the browser timeout).",
     false,
   )
   .option(

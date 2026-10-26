@@ -13,7 +13,7 @@ describe("formatBrowserReattachGuidance", () => {
     );
     expect(message).toContain("oracle session gpt55-pro-plan-review --live      # tail until done");
     expect(message).toContain(
-      "oracle session gpt55-pro-plan-review --harvest   # snapshot the current answer now",
+      "oracle session gpt55-pro-plan-review --harvest   # save the answer if this turn has finished",
     );
   });
 });

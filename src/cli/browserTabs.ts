@@ -38,12 +38,11 @@ function isRecoverableMissingTabError(message: string): boolean {
   );
 }
 
-function harvestMatchesSessionPrompt(
+/** Whether the latest user turn on the page is the one this session submitted. */
+function latestUserIsSessionTurn(
   harvested: ChatGptTabSummary,
   fingerprint: string | undefined,
 ): boolean {
-  const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText;
-  if (harvested.assistantFollowsLatestUser !== true || !answer?.trim()) return false;
   return (
     fingerprint === undefined ||
     (typeof harvested.lastUserMessageId === "string" &&
@@ -58,11 +57,45 @@ function harvestMatchesSessionPrompt(
   );
 }
 
-async function harvestSessionPrompt(
+/**
+ * Where this session's turn stands on the page. Only an assistant answer that follows this
+ * session's own user turn is its answer: the last assistant message on the page can belong to an
+ * earlier turn while this one is still being generated (a Pro turn shows no assistant message
+ * until late). With `requireFinished`, an answer still being generated (stop shown) is not one.
+ */
+type SessionTurnState = "answer" | "generating" | "no-answer" | "other-turn";
+
+function sessionTurnState(
+  harvested: ChatGptTabSummary,
+  fingerprint: string | undefined,
+  requireFinished: boolean,
+): SessionTurnState {
+  if (!latestUserIsSessionTurn(harvested, fingerprint)) return "other-turn";
+  const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText;
+  if (harvested.assistantFollowsLatestUser !== true || !answer?.trim()) {
+    return harvested.stopExists ? "generating" : "no-answer";
+  }
+  return requireFinished && harvested.stopExists ? "generating" : "answer";
+}
+
+function describeSessionTurn(state: SessionTurnState): string {
+  switch (state) {
+    case "generating":
+      return "This session's turn is still being generated (ChatGPT shows its stop button)";
+    case "no-answer":
+      return "This session's turn has no assistant answer on the page";
+    case "other-turn":
+      return "The latest turn on the page is not the one this session submitted";
+    default:
+      return "This session's turn has its answer";
+  }
+}
+
+/** This session's submitted-turn fingerprint (undefined: legacy session or an explicit tab). */
+function sessionFingerprint(
   meta: SessionMetadata,
-  options: Parameters<typeof harvestChatGptTab>[0],
-  requireSessionPrompt = true,
-): Promise<ChatGptTabSummary> {
+  requireSessionPrompt: boolean,
+): string | undefined {
   const fingerprint = requireSessionPrompt ? meta.browser?.runtime?.submittedPromptHash : undefined;
   if (fingerprint === null) {
     throw new Error(
@@ -74,16 +107,29 @@ async function harvestSessionPrompt(
       "Legacy browser session: submitted-turn identity is unavailable; verifying only latest user/assistant pairing.",
     );
   }
+  return fingerprint;
+}
+
+async function harvestSessionPrompt(
+  meta: SessionMetadata,
+  options: Parameters<typeof harvestChatGptTab>[0],
+  requireSessionPrompt = true,
+): Promise<ChatGptTabSummary> {
+  const fingerprint = sessionFingerprint(meta, requireSessionPrompt);
+  // This session's turn is saved only once it has finished; an explicit tab is a snapshot.
+  const requireFinished = requireSessionPrompt;
   const freshnessTimeoutMs = resolveBrowserConfig(meta.browser?.config).inputTimeoutMs;
   const deadline = Date.now() + freshnessTimeoutMs;
   let harvested = await harvestChatGptTab(options);
-  while (!harvestMatchesSessionPrompt(harvested, fingerprint) && Date.now() < deadline) {
+  let state = sessionTurnState(harvested, fingerprint, requireFinished);
+  while (state !== "answer" && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, HARVEST_FRESHNESS_POLL_MS));
     harvested = await harvestChatGptTab(options);
+    state = sessionTurnState(harvested, fingerprint, requireFinished);
   }
-  if (!harvestMatchesSessionPrompt(harvested, fingerprint)) {
+  if (state !== "answer") {
     throw new Error(
-      `Latest ChatGPT turn did not contain an assistant answer paired with this session prompt after ${Math.ceil(freshnessTimeoutMs / 1000)}s; refusing to harvest stale output.`,
+      `${describeSessionTurn(state)} after ${Math.ceil(freshnessTimeoutMs / 1000)}s; nothing was saved (refusing to harvest stale output).${state === "generating" ? " Use --live to wait for the answer." : ""}`,
     );
   }
   return harvested;
@@ -110,7 +156,14 @@ export interface BrowserHarvestOptions {
 export interface BrowserLiveTailOptions {
   writeOutputPath?: string;
   browserTabRef?: string;
+  /** How long a relaunched conversation may take to show its content. */
   stallThresholdMs?: number;
+  /**
+   * How long to wait for this session's answer (default: the session's browser timeout). While
+   * ChatGPT still generates this session's turn, the tail keeps waiting; it never saves an
+   * earlier turn's answer.
+   */
+  waitMs?: number;
   /**
    * When no live tab matches the session's stored target, relaunch Chrome with
    * the persistent profile and navigate to the saved tab URL before tailing.
@@ -420,8 +473,12 @@ export async function liveTailSessionBrowserOutput(
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
   let releaseRecoveredChrome: ((close?: boolean) => Promise<void>) | null = null;
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
+  const fingerprint = sessionFingerprint(meta, !options.browserTabRef);
+  // The live tail waits for this session's answer as long as the run itself would have.
+  const waitMs = options.waitMs ?? resolveBrowserConfig(meta.browser?.config).timeoutMs;
+  const waitUntil = Date.now() + waitMs;
   let lastHash: string | null = null;
-  let unchangedSince = Date.now();
+  let lastTurnState: SessionTurnState | null = null;
   let requireRecoveredContent = false;
   let recoveredContentDeadlineMs = 0;
 
@@ -472,55 +529,61 @@ export async function liveTailSessionBrowserOutput(
         throw new Error("Recovered ChatGPT conversation did not become ready in time.");
       }
       requireRecoveredContent = false;
-      const hash = createHash("sha1").update(fullText).digest("hex");
+      // Only an answer after this session's own user turn counts; the page's last assistant
+      // message can be an earlier turn's while this one is still being generated.
+      const turnState = sessionTurnState(harvested, fingerprint, true);
+      // While this turn is generating, the text is its own only once its answer follows it.
+      const ownText =
+        turnState === "answer" ||
+        (turnState === "generating" && harvested.assistantFollowsLatestUser === true)
+          ? fullText
+          : "";
+      const hash = createHash("sha1").update(`${turnState}|${ownText}`).digest("hex");
       if (hash !== lastHash) {
         lastHash = hash;
-        unchangedSince = Date.now();
         const statusLine =
           `[${new Date().toISOString()}] state=${harvested.state} stop=${harvested.stopExists ? "yes" : "no"} ` +
           `send=${harvested.sendExists ? "yes" : "no"} model=${harvested.currentModelLabel || "(unknown)"} ` +
-          `snippet=${snippet(harvested.lastAssistantSnippet || fullText, 160)}`;
-        await persistBrowserHarvest(sessionId, harvested, Boolean(options.browserTabRef));
+          `turn=${turnState}${ownText ? ` snippet=${snippet(harvested.lastAssistantSnippet || ownText, 160)}` : ""}`;
+        if (ownText) {
+          await persistBrowserHarvest(sessionId, harvested, Boolean(options.browserTabRef));
+        }
         console.log(statusLine);
       }
-
-      const derivedState = harvested.stopExists
-        ? Date.now() - unchangedSince >= stallThresholdMs
-          ? "stalled"
-          : "running"
-        : harvested.authenticated
-          ? "completed"
-          : "detached";
-
-      if (
-        derivedState === "completed" ||
-        derivedState === "stalled" ||
-        derivedState === "detached"
-      ) {
-        const finalHarvest: ChatGptTabSummary = {
-          ...harvested,
-          state: derivedState,
-        };
-        const integrity = await persistBrowserHarvest(
-          sessionId,
-          finalHarvest,
-          Boolean(options.browserTabRef),
-        );
-        printHarvestSummary(sessionId, finalHarvest, integrity);
-        const output = finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
-        if (options.writeOutputPath) {
-          await maybeWriteHarvestOutput(options.writeOutputPath, meta.cwd ?? process.cwd(), output);
+      if (turnState !== lastTurnState) {
+        if (turnState !== "answer") {
+          console.log(chalk.dim(`${describeSessionTurn(turnState)}; waiting.`));
         }
-        if (output) {
-          process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
-        }
-        await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, (line) =>
-          console.log(line),
-        );
-        return finalHarvest;
+        lastTurnState = turnState;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
+      if (turnState !== "answer" || !harvested.authenticated) {
+        if (Date.now() >= waitUntil) {
+          throw new Error(
+            `${describeSessionTurn(turnState)} after ${Math.round(waitMs / 1000)}s of --live; nothing was saved.`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
+        continue;
+      }
+      const finalHarvest: ChatGptTabSummary = { ...harvested, state: "completed" };
+      const integrity = await persistBrowserHarvest(
+        sessionId,
+        finalHarvest,
+        Boolean(options.browserTabRef),
+      );
+      printHarvestSummary(sessionId, finalHarvest, integrity);
+      const output = finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
+      if (options.writeOutputPath) {
+        await maybeWriteHarvestOutput(options.writeOutputPath, meta.cwd ?? process.cwd(), output);
+      }
+      if (output) {
+        process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
+      }
+      await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, (line) =>
+        console.log(line),
+      );
+      return finalHarvest;
     }
   } finally {
     await releaseRecoveredChrome?.(options.closeAfterRecover).catch(() => undefined);

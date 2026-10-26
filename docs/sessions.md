@@ -169,6 +169,16 @@ fingerprint of each rendered, committed user turn and its stable message ID
 before waiting for its answer, including repeated follow-ups. A mismatch preserves the original output; an unconfirmed
 submission requires waiting or explicit tab inspection.
 
+Both `--harvest` and `--live` save only an answer that follows the session's
+own submitted user turn; the last assistant message on the page can belong to
+an earlier turn while this one is still being generated (a Pro turn shows no
+assistant message until late). `"Capture identity: matched"` compares the
+conversation only; the turn is checked by the submitted-turn fingerprint.
+While ChatGPT still generates the session's turn, `--live` keeps waiting, up to
+the session's browser timeout, and `--harvest` reports that the turn has no
+finished answer and saves nothing. Neither ever saves an earlier turn. An
+explicit `--browser-tab` harvest still snapshots that tab's paired answer.
+
 Older sessions without a fingerprint retain their existing recovery behavior,
 with a warning that only latest user/assistant pairing can be checked. Their
 submitted file context cannot be reconstructed reliably from saved metadata.
