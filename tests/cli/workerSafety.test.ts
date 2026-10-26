@@ -16,9 +16,9 @@ afterEach(async () => {
 });
 
 /** Runs `body` in a fresh Node process with the worker handlers installed (unless `bare`). */
-async function runWorker(body: string, options: { bare?: boolean } = {}) {
+async function runWorker(body: string, options: { bare?: boolean; outputLog?: string } = {}) {
   const script = path.join(dir, "worker.mts");
-  const outputLog = path.join(dir, "output.log");
+  const outputLog = options.outputLog ?? path.join(dir, "output.log");
   await writeFile(
     script,
     `${options.bare ? "" : `import { installDetachedWorkerHandlers } from ${JSON.stringify(moduleUrl)};\ninstallDetachedWorkerHandlers({ outputLogPath: ${JSON.stringify(outputLog)} });\n`}${body}\n`,
@@ -50,6 +50,21 @@ describe("the detached worker's crash handlers", () => {
     expect(guarded.code).toBe(0);
     expect(guarded.stdout).toContain("still running");
     expect(guarded.log).toMatch(
+      /\[worker\] Unhandled promise rejection; the run goes on: Error: stray rejection from a monitor\n\s+at /,
+    );
+  }, 60_000);
+
+  test("a stray promise rejection the output log cannot take goes to stderr (the worker's log)", async () => {
+    // The session directory is gone or unwritable: appending to output.log fails.
+    const { code, stdout, stderr } = await runWorker(
+      `
+      Promise.reject(new Error("stray rejection from a monitor"));
+      setTimeout(() => console.log("still running"), 100);`,
+      { outputLog: path.join(dir, "missing-session-dir", "output.log") },
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("still running");
+    expect(stderr).toMatch(
       /\[worker\] Unhandled promise rejection; the run goes on: Error: stray rejection from a monitor\n\s+at /,
     );
   }, 60_000);
