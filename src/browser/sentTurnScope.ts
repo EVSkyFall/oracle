@@ -51,9 +51,11 @@ export async function waitAtSentTurn<T>(
   attempt.signal.addEventListener("abort", relay, { once: true });
   if (attempt.signal.aborted) relay();
   let moved = false;
+  // A read every 2 s: it can run for a whole long answer.
   const watcher = waitForSentUserTurn(runtime, scope.previousUserMessageIds, {
     signal: stopWatching.signal,
     timeoutMs: attempt.remainingMs(totalMs),
+    pollMs: 2_000,
   })
     .then((index) => {
       if (index === null || stopWatching.signal.aborted || index === scope.current()) return;

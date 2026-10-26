@@ -72,6 +72,41 @@ describe("the commit check proves a send by the latest user turn's identity", ()
     expect(onUnproven).not.toHaveBeenCalled();
   });
 
+  test("a fresh conversation whose new user turn has no id is proven by the count, as before", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({
+        turnsCount: 2,
+        hasNewTurn: true,
+        userMatched: true,
+        lastMatched: true,
+        latestUserMatched: true,
+        latestUserKnown: false,
+        latestUserId: null,
+        latestUserIndex: 1,
+      }),
+      // No user turn before the send: an empty list says nothing about ids on this page.
+      { ids: [] },
+    );
+    expect(outcome).toEqual({ committed: 2 });
+    expect(onUnproven).not.toHaveBeenCalled();
+  });
+
+  test("a fresh conversation whose new user turn has an id is proven by it", async () => {
+    const { outcome } = await verify(
+      probe({
+        turnsCount: 1,
+        latestUserMatched: true,
+        latestUserIsNew: true,
+        latestUserKnown: false,
+        latestUserId: "u1",
+        latestUserIndex: 0,
+        latestUserRawText: PROMPT,
+      }),
+      { ids: [] },
+    );
+    expect(outcome).toEqual({ committed: 1 });
+  });
+
   test("with the ids known, a grown count and text in older turns prove nothing", async () => {
     const { outcome, onUnproven } = await verify(
       probe({ hasNewTurn: true, turnsCount: 5, userMatched: true, prefixMatched: true }),

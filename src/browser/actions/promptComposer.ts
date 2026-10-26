@@ -1303,7 +1303,11 @@ async function verifyPromptCommitted(
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
   const baselineUserIdsLiteral = JSON.stringify(options.baselineUserIds ?? null);
-  const idsKnown = Array.isArray(options.baselineUserIds);
+  // The page renders user turn ids: a turn had one before the send, or the latest one has one
+  // now. An empty pre-send list alone (a fresh conversation) says nothing either way.
+  const idsAvailable = (probe: CommitProbeState | undefined): boolean =>
+    Array.isArray(options.baselineUserIds) &&
+    (options.baselineUserIds.length > 0 || Boolean(probe?.latestUserId));
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
   const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
@@ -1438,7 +1442,7 @@ async function verifyPromptCommitted(
     }
     // With the pre-send identities every decision is made by id: text in older turns and a count
     // that a re-rendered window can grow prove nothing then.
-    if (idsKnown) {
+    if (idsAvailable(info)) {
       await delay(100);
       continue;
     }
@@ -1463,6 +1467,7 @@ async function verifyPromptCommitted(
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
   // A new user turn: by id when the pre-send identities are known; without them, only a grown
   // count. A turn that existed before the send, or an assistant's text, is never one.
+  const idsKnown = idsAvailable(probe);
   const newUserTurn = idsKnown
     ? probe?.latestUserIsNew === true
     : probe?.hasNewTurn === true && probe?.latestUserMatched === true;
