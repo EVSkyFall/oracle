@@ -41,22 +41,29 @@ function fakeTab(doc: () => Document, onLoad: () => void = () => {}) {
   let mark: string | null = null;
   const loads: string[] = [];
   const Runtime = {
-    evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-      if (expression.includes("readTurnProgress")) {
-        const sample = readTurnProgress(doc());
-        return { result: { value: { ...sample, url: CONVERSATION } } };
-      }
-      const set = /window\.__oracleResyncMark = "([^"]+)"/.exec(expression);
-      if (set) {
-        mark = set[1]!;
-        return { result: { value: mark } };
-      }
-      const asked = /window\.__oracleResyncMark === "([^"]+)"/.exec(expression);
-      if (asked) return { result: { value: asked[1] === mark ? "old" : "complete" } };
-      if (expression === "location.href") return { result: { value: CONVERSATION } };
-      if (expression.endsWith(").length")) return { result: { value: 6 } };
-      return { result: { value: null } };
-    }),
+    evaluate: vi.fn(
+      async ({
+        expression,
+      }: {
+        expression: string;
+        awaitPromise?: boolean;
+      }): Promise<{ result: { value: unknown } }> => {
+        if (expression.includes("readTurnProgress")) {
+          const sample = readTurnProgress(doc());
+          return { result: { value: { ...sample, url: CONVERSATION } } };
+        }
+        const set = /window\.__oracleResyncMark = "([^"]+)"/.exec(expression);
+        if (set) {
+          mark = set[1]!;
+          return { result: { value: mark } };
+        }
+        const asked = /window\.__oracleResyncMark === "([^"]+)"/.exec(expression);
+        if (asked) return { result: { value: asked[1] === mark ? "old" : "complete" } };
+        if (expression === "location.href") return { result: { value: CONVERSATION } };
+        if (expression.endsWith(").length")) return { result: { value: 6 } };
+        return { result: { value: null } };
+      },
+    ),
   };
   const load = (how: string) => {
     loads.push(how);

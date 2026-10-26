@@ -172,7 +172,7 @@ describe("a frozen approval check", () => {
   test("(b) a check whose page call hangs is given up after a minute, the reload goes ahead, and its late answer never clicks", async () => {
     let page = 1;
     let mark: string | null = null;
-    let lateArm: ((value: unknown) => void) | null = null;
+    const late: { arm?: (value: unknown) => void } = {};
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression.includes("readTurnProgress")) {
         return { result: { value: { key: `page${page}`, length: 5, url: CONVERSATION } } };
@@ -188,7 +188,7 @@ describe("a frozen approval check", () => {
       // Arming the click's guard is the call the frozen page never answers (until much later).
       if (expression.includes("__oracleTrustedClickGuards ??=")) {
         return new Promise((resolve) => {
-          lateArm = resolve;
+          late.arm = resolve;
         });
       }
       const set = /window\.__oracleResyncMark = "([^"]+)"/.exec(expression);
@@ -254,7 +254,7 @@ describe("a frozen approval check", () => {
     expect(reload).toHaveBeenCalledTimes(1);
     expect(reloads[0]).toBeGreaterThanOrEqual(60_000);
     // The frozen page finally answers the old check: nothing is clicked.
-    lateArm?.({ result: { value: { ready: true, contextMatches: true } } });
+    late.arm?.({ result: { value: { ready: true, contextMatches: true } } });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(dispatchMouseEvent).not.toHaveBeenCalled();
     expect(box.state).toBe("resolved");
