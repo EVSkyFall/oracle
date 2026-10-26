@@ -580,9 +580,7 @@ export async function liveTailSessionBrowserOutput(
           `[${new Date().toISOString()}] state=${harvested.state} stop=${harvested.stopExists ? "yes" : "no"} ` +
           `send=${harvested.sendExists ? "yes" : "no"} model=${harvested.currentModelLabel || "(unknown)"} ` +
           `turn=${turnState}${ownText ? ` snippet=${snippet(harvested.lastAssistantSnippet || ownText, 160)}` : ""}`;
-        if (ownText) {
-          await persistBrowserHarvest(sessionId, harvested, Boolean(options.browserTabRef));
-        }
+        // Progress is only shown; the session saves nothing until its answer is finished.
         console.log(statusLine);
       }
       if (turnState !== lastTurnState) {

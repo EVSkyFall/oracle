@@ -177,6 +177,26 @@ describe("a reattach saves only this session's own turn", () => {
     expect(savedTexts()).not.toContain(PREVIOUS);
   });
 
+  test("--live saves nothing while this turn is generating, only its finished answer", async () => {
+    mockSession([
+      ...Array.from({ length: 3 }, () => generatingPartial),
+      ...Array.from({ length: 2 }, () => preambleNoStop),
+      finished,
+    ]);
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const settled = liveTailSessionBrowserOutput("sess-turn").then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await advance(20_000);
+    expect(await settled).toMatchObject({ value: { lastAssistantMarkdown: CURRENT } });
+    // Neither the streaming part nor the preamble was ever written to the session.
+    expect(savedTexts()).not.toContain(JSON.stringify(generatingPartial.lastAssistantSnippet));
+    expect(savedTexts()).not.toContain(PREAMBLE);
+    expect(savedTexts()).not.toContain('"stopExists":true');
+    expect(savedTexts()).toContain(JSON.stringify(CURRENT));
+  });
+
   test("--live with this turn's answer already on the page returns it", async () => {
     mockSession([finished]);
     const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");

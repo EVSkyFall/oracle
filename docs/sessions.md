@@ -180,8 +180,9 @@ stop button and no live thinking. A preamble shown while the stop button is
 briefly gone is not the answer, and placeholder or UI text ("ChatGPT said:",
 "Pro thinking … Answer now", "Stopped thinking Edit") is never an answer.
 While ChatGPT still generates the session's turn, `--live` keeps waiting, up to
-the session's browser timeout, and `--harvest` reports that the turn has no
-finished answer and saves nothing. Neither ever saves an earlier turn. An
+the session's browser timeout, showing its progress without saving any of it,
+and `--harvest` reports that the turn has no finished answer and saves nothing.
+Neither ever saves an earlier turn. An
 explicit `--browser-tab` harvest still snapshots that tab's paired answer.
 
 While `--harvest` or `--live` reads the session's tab on Oracle's persistent
