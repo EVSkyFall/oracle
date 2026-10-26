@@ -26,6 +26,8 @@ const probe = (overrides: Record<string, unknown>) => ({
   latestUserIndex: 3,
   latestUserId: "u4",
   latestUserRawText: "Earlier question 4",
+  // The latest user turn is the one rendered before the send.
+  latestUserSameAsBefore: true,
   ...overrides,
 });
 const runtimeShowing = (value: Record<string, unknown>) =>
@@ -67,6 +69,7 @@ describe("the commit check proves a send by the latest user turn's identity", ()
         latestUserKnown: false,
         latestUserId: "u5",
         latestUserRawText: PROMPT,
+        latestUserSameAsBefore: false,
       }),
     );
     // The committed count ends at the sent user turn: the answer wait starts at index 3.
@@ -233,19 +236,54 @@ describe("an unproven send whose composer was cleared goes on, scoped only to a 
     expect(outcome).toEqual({ committed: 5 });
     expect(onUnproven).toHaveBeenCalledWith({ index: 4, text: PROMPT, messageId: null });
   });
-  test("without ids and without a grown count, a latest user turn showing the prompt never stands", async () => {
-    const { outcome, onUnproven } = await verify(
+});
+
+describe("pages without ids: the latest user turn's text against the latest one before the send", () => {
+  const withoutIds = { latestUserKnown: false, latestUserId: null };
+
+  test("a send that unmounted the oldest turn (count unchanged) is proven by the new text, and scoped to it", async () => {
+    const { outcome, onUnproven, onCommitted } = await verify(
       probe({
-        latestUserKnown: false,
-        latestUserId: null,
+        ...withoutIds,
         latestUserMatched: true,
         latestUserRawText: PROMPT,
+        latestUserSameAsBefore: false,
       }),
       { ids: null },
     );
-    // It could be an older identical turn.
+    // The answer wait starts at the sent user turn (index 3), not at the count before (4).
+    expect(outcome).toEqual({ committed: 4 });
+    expect(onUnproven).not.toHaveBeenCalled();
+    expect(onCommitted).toHaveBeenCalledWith({ index: 3, text: PROMPT, messageId: null });
+  });
+
+  test("an identical repeat that went through keeps the scope, and the log says why", async () => {
+    const { outcome, onUnproven, logger } = await verify(
+      probe({ ...withoutIds, latestUserMatched: true, latestUserRawText: PROMPT }),
+      { ids: null },
+    );
+    // Without ids the new turn and the older identical one can't be told apart.
     expect(outcome).toEqual({ committed: null });
     expect(onUnproven).toHaveBeenCalledWith(null);
+    expect(logger).toHaveBeenCalledWith(
+      "[browser] The latest user turn shows the same text as the one before the send, and the page has no message ids to tell them apart; the answer wait keeps its scope.",
+    );
+  });
+
+  test("an identical-repeat lost click (the composer still holds the prompt) is not sent", async () => {
+    const { outcome, onUnproven } = await verify(
+      probe({
+        ...withoutIds,
+        composerCleared: false,
+        latestUserMatched: true,
+        latestUserRawText: PROMPT,
+        userMatched: true,
+        lastMatched: true,
+      }),
+      { ids: null },
+    );
+    notSent(outcome);
+    expect(onUnproven).not.toHaveBeenCalled();
   });
 });
 

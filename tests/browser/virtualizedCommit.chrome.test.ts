@@ -298,17 +298,38 @@ describe.runIf(enabled)(
       }
     }, 150_000);
 
-    test("without ids, an unproven windowed send goes on but never lowers the scope onto an older turn", async () => {
+    test("without ids, a windowed send (count unchanged) is proven by the latest user turn's new text, and its answer is captured", async () => {
       await open({ ids: false, window: 4, initial: earlier(4) });
+      const { ctx, state, outcome, submitMs } = await send(PROMPT);
+      expect(outcome).toEqual({ sent: true });
+      expect(state.commitUnproven).toBeUndefined();
+      expect(state.committedTurns).toBe(4);
+      // The answer wait starts at the sent user turn, below the count before the send.
+      expect(state.baselineTurns).toBe(3);
+      expect(submitMs).toBeLessThan(20_000);
+      expect(await answerOf(ctx)).toBe(answerTo(PROMPT));
+    }, 150_000);
+
+    test("without ids, an identical repeat that went through keeps the scope and says why", async () => {
+      await open({ ids: false, window: 4, initial: [...earlier(3), PROMPT] });
       const { state, outcome, logger } = await send(PROMPT);
       expect(outcome).toEqual({ sent: true });
       expect(state.commitUnproven).toBe(true);
-      // With the count unchanged, the latest user turn could be an older one: no stand-in.
+      // The new turn and the older identical one can't be told apart: no stand-in.
       expect(state.unprovenCommitTurn).toBeNull();
       expect(state.baselineTurns).toBe(4);
       expect(logger).toHaveBeenCalledWith(
-        expect.stringMatching(/^\[browser\] Prompt commit not proven \(.*\); treating it as sent/),
+        "[browser] The latest user turn shows the same text as the one before the send, and the page has no message ids to tell them apart; the answer wait keeps its scope.",
       );
+    }, 150_000);
+
+    test("without ids, an identical-repeat lost click is not sent", async () => {
+      await open({ ids: false, window: 4, initial: [...earlier(3), PROMPT], lost: true });
+      const { outcome, state } = await send(PROMPT);
+      expect("error" in outcome && outcome.error.message).toMatch(
+        /Prompt did not appear in conversation before timeout/,
+      );
+      expect(state.commitUnproven).toBeUndefined();
     }, 150_000);
 
     test("without ids on a page whose turn count grows, the count still proves the send", async () => {

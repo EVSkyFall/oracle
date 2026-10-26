@@ -416,6 +416,14 @@ export async function submitPrompt(
   // The user turns rendered before the send: a turn not among them is a new one, even when a
   // long conversation unmounts an old turn for it and the count stays the same.
   const baselineUserIds = deps.baselineUserIds ?? (await readUserMessageIds(runtime, 0));
+  // Without ids, the text of the latest user turn before the send is what tells a new one apart.
+  const baselineLatestUserText = await runtime
+    .evaluate({ expression: buildLatestUserTurnExpression(), returnByValue: true })
+    .then(({ result }) => {
+      const turn = result?.value as PageUserTurn | null | undefined;
+      return turn === null ? null : typeof turn?.text === "string" ? turn.text : undefined;
+    })
+    .catch(() => undefined);
 
   // Install before the click: a short answer can complete while commit verification runs.
   await runtime
@@ -461,6 +469,7 @@ export async function submitPrompt(
     deps.baselineTurns ?? undefined,
     {
       baselineUserIds,
+      baselineLatestUserText,
       onUnproven: deps.onCommitUnproven,
       onCommitted: deps.onCommitted,
     },
@@ -1303,6 +1312,8 @@ async function verifyPromptCommitted(
   options: {
     /** The user turn identities rendered before the send (readUserMessageIds). */
     baselineUserIds?: readonly string[];
+    /** The latest user turn's text before the send: null for none, undefined when unread. */
+    baselineLatestUserText?: string | null;
     onUnproven?: (turn: PageUserTurn | null) => void;
     onCommitted?: (turn: PageUserTurn) => void;
   } = {},
@@ -1310,6 +1321,11 @@ async function verifyPromptCommitted(
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
   const baselineUserIdsLiteral = JSON.stringify(options.baselineUserIds ?? null);
+  const baselineLatestUserTextLiteral = JSON.stringify(
+    options.baselineLatestUserText === undefined
+      ? { unread: true }
+      : { text: options.baselineLatestUserText },
+  );
   // The page renders user turn ids: a turn had one before the send, or the latest one has one
   // now. An empty pre-send list alone (a fresh conversation) says nothing either way.
   const idsAvailable = (probe: CommitProbeState | undefined): boolean =>
@@ -1405,6 +1421,14 @@ async function verifyPromptCommitted(
         baselineUserIds.includes(latestUser.messageId);
       const latestUserIsNew =
         Boolean(latestUser?.messageId) && Array.isArray(baselineUserIds) && !latestUserKnown;
+      // Without ids: the latest user turn shows the same text as the latest one before the send
+      // (or that text is unknown), so it may be that older turn.
+      const baselineLatestUser = ${baselineLatestUserTextLiteral};
+      const latestUserSameAsBefore =
+        baselineLatestUser.unread === true ||
+        (typeof baselineLatestUser.text === 'string' &&
+          Boolean(latestUser) &&
+          normalize(baselineLatestUser.text) === latestUserText);
 		    return {
         baseline,
         latestUserMatched,
@@ -1413,6 +1437,7 @@ async function verifyPromptCommitted(
         latestUserIndex: typeof latestUser?.index === 'number' ? latestUser.index : -1,
         latestUserId: latestUser?.messageId ?? null,
         latestUserRawText: latestUser?.text ?? null,
+        latestUserSameAsBefore,
 	      userMatched,
 	      prefixMatched,
 	      lastMatched,
@@ -1434,6 +1459,15 @@ async function verifyPromptCommitted(
     text: probe.latestUserRawText ?? null,
     messageId: probe.latestUserId ?? null,
   });
+  // Without ids: the composer was cleared and the latest user turn shows the prompt with a text
+  // the latest one before the send did not have, so it is the sent turn wherever the window of
+  // rendered turns puts it.
+  const textStandsForSent = (probe: CommitProbeState | undefined): boolean =>
+    probe?.composerCleared === true &&
+    probe.latestUserMatched === true &&
+    probe.latestUserSameAsBefore === false &&
+    typeof probe.latestUserIndex === "number" &&
+    probe.latestUserIndex >= 0;
   let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
@@ -1459,6 +1493,10 @@ async function verifyPromptCommitted(
       await delay(100);
       continue;
     }
+    if (textStandsForSent(info)) {
+      options.onCommitted?.(latestUserTurn(info!));
+      return info!.latestUserIndex! + 1;
+    }
     const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
     const baselineUnknown =
       typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
@@ -1483,10 +1521,14 @@ async function verifyPromptCommitted(
   const idsKnown = idsAvailable(probe);
   const newUserTurn = idsKnown
     ? probe?.latestUserIsNew === true
-    : probe?.hasNewTurn === true && probe?.latestUserMatched === true;
+    : (probe?.hasNewTurn === true && probe?.latestUserMatched === true) || textStandsForSent(probe);
   // Signs that the prompt left the composer through the page: a new user turn by id, or, without
-  // ids, the latest user turn showing it or a grown count.
-  const sentShown = idsKnown ? newUserTurn : Boolean(probe?.latestUserMatched || probe?.hasNewTurn);
+  // ids, a grown count or the latest user turn showing it with a text it did not have before.
+  const sentShown = idsKnown
+    ? newUserTurn
+    : Boolean(
+        probe?.hasNewTurn || (probe?.latestUserMatched && probe?.latestUserSameAsBefore === false),
+      );
   // The send was dispatched. When the composer still holds the prompt and no turn above shows it,
   // the click was lost: today's error, so the wrapper may retry. Any other uncertainty never ends
   // the run, and nothing is ever typed or sent again here.
@@ -1496,6 +1538,16 @@ async function verifyPromptCommitted(
     );
     const latestStands =
       newUserTurn && typeof probe?.latestUserIndex === "number" && probe.latestUserIndex >= 0;
+    if (
+      !idsKnown &&
+      !latestStands &&
+      probe?.latestUserMatched === true &&
+      probe.latestUserSameAsBefore === true
+    ) {
+      logger?.(
+        "[browser] The latest user turn shows the same text as the one before the send, and the page has no message ids to tell them apart; the answer wait keeps its scope.",
+      );
+    }
     options.onUnproven?.(latestStands ? latestUserTurn(probe!) : null);
     return latestStands ? probe!.latestUserIndex! + 1 : null;
   }
@@ -1527,6 +1579,7 @@ interface CommitProbeState {
   latestUserIndex?: number;
   latestUserId?: string | null;
   latestUserRawText?: string | null;
+  latestUserSameAsBefore?: boolean;
   userMatched?: boolean;
   prefixMatched?: boolean;
   lastMatched?: boolean;
