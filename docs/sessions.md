@@ -198,6 +198,15 @@ the session's browser timeout, showing its progress without saving any of it,
 and `--harvest` reports that the turn has no finished answer and saves nothing.
 Neither ever saves an earlier turn. An
 explicit `--browser-tab` harvest still snapshots that tab's paired answer.
+When the tab shows ChatGPT's "Connection interrupted. Waiting for the complete
+answer" banner on two polls in a row, `--live` reloads it at once (it logs
+`[browser] ChatGPT shows "Connection interrupted"; reloading the conversation now`),
+then again after 30 s, 1, 2 and 4 minutes and every 8 minutes while it stays,
+within the session's browser timeout. It never types or resubmits, and then
+waits for the session's turn under the same rules. The banner's markup is saved
+once to `artifacts/interrupted-banner-diag-<n>.html`. A run's own wait, and
+`oracle session <id>` reattaching to it, do the same (see
+[Stalled turns](browser-mode.md#stalled-turns)).
 
 While `--harvest` or `--live` reads the session's tab on Oracle's persistent
 manual-login profile, it holds a browser slot there like a run does, taking

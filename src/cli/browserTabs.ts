@@ -12,10 +12,18 @@ import {
   DEFAULT_REMOTE_CHROME_PORT,
   formatBrowserTabState,
   harvestChatGptTab,
+  readChatGptTabBannerDiagnostic,
+  reloadChatGptTab,
   sessionMatchesTab,
   type ChatGptTabSummary,
   type LiveChromeEndpoint,
 } from "../browser/liveTabs.js";
+import {
+  createInterruptedBannerTracker,
+  INTERRUPTED_BANNER_REASON,
+  saveInterruptedBannerDiagnostic,
+} from "../browser/interruptedBanner.js";
+import { conversationIdFromUrl } from "../browser/actions/navigation.js";
 import {
   isRecoveredConversationHarvestReady,
   recoverConversationTab,
@@ -574,6 +582,57 @@ export async function liveTailSessionBrowserOutput(
   let requireRecoveredContent = false;
   let recoveredContentDeadlineMs = 0;
   const log = (line: string) => console.log(line);
+  // "Connection interrupted": the tab lost the answer's stream, and a fresh load of the
+  // conversation fetches it. Reloaded as soon as two polls in a row show it, then on the banner's
+  // own backoff while it stays (interruptedBanner.ts); never resubmits or types.
+  const banner = createInterruptedBannerTracker();
+  let reportedNoBannerUrl = false;
+  const reloadForInterruptedBanner = async (harvested: ChatGptTabSummary): Promise<boolean> => {
+    const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    if (banner.note(harvested.interruptedBanner ?? null)) {
+      await readChatGptTabBannerDiagnostic(
+        { ...endpoint, targetId: harvested.targetId },
+        INTERRUPTED_BANNER_REASON,
+      )
+        .then((diagnostic) => saveInterruptedBannerDiagnostic(sessionId, diagnostic))
+        .then((path) => {
+          if (path) log(`[browser] "Connection interrupted" diagnostic saved: ${path}`);
+        })
+        .catch((error: unknown) =>
+          log(
+            `[browser] "Connection interrupted" diagnostic could not be saved: ${failure(error)}`,
+          ),
+        );
+    }
+    if (!banner.due() || Date.now() >= waitUntil) return false;
+    const url = [harvested.url, meta.browser?.runtime?.tabUrl, meta.browser?.harvest?.url].find(
+      (candidate): candidate is string => Boolean(conversationIdFromUrl(candidate ?? undefined)),
+    );
+    if (!url) {
+      if (!reportedNoBannerUrl) {
+        reportedNoBannerUrl = true;
+        log(
+          `[browser] ${INTERRUPTED_BANNER_REASON}, but no conversation URL is known, so the page is not reloaded.`,
+        );
+      }
+      return false;
+    }
+    log(banner.reloading());
+    await reloadChatGptTab({
+      ...endpoint,
+      targetId: harvested.targetId,
+      url,
+      logger: log,
+      deadline: waitUntil,
+    }).catch((error: unknown) => {
+      log(
+        `[browser] Conversation reload failed (${failure(error)}); waiting on the page as it is.`,
+      );
+      return false;
+    });
+    banner.reloaded(true);
+    return true;
+  };
   // Tailing the session's tab uses its Chrome like a run does: hold a slot on the profile.
   let slot = options.browserTabRef ? null : await takeHarvestSlot(meta, log);
   let saved = false;
@@ -657,6 +716,7 @@ export async function liveTailSessionBrowserOutput(
         lastTurnState = turnState;
       }
 
+      if (turnState !== "answer" && (await reloadForInterruptedBanner(harvested))) continue;
       if (turnState !== "answer" || !harvested.authenticated) {
         if (Date.now() >= waitUntil) {
           throw new Error(

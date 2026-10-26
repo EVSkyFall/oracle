@@ -18,6 +18,13 @@ import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import {
+  buildInterruptedBannerExpression,
+  readInterruptedBannerDiagnostic,
+  type InterruptedBannerDiagnostic,
+} from "./interruptedBanner.js";
+import { reloadConversationPage } from "./turnResync.js";
+import type { BrowserLogger } from "./types.js";
+import {
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
   openBackgroundChromeWindow,
@@ -81,6 +88,8 @@ export interface ChatGptTabSummary {
    * proven finished by the normal capture's terminal proof; its text is then the proven answer.
    */
   lastAssistantFinished?: boolean;
+  /** The "Connection interrupted" banner's text when the tab shows it (interruptedBanner.ts). */
+  interruptedBanner?: string | null;
 }
 
 interface ResolveChatGptTabOptions extends LiveChromeEndpoint {
@@ -650,6 +659,15 @@ export async function harvestChatGptTab(
   try {
     const { Runtime } = client;
     const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+    const interruptedBanner = await Runtime.evaluate({
+      expression: buildInterruptedBannerExpression(),
+      returnByValue: true,
+    })
+      .then(({ result }) => {
+        const text = (result?.value as { text?: unknown } | null)?.text;
+        return typeof text === "string" && text ? text : null;
+      })
+      .catch(() => null);
     const nowSummary = await inspectChatGptTab({
       ...options,
       target: {
@@ -693,6 +711,7 @@ export async function harvestChatGptTab(
         : nowSummary.lastAssistantText;
     const harvested: ChatGptTabSummary = {
       ...nowSummary,
+      interruptedBanner,
       lastAssistantText,
       lastAssistantSnippet: trimToSnippet(lastAssistantText),
       lastAssistantMarkdown: assistantMarkdown ?? (lastAssistantText || null),
@@ -776,6 +795,48 @@ export async function harvestChatGptTab(
       harvested.state = classifyTabState(harvested);
     }
     return harvested;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Reloads the conversation in tab `targetId` with the turn resync's marked reload (its steps bounded
+ * by `deadline`); never resubmits and never types. False when it could not reload (logged).
+ */
+export async function reloadChatGptTab(
+  options: LiveChromeEndpoint & {
+    targetId: string;
+    url: string;
+    logger: (line: string) => void;
+    deadline?: number;
+  },
+): Promise<boolean> {
+  const client = await connectToTarget(options, options.targetId);
+  try {
+    return await reloadConversationPage({
+      Runtime: client.Runtime,
+      Page: client.Page,
+      logger: options.logger as BrowserLogger,
+      url: options.url,
+      deadline: options.deadline,
+    });
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+/** The "Connection interrupted" banner's diagnostic as tab `targetId` shows it now. */
+export async function readChatGptTabBannerDiagnostic(
+  options: LiveChromeEndpoint & { targetId: string },
+  reason: string,
+): Promise<InterruptedBannerDiagnostic> {
+  const client = await connectToTarget(options, options.targetId);
+  try {
+    return await readInterruptedBannerDiagnostic(async (expression) => {
+      const { result } = await client.Runtime.evaluate({ expression, returnByValue: true });
+      return result?.value;
+    }, reason);
   } finally {
     await client.close().catch(() => undefined);
   }

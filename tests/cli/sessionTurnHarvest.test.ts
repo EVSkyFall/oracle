@@ -84,12 +84,21 @@ let cwd: string;
 let updateSession: ReturnType<typeof vi.fn>;
 
 function mockSession(
-  harvests: unknown[],
+  harvests: unknown[] | (() => unknown),
   config: Record<string, unknown> = {},
   overrides: { runtime?: Record<string, unknown>; options?: Record<string, unknown> } = {},
 ) {
   let index = 0;
-  const harvestChatGptTab = vi.fn(async () => harvests[Math.min(index++, harvests.length - 1)]);
+  const harvestChatGptTab = vi.fn(async () =>
+    typeof harvests === "function" ? harvests() : harvests[Math.min(index++, harvests.length - 1)],
+  );
+  // The tab is never reached: a reload and a banner read only record their call.
+  const reloadChatGptTab = vi.fn(async (_options: Record<string, unknown>) => true);
+  const readChatGptTabBannerDiagnostic = vi.fn(async () => ({
+    reason: 'ChatGPT shows "Connection interrupted"',
+    capturedAt: "2026-10-26T05:30:00.000Z",
+    page: null,
+  }));
   const meta = {
     id: "sess-turn",
     createdAt: "2026-10-26T03:04:18.000Z",
@@ -121,6 +130,8 @@ function mockSession(
   vi.doMock("../../src/browser/liveTabs.js", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../../src/browser/liveTabs.js")>()),
     harvestChatGptTab,
+    reloadChatGptTab,
+    readChatGptTabBannerDiagnostic,
   }));
   vi.doMock("../../src/browser/recoverConversation.js", () => ({
     recoverConversationTab: vi.fn(),
@@ -134,7 +145,7 @@ function mockSession(
       sessionsDir: () => path.join(os.tmpdir(), "oracle-turn-sessions-dir"),
     },
   }));
-  return { harvestChatGptTab };
+  return { harvestChatGptTab, reloadChatGptTab, readChatGptTabBannerDiagnostic };
 }
 
 const savedTexts = () => JSON.stringify(updateSession.mock.calls);
@@ -339,6 +350,65 @@ describe("a reattach saves only this session's own turn", () => {
     for (const [options] of harvestChatGptTab.mock.calls.slice(1) as unknown as Array<[unknown]>) {
       expect(options).toMatchObject({ confirmTurnComplete: { timeoutMs: expect.any(Number) } });
     }
+  });
+
+  test('--live reloads a tab that shows "Connection interrupted", then saves this session\'s finished answer', async () => {
+    // The page lost the answer's stream: Stop stays shown and nothing changes until a reload.
+    const interrupted = {
+      ...generatingPartial,
+      interruptedBanner: "connection interrupted. waiting for the complete answer",
+    };
+    let reloaded = false;
+    const { reloadChatGptTab, readChatGptTabBannerDiagnostic } = mockSession(() =>
+      reloaded ? finished : interrupted,
+    );
+    reloadChatGptTab.mockImplementation(async () => {
+      reloaded = true;
+      return true;
+    });
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const settled = liveTailSessionBrowserOutput("sess-turn", {
+      writeOutputPath: "answer.md",
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await advance(30_000);
+    expect(await settled).toMatchObject({ value: { lastAssistantMarkdown: CURRENT } });
+    expect(await fs.readFile(path.join(cwd, "answer.md"), "utf8")).toBe(CURRENT);
+    expect(reloadChatGptTab).toHaveBeenCalledTimes(1);
+    expect(reloadChatGptTab.mock.calls[0]![0]).toMatchObject({
+      targetId: "target-x",
+      url: "https://chatgpt.com/c/saved-conversation",
+      deadline: expect.any(Number),
+    });
+    expect(readChatGptTabBannerDiagnostic).toHaveBeenCalledTimes(1);
+    const logged = (console.log as unknown as ReturnType<typeof vi.fn>).mock.calls.map(([line]) =>
+      String(line),
+    );
+    expect(logged).toContain(
+      '[browser] ChatGPT shows "Connection interrupted"; reloading the conversation now',
+    );
+    expect(savedTexts()).not.toContain(PREVIOUS);
+  });
+
+  test("--live never reloads for a banner seen on one poll only", async () => {
+    let polls = 0;
+    const { reloadChatGptTab } = mockSession(() => {
+      polls += 1;
+      if (polls === 2) {
+        return { ...generatingPartial, interruptedBanner: "connection interrupted" };
+      }
+      return polls < 6 ? generatingPartial : finished;
+    });
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const settled = liveTailSessionBrowserOutput("sess-turn").then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await advance(30_000);
+    expect(await settled).toMatchObject({ value: { lastAssistantMarkdown: CURRENT } });
+    expect(reloadChatGptTab).not.toHaveBeenCalled();
   });
 
   test.each([["ChatGPT said:"], ["Pro thinking\nAnswer now"], ["Stopped thinking\nEdit"]])(
