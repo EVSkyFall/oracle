@@ -20,7 +20,7 @@ import {
   buildThinkingActivityDetailsPredicateJs,
   readThinkingActivity,
 } from "./thinkingStatus.js";
-import { delay } from "../utils.js";
+import { delay, withRetries } from "../utils.js";
 import {
   logDomFailure,
   logConversationSnapshot,
@@ -607,6 +607,39 @@ export async function captureTurnMarkdown(
     ? copied.owner?.messageId === meta.messageId
     : Boolean(meta.turnId) && copied.owner?.turnId === meta.turnId;
   return tied ? copied.markdown : null;
+}
+
+/**
+ * A run's Markdown capture of its own answer turn (local and remote runs): that turn's copy
+ * button, retried as the run always did, and only a copy tied to that turn
+ * (captureTurnMarkdown). Rejects when there is none; the run then saves the turn's text.
+ */
+export function captureRunAnswerMarkdown(
+  Runtime: ChromeClient["Runtime"],
+  meta: { messageId?: string | null; turnId?: string | null },
+  logger: BrowserLogger,
+  options: { verbose?: boolean } = {},
+): Promise<string> {
+  return withRetries(
+    async () => {
+      const attempt = await captureTurnMarkdown(Runtime, meta, logger);
+      if (!attempt) {
+        throw new Error("copy-missing");
+      }
+      return attempt;
+    },
+    {
+      retries: 2,
+      delayMs: 350,
+      onRetry: (attempt, error) => {
+        if (options.verbose) {
+          logger(
+            `[retry] Markdown capture attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      },
+    },
+  );
 }
 
 export function buildAssistantExtractorForTest(name: string): string {

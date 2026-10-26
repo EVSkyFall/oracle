@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import {
   waitForAssistantResponse,
-  captureAssistantMarkdown,
+  captureTurnMarkdown,
   navigateToChatGPT,
   ensureNotBlocked,
   ensureLoggedIn,
@@ -67,7 +67,8 @@ export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
   connect?: (options?: unknown) => Promise<ChromeClient>;
   waitForAssistantResponse?: typeof waitForAssistantResponse;
-  captureAssistantMarkdown?: typeof captureAssistantMarkdown;
+  /** Defaults to the turn-tied copy: another turn's Markdown never stands in for this one's. */
+  captureAssistantMarkdown?: typeof captureTurnMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
   waitForConversationHydration?: typeof waitForResumedConversationHydration;
   launchChrome?: typeof launchChrome;
@@ -267,7 +268,7 @@ async function resumeBrowserSessionInternal(
     };
 
     const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
-    const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
+    const captureMarkdown = deps.captureAssistantMarkdown ?? captureTurnMarkdown;
     const timeoutMs = config?.timeoutMs ?? 120_000;
     const pingTimeoutMs = Math.min(5_000, Math.max(1_500, Math.floor(timeoutMs * 0.05)));
     await withTimeout(
@@ -683,7 +684,7 @@ async function resumeBrowserSessionViaNewChrome(
       }),
     );
     const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
-    const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
+    const captureMarkdown = deps.captureAssistantMarkdown ?? captureTurnMarkdown;
     const timeoutMs = resolved.timeoutMs ?? 120_000;
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??

@@ -13,7 +13,7 @@ import { delay } from "../utils.js";
 import { RunTimeExpiredError } from "../runClient.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import {
-  captureAssistantMarkdown,
+  captureTurnMarkdown,
   readAssistantSnapshot,
   throwIfAssistantUiError,
 } from "./assistantResponse.js";
@@ -677,7 +677,7 @@ export async function waitForDeepResearchCompletion(
 
 /**
  * Extracts the Deep Research result using existing assistant response
- * extraction logic (readAssistantSnapshot + captureAssistantMarkdown).
+ * extraction logic (readAssistantSnapshot + captureTurnMarkdown).
  */
 export async function extractDeepResearchResult(
   Runtime: ChromeClient["Runtime"],
@@ -695,8 +695,8 @@ export async function extractDeepResearchResult(
     messageId: snapshot?.messageId ?? null,
   };
 
-  // Try the copy-button approach first for clean markdown
-  const markdown = await captureAssistantMarkdown(Runtime, meta, logger);
+  // Try the copy-button approach first for clean markdown, only from this turn's own button.
+  const markdown = await captureTurnMarkdown(Runtime, meta, logger);
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
     return { text: markdown, html: snapshot?.html ?? undefined, meta };
   }

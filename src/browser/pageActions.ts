@@ -23,6 +23,8 @@ export {
   waitForAssistantResponse,
   readAssistantSnapshot,
   captureAssistantMarkdown,
+  captureRunAnswerMarkdown,
+  captureTurnMarkdown,
   buildAssistantExtractorForTest,
   buildAssistantSnapshotExpressionForTest,
   buildConversationDebugExpressionForTest,

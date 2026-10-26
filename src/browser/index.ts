@@ -54,7 +54,7 @@ import {
   ensureModelSelection,
   clearPromptComposer,
   waitForAssistantResponse,
-  captureAssistantMarkdown,
+  captureRunAnswerMarkdown,
   captureComposerNavigationUrl,
   assertComposerPlusStayedInPlace,
   clearComposerAttachments,
@@ -2275,27 +2275,9 @@ async function runBrowserModeInternal(
       }
       let turnAnswerText = turnAnswer.text;
       const turnAnswerHtml = turnAnswer.html ?? "";
+      // Only this turn's own copy: another turn's Markdown never stands in for its text.
       const copiedMarkdown = await raceWithDisconnect(
-        withRetries(
-          async () => {
-            const attempt = await captureAssistantMarkdown(Runtime, turnAnswer.meta, logger);
-            if (!attempt) {
-              throw new Error("copy-missing");
-            }
-            return attempt;
-          },
-          {
-            retries: 2,
-            delayMs: 350,
-            onRetry: (attempt, error) => {
-              if (options.verbose) {
-                logger(
-                  `[retry] Markdown capture attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-                );
-              }
-            },
-          },
-        ),
+        captureRunAnswerMarkdown(Runtime, turnAnswer.meta, logger, { verbose: options.verbose }),
       ).catch(() => null);
       let turnAnswerMarkdown = copiedMarkdown ?? turnAnswerText;
 
@@ -4002,26 +3984,10 @@ async function runRemoteBrowserMode(
       let turnAnswerText = turnAnswer.text;
       const turnAnswerHtml = turnAnswer.html ?? "";
 
-      const copiedMarkdown = await withRetries(
-        async () => {
-          const attempt = await captureAssistantMarkdown(Runtime, turnAnswer.meta, logger);
-          if (!attempt) {
-            throw new Error("copy-missing");
-          }
-          return attempt;
-        },
-        {
-          retries: 2,
-          delayMs: 350,
-          onRetry: (attempt, error) => {
-            if (options.verbose) {
-              logger(
-                `[retry] Markdown capture attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-              );
-            }
-          },
-        },
-      ).catch(() => null);
+      // Only this turn's own copy: another turn's Markdown never stands in for its text.
+      const copiedMarkdown = await captureRunAnswerMarkdown(Runtime, turnAnswer.meta, logger, {
+        verbose: options.verbose,
+      }).catch(() => null);
 
       let turnAnswerMarkdown = copiedMarkdown ?? turnAnswerText;
       ({ answerText: turnAnswerText, answerMarkdown: turnAnswerMarkdown } =
