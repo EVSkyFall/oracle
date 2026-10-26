@@ -1433,6 +1433,23 @@ async function autoReattachUntilComplete({
       })
       .catch(() => undefined);
   };
+  // The wait moved to a new tab (the old one stopped answering): later attempts and the session
+  // runtime follow it.
+  const persistMovedTarget = async (moved: {
+    chromeTargetId?: string;
+    ownedRecoveryTarget?: BrowserRuntimeMetadata["ownedRecoveryTarget"];
+  }) => {
+    knownRuntime = {
+      ...knownRuntime,
+      chromeTargetId: moved.chromeTargetId,
+      ...(moved.ownedRecoveryTarget ? { ownedRecoveryTarget: moved.ownedRecoveryTarget } : {}),
+    };
+    await sessionStore
+      .updateSession(sessionMeta.id, {
+        browser: { ...browserMetadata, config: browserConfig, runtime: knownRuntime },
+      })
+      .catch(() => undefined);
+  };
 
   let attempt = 0;
   for (;;) {
@@ -1455,10 +1472,11 @@ async function autoReattachUntilComplete({
         timeoutMs,
       };
       const result = await awaitBrowserCancellation(
-        resumeBrowserSession(runtime, reattachConfig, logger, {
+        resumeBrowserSession(knownRuntime, reattachConfig, logger, {
           promptPreview: sessionMeta.promptPreview,
           signal,
           onAppApproval: persistApproval,
+          onTargetMoved: persistMovedTarget,
           saveAppApprovalDiagnostic: (diagnostic) =>
             saveAppApprovalDiagnostic(sessionMeta.id, diagnostic),
         }),
@@ -1532,7 +1550,7 @@ async function autoReattachUntilComplete({
           ...browserMetadata,
           config: browserConfig,
           runtime: withAppApprovals(
-            { ...runtime, appApprovals: result.appApprovals },
+            { ...knownRuntime, appApprovals: result.appApprovals },
             knownRuntime,
           ),
         },

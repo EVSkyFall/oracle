@@ -20,6 +20,10 @@ import {
   positionChromeWindowOnscreen,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
+  connectToRemoteChrome,
+  connectWithNewTab,
+  closeTab,
+  closeRemoteChromeTarget,
 } from "./chromeLifecycle.js";
 import {
   normalizeBrowserAllowApps,
@@ -51,6 +55,8 @@ import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./action
 import { mergeAppApprovalRecords } from "./appApprovalRecords.js";
 import { createTurnResync } from "./turnResync.js";
 import { createRunClient } from "./runClient.js";
+import { clientTargetId, moveRunToNewTab, type ReplacementTab } from "./tabReplacement.js";
+import { claimBrowserTarget } from "./targetClaim.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
 import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
@@ -77,6 +83,14 @@ export interface ReattachDeps {
   onAppApproval?: (record: BrowserAppApprovalRecord) => void | Promise<void>;
   /** Saves a diagnostic of an approval card that was not taken or not clicked (session files). */
   saveAppApprovalDiagnostic?: AppApprovalMonitorOptions["saveDiagnostic"];
+  /**
+   * Called when the wait moved to a new tab because the page stopped answering: the new target
+   * (and the session's owned recovery target, when it moved with it) for the session runtime.
+   */
+  onTargetMoved?: (moved: {
+    chromeTargetId?: string;
+    ownedRecoveryTarget?: BrowserRuntimeMetadata["ownedRecoveryTarget"];
+  }) => void | Promise<void>;
 }
 
 export interface ReattachResult {
@@ -188,12 +202,15 @@ async function resumeBrowserSessionInternal(
       (lateConnection) => lateConnection.close(),
     );
     closeAttachedConnection = () => connection.close();
+    // The tab the wait is on: the attached one, or the tab that replaced it (see below).
+    let currentTargetId = target?.targetId ?? target?.id;
+    let ownedTarget = runtime.ownedRecoveryTarget;
 
     const runClient = createRunClient(cancellation.client(connection.client));
     const client = runClient.client;
     const { Runtime, DOM, Page } = client;
     const captureIdentity = async (): Promise<BrowserRecoveryCapture | undefined> => {
-      const targetId = target?.targetId ?? target?.id;
+      const targetId = currentTargetId;
       if (!targetId || !port) return undefined;
       const { result } = await withTimeout(
         Runtime.evaluate({ expression: "location.href", returnByValue: true }),
@@ -316,6 +333,68 @@ async function resumeBrowserSessionInternal(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts); the frozen tab is closed when the session's run opened it.
+    const replaceFrozenTab = (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> =>
+      moveRunToNewTab({
+        runClient,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectToRemoteChrome(host, port ?? 9222, logger, url, browserWSEndpoint, {
+                approvalWaitMs: browserWSEndpoint ? approvalWaitMs : undefined,
+                fallbackToDefault: false,
+                ...(resolveBrowserNoFocus(config) ? { background: true } : {}),
+              }),
+            (late) => late.close(),
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: () => opened.close(),
+            connection: opened,
+          };
+        },
+        retire: (retired) => {
+          const frozenId = currentTargetId;
+          const steps: Array<() => Promise<unknown>> = [() => retired.close()];
+          if (frozenId && ownedTarget?.targetId === frozenId) {
+            steps.push(() => closeRemoteChromeTarget(host, port ?? 9222, frozenId, logger));
+          } else if (frozenId) {
+            logger(
+              `[browser] The frozen tab (target ${frozenId}) was not opened by this session; it is left open.`,
+            );
+          }
+          return steps;
+        },
+        moved: (opened) => {
+          const ownedMoves = Boolean(
+            currentTargetId && opened.targetId && ownedTarget?.targetId === currentTargetId,
+          );
+          currentTargetId = opened.targetId;
+          // Kept open after the capture, like the tab it replaces (retired with the session).
+          closeAttachedConnection = () => opened.connection.close({ preserveTarget: true });
+          if (ownedMoves && ownedTarget && opened.targetId) {
+            ownedTarget = { ...ownedTarget, targetId: opened.targetId };
+          }
+          void Promise.resolve()
+            .then(() =>
+              deps.onTargetMoved?.({
+                chromeTargetId: opened.targetId,
+                ...(ownedMoves ? { ownedRecoveryTarget: ownedTarget } : {}),
+              }),
+            )
+            .catch(() => undefined);
+        },
+        ready: async () => {
+          if (ownedTarget?.claimId) await claimBrowserTarget(Runtime, ownedTarget.claimId);
+        },
+      });
     // A stalled turn (or a prompt hidden in the page) is reloaded and waited for again.
     const resync = createTurnResync({
       Runtime,
@@ -323,6 +402,7 @@ async function resumeBrowserSessionInternal(
       logger,
       conversationUrl: () => expectedConversationUrl,
       timeLimit: runClient,
+      replaceTab: replaceFrozenTab,
     });
     const answer = await withTimeout(
       cancellation.call(() =>
@@ -488,7 +568,10 @@ async function resumeBrowserSessionViaNewChrome(
     }
     throw error;
   }
+  // The client of a tab that replaced a frozen one (see replaceFrozenTab below).
+  let movedClient: ChromeClient | null = null;
   const cleanup = async () => {
+    await movedClient?.close().catch(() => undefined);
     if (rawClient && typeof rawClient.close === "function") {
       try {
         await rawClient.close();
@@ -622,12 +705,57 @@ async function resumeBrowserSessionViaNewChrome(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts); this Chrome is the reattach's own, so the frozen tab is closed.
+    let currentTabId = clientTargetId(rawClient);
+    const replaceFrozenTab = (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> =>
+      moveRunToNewTab({
+        runClient,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectWithNewTab(chrome.port, logger, url, chromeHost, {
+                fallbackToDefault: false,
+                background: Boolean(resolved.noFocus),
+              }),
+            async (late) => {
+              await late.client.close().catch(() => undefined);
+              if (late.targetId) await closeTab(chrome.port, late.targetId, logger, chromeHost);
+            },
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: async () => {
+              await opened.client.close().catch(() => undefined);
+              if (opened.targetId) await closeTab(chrome.port, opened.targetId, logger, chromeHost);
+            },
+          };
+        },
+        retire: (retired) => {
+          const frozenId = currentTabId;
+          return [
+            () => retired.close(),
+            ...(frozenId ? [() => closeTab(chrome.port, frozenId, logger, chromeHost)] : []),
+          ];
+        },
+        moved: (opened) => {
+          currentTabId = opened.targetId;
+          movedClient = opened.client;
+        },
+      });
     const resync = createTurnResync({
       Runtime,
       Page,
       logger,
       conversationUrl: () => conversationUrl,
       timeLimit: runClient,
+      replaceTab: replaceFrozenTab,
     });
     const answer = await cancellation.call(() =>
       withAppApprovalMonitor(

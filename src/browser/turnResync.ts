@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import { conversationIdFromUrl } from "./actions/navigation.js";
+import type { ReplacementTab } from "./tabReplacement.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 
 /** No change in the thread for this long means the turn looks stalled (then 16, 32, … minutes). */
@@ -13,6 +14,15 @@ const HIDDEN_PROMPT_QUIET_MS = 20_000;
 const HIDDEN_PROMPT_FRESH_MS = 10_000;
 const RELOAD_SETTLE_MS = 30_000;
 const PAGE_COMMAND_MS = 15_000;
+/**
+ * The progress read is a cheap evaluate that answers in milliseconds, and in a few seconds on a
+ * busy page; a minute without an answer is a renderer that stopped (an endless script).
+ */
+const PAGE_FROZEN_MS = 60_000;
+// Recovery steps: stopping the page's script, asking whether it answers, opening a new tab.
+const TERMINATE_WAIT_MS = 5_000;
+const PAGE_ANSWER_WAIT_MS = 10_000;
+const NEW_TAB_MS = 60_000;
 
 /** One sample of the thread: changes in `key` are progress. */
 export interface TurnProgressSample {
@@ -131,6 +141,15 @@ export interface TurnResyncOptions {
    * time left, so no call holds the run past it; cleared when the answer is in.
    */
   timeLimit?: { setDeadline(at: number | null): void };
+  /** How long the progress read may go unanswered before the page counts as frozen. */
+  frozenMs?: number;
+  /**
+   * Opens the conversation in a new tab of the same Chrome and moves the run there (its client,
+   * so the wait, the approval monitor and this resync follow), recording the new target; the
+   * frozen tab is closed in the background. Null when no tab could be opened. A tab that opens
+   * once `givenUp()` (its step ran out of time) is closed instead of taking the run over.
+   */
+  replaceTab?: (url: string, givenUp: () => boolean) => Promise<ReplacementTab | null>;
 }
 
 export interface TurnResync {
@@ -158,7 +177,16 @@ export interface TurnResync {
   ): Promise<T>;
 }
 
-type Trigger = { url: string; reason: string };
+type Trigger = {
+  url: string | null;
+  reason: string;
+  kind: "stall" | "hidden" | "frozen";
+  /** When the frozen page was last asked something (kind "frozen"). */
+  since?: number;
+};
+
+/** The progress read got no answer for the frozen time. */
+class PageNotAnswering extends Error {}
 
 const idle = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -209,6 +237,9 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   let stallAnchor = lastChangeAt;
   let hiddenReloads = 0;
   let hidden: { app: string; state: string; at: number } | null = null;
+  // Since when the page has not answered the progress read (null while it answers).
+  let frozenSince: number | null = null;
+  const frozenMs = Math.max(1, options.frozenMs ?? PAGE_FROZEN_MS);
   let pageConversationUrl: string | null = null;
   let reloading = false;
   // Bumped by each reload: a sample read before it must not become the reloaded page's baseline.
@@ -247,11 +278,18 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
 
   const sample = async (): Promise<void> => {
     const readIn = epoch;
+    const askedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const { result } = await Runtime.evaluate({
-        expression: buildTurnProgressExpression(),
-        returnByValue: true,
-      });
+      const { result } = await Promise.race([
+        Runtime.evaluate({ expression: buildTurnProgressExpression(), returnByValue: true }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new PageNotAnswering("no answer")), frozenMs);
+          timer.unref?.();
+        }),
+      ]);
+      // The page answered: whatever it shows, it is not frozen.
+      if (readIn === epoch) frozenSince = null;
       const value = result?.value as Partial<TurnProgressSample> | undefined;
       if (reloading || readIn !== epoch || typeof value?.key !== "string" || !value.key) return;
       if (typeof value.url === "string" && conversationIdFromUrl(value.url)) {
@@ -263,8 +301,15 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         baseline = value.key;
         progressed(Date.now());
       }
-    } catch {
-      // A failed read is not a change; the next poll reads again.
+    } catch (error) {
+      // A failed read is not a change; the next poll reads again. A read that never answers
+      // means the renderer stopped: the page is recovered (see recoverFrozen).
+      if (error instanceof PageNotAnswering && !reloading && readIn === epoch) {
+        frozenSince = askedAt;
+        void decide();
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   };
 
@@ -293,8 +338,11 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       const now = Date.now();
       const quiet = now - lastChangeAt;
       let reason: string | null = null;
-      let kind: "stall" | "hidden" = "stall";
-      if (now - stallAnchor >= stallMs * 2 ** stallReloads) {
+      let kind: Trigger["kind"] = "stall";
+      if (frozenSince !== null) {
+        kind = "frozen";
+        reason = formatQuiet(now - frozenSince);
+      } else if (now - stallAnchor >= stallMs * 2 ** stallReloads) {
         reason = `no change for ${formatQuiet(quiet)}`;
       } else if (
         hidden &&
@@ -306,10 +354,17 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         reason = `no change for ${formatQuiet(quiet)}; ${hidden.app}'s approval prompt is hidden in the page`;
       }
       if (!reason) return;
-      const url = await resolveUrl();
+      // A frozen page answers no URL read; its conversation URL comes from the run or earlier reads.
+      const known = options.conversationUrl?.();
+      const url =
+        kind === "frozen"
+          ? known && conversationIdFromUrl(known)
+            ? known
+            : pageConversationUrl
+          : await resolveUrl();
       // The wait may have ended (or a reload begun) while the URL was read.
       if (!waiter || reloading) return;
-      if (!url) {
+      if (!url && kind !== "frozen") {
         // Reloading a page that is not the conversation would lose the turn.
         // Nothing was reloaded, so nothing is counted: the next poll asks again.
         if (!reportedNoUrl.has(kind)) {
@@ -323,13 +378,15 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
       if (kind === "stall") {
         stallReloads += 1;
         stallAnchor = now;
-      } else {
+      } else if (kind === "hidden") {
         hiddenReloads += 1;
       }
-      logger(`[browser] Turn looks stalled (${reason}); reloading the conversation to resync`);
+      if (kind !== "frozen") {
+        logger(`[browser] Turn looks stalled (${reason}); reloading the conversation to resync`);
+      }
       const wake = waiter;
       waiter = null;
-      wake?.({ url, reason });
+      wake?.({ url, reason, kind, since: frozenSince ?? undefined });
     } finally {
       deciding = false;
     }
@@ -344,7 +401,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
    * Reloads the conversation and waits until the new page shows its turns. Every step is bounded
    * by the run's remaining time and stops once `abandoned()` (RunTimeSpent / ReloadAbandoned).
    */
-  const reload = async ({ url }: Trigger, abandoned: () => boolean): Promise<void> => {
+  const reload = async ({ url }: { url: string }, abandoned: () => boolean): Promise<void> => {
     const step = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
       abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
     // A step that fails on its own is skipped with `fallback`; one that ends the reload is not.
@@ -426,6 +483,119 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   };
 
   /**
+   * A page that stopped answering CDP (its renderer runs an endless script): stop its script,
+   * reload it from the browser side, and if it still does not answer, move the run to a new tab
+   * on the conversation URL. Never resubmits and never types. Each step is bounded by its own
+   * limit and by the run's remaining time.
+   */
+  const recoverFrozen = async (trigger: Trigger, abandoned: () => boolean): Promise<void> => {
+    const since = trigger.since ?? Date.now();
+    const said = (what: string) =>
+      logger(
+        `[browser] The page stopped answering (${Math.floor((Date.now() - since) / 1_000)}s); ${what}`,
+      );
+    const step = <T>(what: string, start: () => Promise<T>, capMs: number): Promise<T> =>
+      abandoned() ? Promise.reject(new ReloadAbandoned(what)) : bounded(what, start, capMs);
+    const orElse = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
+      promise.catch((error: unknown) => {
+        if (endsReload(error)) throw error;
+        return fallback;
+      });
+    const answers = (capMs: number) =>
+      orElse(
+        step("asking the page", () => readPage("1").then(() => true), capMs),
+        false,
+      );
+
+    said("stopping its script.");
+    await orElse(
+      step(
+        "Runtime.terminateExecution",
+        () => (Runtime as { terminateExecution: () => Promise<unknown> }).terminateExecution(),
+        TERMINATE_WAIT_MS,
+      ),
+      undefined,
+    );
+    const answeredAfterStop = await answers(PAGE_ANSWER_WAIT_MS);
+    said(
+      answeredAfterStop
+        ? "it answers again after its script was stopped; reloading the conversation."
+        : "reloading it from the browser.",
+    );
+    if (answeredAfterStop && trigger.url) {
+      await reload({ ...trigger, url: trigger.url }, abandoned);
+    } else {
+      try {
+        await step("Page.reload", () => Page.reload({}), PAGE_COMMAND_MS);
+      } catch (reloadError) {
+        if (endsReload(reloadError)) throw reloadError;
+        if (trigger.url) {
+          const url = trigger.url;
+          await orElse(
+            step("Page.navigate", () => Page.navigate({ url }), PAGE_COMMAND_MS),
+            undefined,
+          );
+        }
+      }
+      // Any answer now comes from the reloaded document.
+      const settleBy = Date.now() + settleMs;
+      while (Date.now() < settleBy && !(await answers(Math.max(1, settleBy - Date.now())))) {
+        await idle(250);
+      }
+    }
+    if (await answers(PAGE_ANSWER_WAIT_MS)) {
+      said("it answers again; waiting for the turn again.");
+      return;
+    }
+    if (!trigger.url || !options.replaceTab) {
+      said(
+        "it does not answer after a reload, and no new tab can be opened; waiting on it as it is.",
+      );
+      return;
+    }
+    const url = trigger.url;
+    said("opening the conversation in a new tab.");
+    let tabStepOver = false;
+    const replacement = await orElse(
+      step("opening a new tab", () => options.replaceTab!(url, () => tabStepOver), NEW_TAB_MS),
+      null,
+    ).finally(() => {
+      tabStepOver = true;
+    });
+    if (!replacement) {
+      said("a new tab could not be opened; waiting on the page as it is.");
+      return;
+    }
+    // The new tab's turns: the count holds for three reads in a row.
+    const settleBy = Date.now() + settleMs;
+    let turns = -1;
+    let steady = 0;
+    while (Date.now() < settleBy && steady < 3) {
+      const count = await orElse(
+        step(
+          "counting the turns",
+          () => readPage(buildConversationTurnCountExpression()),
+          Math.max(1, settleBy - Date.now()),
+        ),
+        -1,
+      );
+      const next = typeof count === "number" ? count : -1;
+      steady = next > 0 && next === turns ? steady + 1 : 0;
+      turns = next;
+      await idle(250);
+    }
+    if (replacement.ready) {
+      await orElse(
+        step("readying the new tab", () => Promise.resolve(replacement.ready!()), PAGE_COMMAND_MS),
+        undefined,
+      );
+    }
+    said(
+      `the wait moved to a new tab${replacement.targetId ? ` (target ${replacement.targetId})` : ""}${turns > 0 ? ` with ${turns} turns on the page` : ""}.`,
+    );
+  };
+
+  /**
    * The reload, after any approval click in flight has finished (the gate). Waiting for the gate
    * counts against the run's time too: when it is spent the reload is given up, and if its turn
    * comes later it does nothing.
@@ -433,7 +603,13 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
   const reloadInTurn = async (trigger: Trigger): Promise<void> => {
     let abandoned = false;
     const job = gate.exclusive(() =>
-      abandoned ? Promise.resolve() : reload(trigger, () => abandoned),
+      abandoned
+        ? Promise.resolve()
+        : trigger.kind === "frozen"
+          ? recoverFrozen(trigger, () => abandoned)
+          : trigger.url
+            ? reload({ ...trigger, url: trigger.url }, () => abandoned)
+            : Promise.resolve(),
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const runTime = Number.isFinite(deadline)
@@ -523,6 +699,7 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
           } finally {
             baseline = undefined;
             hidden = null;
+            frozenSince = null;
             epoch += 1;
             reloading = false;
           }

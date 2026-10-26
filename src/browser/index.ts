@@ -69,6 +69,7 @@ import { closeComposerPlusPanel } from "./actions/composerTools.js";
 import { type AppApprovalMonitorOptions, withAppApprovalMonitor } from "./actions/appApprovals.js";
 import { createTurnResync, type TurnResyncAttempt } from "./turnResync.js";
 import { createRunClient, type RunClient } from "./runClient.js";
+import { moveRunToNewTab, type ReplacementTab } from "./tabReplacement.js";
 import { saveAppApprovalDiagnostic } from "./appApprovalDiagnostics.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { browserThinkingCapSteps, enforceThinkingTimeCap } from "./actions/thinkingTimeCap.js";
@@ -2031,6 +2032,65 @@ async function runBrowserModeInternal(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
+    const replaceFrozenTab = async (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> => {
+      const run = runClient;
+      const port = chrome?.port;
+      if (!run || !port) return null;
+      return moveRunToNewTab({
+        runClient: run,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectWithNewTab(port, logger, url, chromeHost, {
+                fallbackToDefault: false,
+                background: config.noFocus,
+              }),
+            async (late) => {
+              await late.client.close().catch(() => undefined);
+              if (late.targetId) await closeTab(port, late.targetId, logger, chromeHost);
+            },
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: async () => {
+              await opened.client.close().catch(() => undefined);
+              if (opened.targetId) await closeTab(port, opened.targetId, logger, chromeHost);
+            },
+          };
+        },
+        retire: (retired) => {
+          const frozenId = isolatedTargetId;
+          const steps: Array<() => Promise<unknown>> = [() => retired.close()];
+          if (ownsTarget && frozenId) {
+            steps.push(() => closeTab(port, frozenId, logger, chromeHost));
+          } else if (frozenId) {
+            logger(
+              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
+            );
+          }
+          return steps;
+        },
+        moved: (opened) => {
+          isolatedTargetId = opened.targetId ?? null;
+          lastTargetId = opened.targetId ?? lastTargetId;
+          ownsTarget = Boolean(opened.targetId);
+          ownedRecoveryTarget =
+            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
+              ? { host: chromeHost, port, targetId: opened.targetId, claimId: targetClaimId }
+              : undefined;
+          void emitRuntimeHint();
+        },
+        ready: () => claimBrowserTarget(Runtime, targetClaimId),
+      });
+    };
     // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
@@ -2043,6 +2103,7 @@ async function runBrowserModeInternal(
         logger,
         conversationUrl: () => lastUrl,
         timeLimit: runClient ?? undefined,
+        replaceTab: replaceFrozenTab,
       });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {
@@ -3687,6 +3748,67 @@ async function runRemoteBrowserMode(
     }
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
+    // A tab whose renderer stopped answering is replaced by a new tab on the conversation
+    // (turnResync.ts): the run moves there and the frozen tab is closed if this run opened it.
+    const replaceFrozenTab = async (
+      url: string,
+      givenUp: () => boolean,
+    ): Promise<ReplacementTab | null> => {
+      const run = runClient;
+      if (!run) return null;
+      return moveRunToNewTab({
+        runClient: run,
+        logger,
+        givenUp,
+        open: async () => {
+          const opened = await cancellation.acquire(
+            () =>
+              connectToRemoteChrome(host, port, logger, url, browserWSEndpoint, {
+                approvalWaitMs: browserWSEndpoint ? config.approvalWaitMs : undefined,
+                fallbackToDefault: false,
+                background: config.noFocus,
+              }),
+            (late) => late.close(),
+          );
+          return {
+            client: cancellation.client(opened.client),
+            targetId: opened.targetId,
+            discard: () => opened.close(),
+            connection: opened,
+          };
+        },
+        retire: (retired) => {
+          const frozenConnection = connection;
+          const frozenId = remoteTargetId;
+          if (ownsTarget && frozenConnection) {
+            return [() => frozenConnection.close({ preserveTarget: false })];
+          }
+          if (frozenId) {
+            logger(
+              `[browser] The frozen tab (target ${frozenId}) was not opened by this run; it is left open.`,
+            );
+          }
+          return [() => retired.close()];
+        },
+        moved: (opened) => {
+          connection = opened.connection;
+          remoteTargetId = opened.targetId ?? null;
+          ownsTarget = Boolean(opened.targetId);
+          ownedRecoveryTarget =
+            opened.targetId && (!config.keepBrowser || options.closeOwnedTabOnComplete)
+              ? {
+                  host,
+                  port,
+                  targetId: opened.targetId,
+                  browserWSEndpoint,
+                  claimId: targetClaimId,
+                }
+              : undefined;
+          void emitRuntimeHint();
+        },
+        ready: () => claimBrowserTarget(Runtime, targetClaimId),
+      });
+    };
     // The response wait reloads a turn that looks stalled (or whose approval prompt is hidden in
     // the page) and waits again on the reloaded page; see turnResync.ts.
     const waitWithThinkingMonitor = async <T>(
@@ -3699,6 +3821,7 @@ async function runRemoteBrowserMode(
         logger,
         conversationUrl: () => lastUrl,
         timeLimit: runClient ?? undefined,
+        replaceTab: replaceFrozenTab,
       });
       stopThinkingMonitor?.();
       stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, {

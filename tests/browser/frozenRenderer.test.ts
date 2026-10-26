@@ -5,6 +5,7 @@ import {
   withAppApprovalMonitor,
 } from "../../src/browser/actions/appApprovals.js";
 import { createRunClient, RunTimeExpiredError } from "../../src/browser/runClient.js";
+import { moveRunToNewTab } from "../../src/browser/tabReplacement.js";
 import { createTurnResync } from "../../src/browser/turnResync.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 
@@ -282,5 +283,196 @@ describe("a frozen approval check", () => {
     const calls = evaluate.mock.calls.length;
     await vi.advanceTimersByTimeAsync(120_000);
     expect(evaluate.mock.calls.length).toBe(calls);
+  });
+});
+
+describe("a page that stops answering while the answer is awaited", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("(d) a hung page is stopped, reloaded, then replaced by a new tab: the wait and the approval check go on there and the answer is captured from it", async () => {
+    const answerText = "The check passed: CODEXish read the file and found 42 lines.";
+    // Tab A runs the turn; then its renderer stops and nothing it is asked answers again.
+    let frozen = false;
+    const evaluateA = vi.fn(
+      async ({ expression, awaitPromise }: { expression: string; awaitPromise?: boolean }) => {
+        if (frozen || awaitPromise) return never();
+        if (expression.includes("readTurnProgress")) {
+          return {
+            result: { value: { key: `running:${Date.now()}`, length: 9, url: CONVERSATION } },
+          };
+        }
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          return { result: { value: { cards: [], skipped: [], hidden: [] } } };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          return { result: { value: { text: "Running command", messageId: "m5", turnIndex: 5 } } };
+        }
+        if (expression.includes("isStopControlVisible")) return { result: { value: true } };
+        return { result: { value: null } };
+      },
+    );
+    const tabA = {
+      Runtime: { evaluate: evaluateA, terminateExecution: vi.fn(never) },
+      Page: { reload: vi.fn(never), navigate: vi.fn(never) },
+      Input: { dispatchMouseEvent: vi.fn(async () => ({})) },
+      close: vi.fn(async () => {}),
+    };
+    // Tab B shows the same turn waiting on an approval; once it is approved, the answer comes.
+    let approved = false;
+    const card = {
+      key: "codexish",
+      app: "CODEXish",
+      title: "CODEXish",
+      toolText: "Allow ChatGPT to use CODEXish? ChatGPT will call CODEXish's Fs Read tool.",
+      button: { label: "Always allow", rank: 0, index: 0 },
+      subject: 0,
+      id: "pageB:1",
+    };
+    const evaluateB = vi.fn(
+      async ({
+        expression,
+        awaitPromise,
+      }: {
+        expression: string;
+        awaitPromise?: boolean;
+      }): Promise<{ result: { value: unknown } }> => {
+        if (awaitPromise) return never();
+        if (expression.includes("readTurnProgress")) {
+          return {
+            result: { value: { key: approved ? "done" : "waiting", length: 9, url: CONVERSATION } },
+          };
+        }
+        if (expression.includes("window.__oracleApprovalButtons = {")) {
+          return { result: { value: { cards: approved ? [] : [card], skipped: [], hidden: [] } } };
+        }
+        if (expression.includes("'settling'")) {
+          return { result: { value: { status: "ready", x: 50, y: 60 } } };
+        }
+        if (expression.includes("__oracleTrustedClickGuards ??=")) {
+          return { result: { value: { ready: true, contextMatches: true } } };
+        }
+        if (expression.includes("const summary = { reached")) {
+          approved = true;
+          return { result: { value: { reached: true, blocked: null } } };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          const text = approved ? answerText : "Used CODEXish integration. Running command";
+          return { result: { value: { text, messageId: "m5", turnIndex: 5 } } };
+        }
+        if (expression.includes("Find the LAST assistant turn")) {
+          return { result: { value: approved } };
+        }
+        if (expression.includes("isStopControlVisible")) return { result: { value: !approved } };
+        if (expression.includes("readThinkingActivity")) {
+          return { result: { value: { active: false, strong: false } } };
+        }
+        if (expression === "1") return { result: { value: 1 } };
+        if (expression.endsWith(").length")) return { result: { value: 6 } };
+        return { result: { value: null } };
+      },
+    );
+    const tabB = {
+      Runtime: { evaluate: evaluateB, terminateExecution: vi.fn(async () => ({})) },
+      Page: { reload: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+      Input: { dispatchMouseEvent: vi.fn(async () => ({})) },
+      close: vi.fn(async () => {}),
+    };
+    const runClient = createRunClient(tabA as unknown as ChromeClient);
+    const { Runtime, Page, Input } = runClient.client;
+    const logger = quietLogger();
+    const opened: string[] = [];
+    const resync = createTurnResync({
+      Runtime,
+      Page,
+      logger,
+      conversationUrl: () => CONVERSATION,
+      timeLimit: runClient,
+      replaceTab: (url, givenUp) =>
+        moveRunToNewTab({
+          runClient,
+          logger,
+          givenUp,
+          open: async () => {
+            opened.push(url);
+            return {
+              client: tabB as unknown as ChromeClient,
+              targetId: "TAB-B",
+              discard: async () => {},
+            };
+          },
+          retire: (retired) => [() => retired.close()],
+          moved: () => {},
+        }),
+    });
+    const runMs = 30 * 60_000;
+    const box = track(
+      withAppApprovalMonitor(
+        Runtime,
+        Input,
+        {
+          allowApps: ["CODEXish"],
+          logger,
+          gate: resync.gate,
+          deadline: () => resync.deadlineAt(),
+        },
+        () =>
+          resync.run(
+            (attempt) =>
+              waitForAssistantResponse(
+                Runtime,
+                attempt.remainingMs(runMs),
+                logger,
+                5,
+                undefined,
+                attempt.signal,
+              ),
+            { timeoutMs: runMs },
+          ),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    frozen = true;
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    expect(box.state).toBe("resolved");
+    expect((box.value as { text: string }).text).toBe(answerText);
+    // The ladder: its script stopped, a browser-side reload, then the new tab.
+    expect(tabA.Runtime.terminateExecution).toHaveBeenCalled();
+    expect(tabA.Page.reload).toHaveBeenCalled();
+    expect(opened).toEqual([CONVERSATION]);
+    expect(tabA.close).toHaveBeenCalled();
+    // The approval was clicked on the new tab; the frozen one was never clicked.
+    expect(tabB.Input.dispatchMouseEvent).toHaveBeenCalled();
+    expect(tabA.Input.dispatchMouseEvent).not.toHaveBeenCalled();
+    const lines = logger.mock.calls.map(([line]) => String(line));
+    const steps = lines.filter((line) => line.startsWith("[browser] The page stopped answering"));
+    expect(steps[0]).toMatch(/\(\d+s\); stopping its script\.$/);
+    expect(steps.some((line) => line.endsWith("reloading it from the browser."))).toBe(true);
+    expect(steps.some((line) => line.endsWith("opening the conversation in a new tab."))).toBe(
+      true,
+    );
+    expect(steps.at(-1)).toMatch(
+      /the wait moved to a new tab \(target TAB-B\) with 6 turns on the page\.$/,
+    );
+  });
+
+  test("every turn resync of a run and of both reattach paths can move the wait to a new tab", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const sources: Array<[string, number]> = [
+      ["src/browser/index.ts", 2],
+      ["src/browser/reattach.ts", 2],
+    ];
+    for (const [file, sites] of sources) {
+      const source = await readFile(new URL(`../../${file}`, import.meta.url), "utf8");
+      const blocks = source.split("createTurnResync({").slice(1);
+      expect(blocks).toHaveLength(sites);
+      for (const block of blocks) {
+        expect(block.slice(0, block.indexOf("});"))).toContain("replaceTab: replaceFrozenTab");
+      }
+    }
   });
 });

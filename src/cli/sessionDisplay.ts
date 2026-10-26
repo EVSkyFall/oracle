@@ -378,6 +378,20 @@ export async function attachSession(
               .updateSession(sessionId, { browser: { ...browserMetadata, runtime: knownRuntime } })
               .catch(() => undefined);
           },
+          // The wait moved to a new tab (the old one stopped answering): the runtime follows it.
+          onTargetMoved: async (moved) => {
+            if (!knownRuntime) return;
+            knownRuntime = {
+              ...knownRuntime,
+              chromeTargetId: moved.chromeTargetId,
+              ...(moved.ownedRecoveryTarget
+                ? { ownedRecoveryTarget: moved.ownedRecoveryTarget }
+                : {}),
+            };
+            await sessionStore
+              .updateSession(sessionId, { browser: { ...browserMetadata, runtime: knownRuntime } })
+              .catch(() => undefined);
+          },
         },
       );
       await logWrites;
@@ -414,7 +428,7 @@ export async function attachSession(
         browser: {
           config: metadata.browser?.config,
           runtime: withAppApprovals(
-            { ...runtime, appApprovals: result.appApprovals },
+            { ...(knownRuntime ?? runtime), appApprovals: result.appApprovals },
             knownRuntime,
           ),
           modelSelection: metadata.browser?.modelSelection,
