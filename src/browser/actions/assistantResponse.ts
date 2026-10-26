@@ -991,7 +991,7 @@ function buildStopButtonVisibilityExpression(): string {
   })()`;
 }
 
-function buildStopButtonVisibilityPredicateJs(fnName: string): string {
+export function buildStopButtonVisibilityPredicateJs(fnName: string): string {
   const selectorLiteral = JSON.stringify(STOP_CONTROL_SELECTOR);
   return `const ${fnName} = () => {
     const isVisible = (node) => {

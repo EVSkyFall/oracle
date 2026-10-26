@@ -3,7 +3,7 @@ import type { ChromeClient } from "./types.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { promptAppearsInText } from "./promptMatch.js";
 
-const USER_TURN_SELECTOR =
+export const USER_TURN_SELECTOR =
   ':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])';
 
 export function browserPromptFingerprint(value: unknown, messageId: string): string {

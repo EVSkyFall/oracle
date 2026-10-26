@@ -3,8 +3,8 @@ import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import { conversationIdFromUrl } from "./actions/navigation.js";
 import {
   createInterruptedBannerTracker,
+  buildInterruptedBannerExpression,
   INTERRUPTED_BANNER_REASON,
-  readInterruptedBanner,
   readInterruptedBannerDiagnostic,
   type InterruptedBannerDiagnostic,
 } from "./interruptedBanner.js";
@@ -105,7 +105,7 @@ export function buildTurnProgressExpression(): string {
   return `((sample) => {
     let banner = null;
     try {
-      banner = (${readInterruptedBanner.toString()})(document);
+      banner = ${buildInterruptedBannerExpression()};
     } catch {}
     return { ...sample, interrupted: banner ? banner.text : null };
   })((${readTurnProgress.toString()})(document))`;
@@ -459,24 +459,31 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
     hiddenReloads = 0;
   };
 
-  const diagnoseBanner = async (): Promise<void> => {
+  // The banner's diagnostic: on its first sighting, and else before a stall or banner reload
+  // while none was saved, whenever its words are visible anywhere (message bodies included). It
+  // only records; it never decides a reload. The caller keeps one per run.
+  let bannerDiagnosed = false;
+  const diagnoseBanner = async (reason: string): Promise<void> => {
     const save = options.saveInterruptedBannerDiagnostic;
-    if (!save) return;
+    if (!save || bannerDiagnosed) return;
     try {
       const diagnostic = await readInterruptedBannerDiagnostic(
         (expression) =>
           bounded("reading the banner", () => readPageWith(Runtime, expression), PAGE_COMMAND_MS),
-        INTERRUPTED_BANNER_REASON,
+        reason,
       );
+      if (!diagnostic || bannerDiagnosed) return;
+      bannerDiagnosed = true;
       const saved = await save(diagnostic);
       if (saved) logger(`[browser] "Connection interrupted" diagnostic saved: ${saved}`);
     } catch (error) {
+      if (endsReload(error)) return;
       logger(`[browser] "Connection interrupted" diagnostic could not be saved: ${message(error)}`);
     }
   };
 
   const noteBanner = (text: string | null) => {
-    if (banner.note(text)) void diagnoseBanner();
+    if (banner.note(text)) void diagnoseBanner(INTERRUPTED_BANNER_REASON);
     if (banner.due()) void decide();
   };
 
@@ -553,10 +560,14 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
         // An explicit sign that the page lost the stream: no quiet time is waited for.
         kind = "banner";
         reason = INTERRUPTED_BANNER_REASON;
-      } else if (options.frozenOnly || banner.active()) {
-        // only a page that stops answering is recovered; while the banner shows, its own backoff
-        // decides (a stall reload would only reload the same page again)
-      } else if (now - stallAnchor >= stallMs * 2 ** stallReloads) {
+      } else if (options.frozenOnly) {
+        // only a page that stops answering is recovered
+      } else if (
+        // While the banner shows (or its own reload was not read yet), its backoff decides: a
+        // stall reload would only reload the same page again.
+        !banner.active() &&
+        now - stallAnchor >= stallMs * 2 ** stallReloads
+      ) {
         reason = `no change for ${formatQuiet(quiet)}`;
       } else if (
         hidden &&
@@ -730,15 +741,23 @@ export function createTurnResync(options: TurnResyncOptions): TurnResync {
    */
   const reloadInTurn = async (trigger: Trigger): Promise<void> => {
     let abandoned = false;
-    const job = gate.exclusive(() =>
-      abandoned
-        ? Promise.resolve()
-        : trigger.kind === "frozen"
-          ? recoverFrozen(trigger, () => abandoned)
-          : trigger.url
-            ? reload({ ...trigger, url: trigger.url }, () => abandoned)
-            : Promise.resolve(),
-    );
+    const job = gate.exclusive(async () => {
+      if (abandoned) return;
+      if (trigger.kind === "frozen") {
+        await recoverFrozen(trigger, () => abandoned);
+        return;
+      }
+      if (!trigger.url) return;
+      if (trigger.kind === "stall" || trigger.kind === "banner") {
+        await diagnoseBanner(
+          trigger.kind === "banner"
+            ? INTERRUPTED_BANNER_REASON
+            : `Before a stall reload (${trigger.reason})`,
+        );
+        if (abandoned) return;
+      }
+      await reload({ ...trigger, url: trigger.url }, () => abandoned);
+    });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const runTime = Number.isFinite(deadline)
       ? new Promise<never>((_, reject) => {

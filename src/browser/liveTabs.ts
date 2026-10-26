@@ -830,7 +830,7 @@ export async function reloadChatGptTab(
 export async function readChatGptTabBannerDiagnostic(
   options: LiveChromeEndpoint & { targetId: string },
   reason: string,
-): Promise<InterruptedBannerDiagnostic> {
+): Promise<InterruptedBannerDiagnostic | null> {
   const client = await connectToTarget(options, options.targetId);
   try {
     return await readInterruptedBannerDiagnostic(async (expression) => {

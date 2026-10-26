@@ -594,7 +594,9 @@ export async function liveTailSessionBrowserOutput(
         { ...endpoint, targetId: harvested.targetId },
         INTERRUPTED_BANNER_REASON,
       )
-        .then((diagnostic) => saveInterruptedBannerDiagnostic(sessionId, diagnostic))
+        .then((diagnostic) =>
+          diagnostic ? saveInterruptedBannerDiagnostic(sessionId, diagnostic) : undefined,
+        )
         .then((path) => {
           if (path) log(`[browser] "Connection interrupted" diagnostic saved: ${path}`);
         })

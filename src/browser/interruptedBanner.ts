@@ -1,6 +1,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { buildStopButtonVisibilityPredicateJs } from "./actions/assistantResponse.js";
 import { resolveSessionArtifactsDir } from "./artifacts.js";
+import {
+  APPROVAL_CARD_SELECTOR,
+  ARGUMENTS_SELECTOR,
+  DIALOG_SELECTOR,
+  EDITABLE_SELECTOR,
+  PAGE_CHROME_SELECTOR,
+  PANEL_SELECTOR,
+  PROSE_SELECTOR,
+  USER_MESSAGE_SELECTOR,
+} from "./pageSurfaces.js";
+import { USER_TURN_SELECTOR } from "./promptFingerprint.js";
 
 /**
  * ChatGPT's "Connection interrupted. Waiting for the complete answer" banner: the page lost the
@@ -36,7 +48,7 @@ export interface InterruptedBannerTracker {
   note(text: string | null, now?: number): boolean;
   /** A reload for it is due: two reads in a row showed it and its backoff has passed. */
   due(now?: number): boolean;
-  /** It is being answered: shown on the last read, or reloaded for and not gone for long. */
+  /** It is shown, or its own reload has not been read yet: a stall reload waits meanwhile. */
   active(): boolean;
   /** A reload for it begins; its log line (the n-th since the banner was last gone). */
   reloading(): string;
@@ -55,7 +67,11 @@ export function createInterruptedBannerTracker(): InterruptedBannerTracker {
       if (!text) {
         reads = 0;
         goneSince ??= now;
-        if (now - goneSince >= BANNER_GONE_MS) reloads = 0;
+        if (now - goneSince >= BANNER_GONE_MS) {
+          // A banner that comes back after that is a new one: reloaded at once.
+          reloads = 0;
+          notBefore = 0;
+        }
         return false;
       }
       goneSince = null;
@@ -68,7 +84,7 @@ export function createInterruptedBannerTracker(): InterruptedBannerTracker {
       return reads >= BANNER_READS && now >= notBefore;
     },
     active() {
-      return reads > 0 || reloads > 0;
+      return reads > 0 || (reloads > 0 && goneSince === null);
     },
     reloading() {
       reloads += 1;
@@ -84,43 +100,71 @@ export function createInterruptedBannerTracker(): InterruptedBannerTracker {
   };
 }
 
-/**
- * Page function: the banner when it is shown. Its text ("Connection interrupted" or "Waiting for
- * the complete answer", any case, whitespace folded) counts only on a visible element outside
- * anything a user or the model wrote: user messages, the answer's Markdown/prose, reasoning
- * panels, code, quotes and editors. A screen-reader-only copy (1 px) is not shown. With
- * `withNode`, the element holding the text is returned too. Injected into the page with
- * Function.prototype.toString, so it stays free of imports and closures.
- */
-export function readInterruptedBanner(
-  doc: Document,
-  withNode = false,
-): { text: string; node?: Element } | null {
-  const PHRASES = ["connection interrupted", "waiting for the complete answer"];
-  const CANDIDATE = /interrupted|waiting for the|complete answer/i;
-  const CONTENT = [
-    ':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"], [data-turn="user"])',
-    "[data-user-message-bubble]",
-    ".markdown",
-    '[class*="markdown"]',
-    ".prose",
-    '[class*="MarkdownRoot"]',
-    '[data-testid*="thinking"]',
-    '[data-testid*="reasoning"]',
-    "pre",
-    "code",
-    "blockquote",
-    '[contenteditable="true"]',
-    '[contenteditable=""]',
-    '[contenteditable="plaintext-only"]',
-    '[role="textbox"]',
-    "textarea",
+/** Where on the page the banner may count, as selectors (see readInterruptedBanner). */
+export interface InterruptedBannerSurfaces {
+  /** The conversation thread. */
+  thread: string;
+  /** User turns: the banner belongs below the latest one. */
+  user: string;
+  /** What a user or the model wrote. */
+  body: string;
+  /** Never the banner: those, editors, and surfaces whose text stays across reloads. */
+  excluded: string;
+}
+
+const MESSAGE_BODY_SELECTOR = [
+  USER_TURN_SELECTOR,
+  USER_MESSAGE_SELECTOR,
+  "[data-user-message-bubble]",
+  PROSE_SELECTOR,
+  '[class*="MarkdownRoot"]',
+  PANEL_SELECTOR,
+  ARGUMENTS_SELECTOR,
+  "blockquote",
+].join(", ");
+
+export const INTERRUPTED_BANNER_SURFACES: InterruptedBannerSurfaces = {
+  thread: "main",
+  user: `${USER_TURN_SELECTOR}, ${USER_MESSAGE_SELECTOR}`,
+  body: MESSAGE_BODY_SELECTOR,
+  excluded: [
+    MESSAGE_BODY_SELECTOR,
+    // Page chrome (a conversation titled "Connection interrupted"), approval cards and dialogs,
+    // activity rows and disclosures: their text stays across reloads.
+    PAGE_CHROME_SELECTOR,
+    '[role="navigation"]',
+    DIALOG_SELECTOR,
+    APPROVAL_CARD_SELECTOR,
+    "details",
+    "summary",
+    "[aria-expanded]",
+    EDITABLE_SELECTOR,
     "input",
     "script",
     "style",
     "noscript",
     "template",
-  ].join(", ");
+  ].join(", "),
+};
+
+/**
+ * Page function: the banner when it is shown. Its words ("Connection interrupted" or "Waiting for
+ * the complete answer", any case, whitespace folded) open the text of a small visible element
+ * (a sentence that mentions or quotes them is not the banner) that sits in the conversation
+ * thread below the latest user turn, the turn the banner belongs to, and outside anything a user
+ * or the model wrote (user turns, Markdown/prose, reasoning panels, code, quotes), editors, and
+ * surfaces whose text stays across reloads (sidebar and header, approval cards and dialogs,
+ * activity rows and disclosures). A screen-reader-only copy (1 px) is not shown. With
+ * `withNode`, the element holding the words is returned too. Injected into the page with
+ * Function.prototype.toString, so it stays free of imports and closures.
+ */
+export function readInterruptedBanner(
+  doc: Document,
+  surfaces: InterruptedBannerSurfaces,
+  withNode = false,
+): { text: string; node?: Element } | null {
+  const PHRASES = ["connection interrupted", "waiting for the complete answer"];
+  const CANDIDATE = /interrupted|waiting for the|complete answer/i;
   const fold = (value: unknown) =>
     String(value ?? "")
       .toLowerCase()
@@ -135,30 +179,88 @@ export function readInterruptedBanner(
       check.call(node, { visibilityProperty: true, opacityProperty: true })
     );
   };
+  const root = doc.querySelector(surfaces.thread);
+  if (!root || typeof doc.createTreeWalker !== "function") return null;
+  const users = root.querySelectorAll(surfaces.user);
+  const latestUser = users.length > 0 ? users[users.length - 1]! : null;
+  if (!latestUser) return null;
+  // 4: Node.DOCUMENT_POSITION_FOLLOWING
+  const below = (node: Node) =>
+    !latestUser.contains(node) && (latestUser.compareDocumentPosition(node) & 4) !== 0;
+  // 4: NodeFilter.SHOW_TEXT
+  const walker = doc.createTreeWalker(root, 4);
+  for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+    if (!CANDIDATE.test(String((text as Text).data ?? ""))) continue;
+    const parent = text.parentElement;
+    if (!parent || !below(parent) || parent.closest(surfaces.excluded) || !shown(parent)) continue;
+    // The smallest element around it that holds a whole phrase (it can be split over elements).
+    let holder: Element | null = parent;
+    for (
+      let depth = 0;
+      holder && holder !== root && depth < 4;
+      depth += 1, holder = holder.parentElement
+    ) {
+      if (
+        holder !== parent &&
+        (holder.contains(latestUser) || holder.querySelector(surfaces.excluded))
+      ) {
+        break;
+      }
+      const folded = fold(holder.textContent);
+      if (folded.length > 300) break;
+      const at = PHRASES.map((phrase) => folded.indexOf(phrase))
+        .filter((index) => index >= 0)
+        .sort((a, b) => a - b)[0];
+      if (at === undefined) continue;
+      // The banner's words open its text; a few characters (an icon's label) may come first.
+      const lead = folded.slice(0, at);
+      if (lead.length > 15 || /["'“”‘’«»([]\s*$/.test(lead)) break;
+      return withNode ? { text: folded, node: holder } : { text: folded };
+    }
+  }
+  return null;
+}
+
+/**
+ * Page function: the first visible element anywhere in the page whose text holds one of the
+ * banner's phrases, message bodies included. Only for the diagnostic: it never decides a reload.
+ */
+export function findInterruptedPhrase(doc: Document): { node: Element; phrase: string } | null {
+  const PHRASES = ["connection interrupted", "waiting for the complete answer"];
+  const CANDIDATE = /interrupted|waiting for the|complete answer/i;
+  const fold = (value: unknown) =>
+    String(value ?? "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  const shown = (node: Element) => {
+    const rect = node.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const check = (node as { checkVisibility?: (options: object) => boolean }).checkVisibility;
+    return (
+      typeof check !== "function" ||
+      check.call(node, { visibilityProperty: true, opacityProperty: true })
+    );
+  };
   const body = doc.body;
   if (!body || typeof doc.createTreeWalker !== "function") return null;
-  // 4: NodeFilter.SHOW_TEXT
   const walker = doc.createTreeWalker(body, 4);
   for (let text = walker.nextNode(); text; text = walker.nextNode()) {
     if (!CANDIDATE.test(String((text as Text).data ?? ""))) continue;
     const parent = text.parentElement;
-    if (!parent || parent.closest(CONTENT) || !shown(parent)) continue;
-    // The smallest element around it that holds a whole phrase (it can be split over elements).
+    if (!parent || parent.closest("script, style, noscript, template") || !shown(parent)) continue;
     let holder: Element | null = parent;
     for (let depth = 0; holder && depth < 4; depth += 1, holder = holder.parentElement) {
-      if (holder !== parent && holder.querySelector(CONTENT)) break;
       const folded = fold(holder.textContent);
-      if (folded.length > 300) break;
-      if (PHRASES.some((phrase) => folded.includes(phrase))) {
-        return withNode ? { text: folded, node: holder } : { text: folded };
-      }
+      const phrase = PHRASES.find((candidate) => folded.includes(candidate));
+      if (phrase) return { node: holder, phrase };
     }
   }
   return null;
 }
 
 export function buildInterruptedBannerExpression(): string {
-  return `((found) => found ? { text: found.text } : null)((${readInterruptedBanner.toString()})(document))`;
+  return `((found) => found ? { text: found.text } : null)((${readInterruptedBanner.toString()})(document, ${JSON.stringify(INTERRUPTED_BANNER_SURFACES)}))`;
 }
 
 const DIAGNOSTIC_HTML_CHARS = 30_000;
@@ -177,37 +279,54 @@ interface DiagnosticNode {
 
 export interface InterruptedBannerDiagnosticPage {
   url: string;
-  /** The banner's text as matched (folded). */
+  /**
+   * The banner's text (folded); for words found inside a message, only the phrase, never the
+   * message's text.
+   */
   text: string;
+  /** Whether the reload rule counts it as the banner (readInterruptedBanner). */
+  detected: boolean;
+  /** Whether it sits inside what a user or the model wrote. */
+  insideMessageBody: boolean;
   /** The element holding the text, cut at about 30 KB. */
   bannerHtml: string;
   bannerHtmlLength: number;
-  /** Up to three levels around it that hold no message, editor or main area, cut likewise. */
+  /** For the banner, up to three levels around it that hold no message, editor or main area. */
   html: string;
   htmlLength: number;
-  /** The banner element and its ancestors up to body. */
+  /** The element and its ancestors up to body: tags, ids, classes, roles, test ids. */
   ancestors: DiagnosticNode[];
-  /** True when the markup was not saved because it held a message, an editor or the main area. */
+  /** True when the markup was not saved: it held or sat in a message, an editor or the main area. */
   withheld: boolean;
+  /** The run's own stop-control check. */
   stopVisible: boolean;
 }
 
 export interface InterruptedBannerDiagnostic {
   reason: string;
   capturedAt: string;
-  /** Null when the banner was gone before it could be read. */
+  /** Null when no phrase was shown when it was read. */
   page: InterruptedBannerDiagnosticPage | null;
 }
 
-/** Reads the diagnostic of the banner shown now (null when none is shown). */
+/**
+ * Reads the diagnostic of the banner shown now, or else of the banner's words wherever they are
+ * visible (message bodies included, their text withheld); null when neither is shown.
+ */
 export function buildInterruptedBannerDiagnosticExpression(): string {
   return `(() => {
-    const found = (${readInterruptedBanner.toString()})(document, true);
+    const surfaces = ${JSON.stringify(INTERRUPTED_BANNER_SURFACES)};
+    const detected = (${readInterruptedBanner.toString()})(document, surfaces, true);
+    const found = detected && detected.node
+      ? { node: detected.node, phrase: null }
+      : (${findInterruptedPhrase.toString()})(document);
     if (!found || !found.node) return null;
+    const node = found.node;
     const WIDE = ${JSON.stringify(DIAGNOSTIC_WIDE_SELECTOR)};
     const LIMIT = ${DIAGNOSTIC_HTML_CHARS};
+    ${buildStopButtonVisibilityPredicateJs("isStopControlVisible")}
     const ancestors = [];
-    for (let current = found.node; current; current = current.parentElement) {
+    for (let current = node; current; current = current.parentElement) {
       ancestors.push({
         tag: String(current.tagName || '').toLowerCase(),
         id: current.getAttribute('id') || '',
@@ -218,28 +337,35 @@ export function buildInterruptedBannerDiagnosticExpression(): string {
       });
       if (current === document.body) break;
     }
-    const wide = (node) => node.matches('html, body') || node.matches(WIDE) || Boolean(node.querySelector(WIDE));
-    let subject = found.node;
-    for (let depth = 0; depth < 3; depth += 1) {
+    const insideMessageBody = Boolean(node.closest(surfaces.body));
+    const wide = (element) => element.matches('html, body') || element.matches(WIDE) || Boolean(element.querySelector(WIDE));
+    const withheld = insideMessageBody || wide(node);
+    // Around the banner only: the words found elsewhere (a sidebar list, say) are saved alone.
+    let subject = node;
+    for (let depth = 0; detected && depth < 3; depth += 1) {
       const up = subject.parentElement;
       if (!up || wide(up)) break;
       subject = up;
     }
-    const withheld = wide(found.node);
-    const html = withheld ? '' : String(subject.outerHTML || '');
-    const bannerHtml = withheld ? '' : String(found.node.outerHTML || '');
-    const stop = document.querySelector('[data-testid="stop-button"]');
-    const stopRect = stop && stop.getBoundingClientRect ? stop.getBoundingClientRect() : null;
+    const html = withheld || !detected ? '' : String(subject.outerHTML || '');
+    const bannerHtml = withheld ? '' : String(node.outerHTML || '');
+    const text = detected
+      ? detected.text
+      : insideMessageBody
+        ? found.phrase
+        : String(node.textContent || '').toLowerCase().replace(/\\s+/g, ' ').trim().slice(0, 300);
     return {
       url: location.href,
-      text: found.text,
+      text,
+      detected: Boolean(detected),
+      insideMessageBody,
       bannerHtml: bannerHtml.slice(0, LIMIT),
       bannerHtmlLength: bannerHtml.length,
       html: html.slice(0, LIMIT),
       htmlLength: html.length,
       ancestors,
       withheld,
-      stopVisible: Boolean(stopRect && stopRect.width > 0 && stopRect.height > 0),
+      stopVisible: isStopControlVisible(),
     };
   })()`;
 }
@@ -266,16 +392,16 @@ export function renderInterruptedBannerDiagnostic(diagnostic: InterruptedBannerD
     '<html><head><meta charset="utf-8"><title>Oracle "Connection interrupted" diagnostic</title></head><body>',
     `<h1>${escapeHtml(diagnostic.reason)}</h1>`,
     `<p>Captured ${escapeHtml(diagnostic.capturedAt)}${page ? ` on ${escapeHtml(page.url)}` : ""}.</p>`,
-    page ? "" : "<p>The banner was gone before it could be read.</p>",
+    page ? "" : "<p>The banner's words were not shown when the page was read.</p>",
     page
-      ? `<p>Matched text: ${escapeHtml(page.text)}. Stop button shown: ${page.stopVisible ? "yes" : "no"}.</p>`
+      ? `<p>Matched text: ${escapeHtml(page.text)}. Counted as the banner: ${page.detected ? "yes" : "no"}. Inside a message: ${page.insideMessageBody ? "yes" : "no"}. Stop button shown: ${page.stopVisible ? "yes" : "no"}.</p>`
       : "",
     page?.withheld
-      ? "<p>The element held a message, an editor or the main area, so its markup was not saved.</p>"
+      ? "<p>The element held or sat in a message, an editor or the main area, so its markup was not saved.</p>"
       : "",
-    "<h2>Ancestors (the banner first, up to body)</h2>",
+    "<h2>Ancestors (the element first, up to body)</h2>",
     `<pre>${escapeHtml(ancestors.join("\n"))}</pre>`,
-    `<h2>Banner outerHTML (${page?.bannerHtmlLength ?? 0} characters${cut(page?.bannerHtml.length ?? 0, page?.bannerHtmlLength ?? 0)})</h2>`,
+    `<h2>Element outerHTML (${page?.bannerHtmlLength ?? 0} characters${cut(page?.bannerHtml.length ?? 0, page?.bannerHtmlLength ?? 0)})</h2>`,
     `<pre>${escapeHtml(page?.bannerHtml ?? "")}</pre>`,
     `<h2>Surroundings outerHTML (${page?.htmlLength ?? 0} characters${cut(page?.html.length ?? 0, page?.htmlLength ?? 0)})</h2>`,
     `<pre>${escapeHtml(page?.html ?? "")}</pre>`,
@@ -315,19 +441,16 @@ export async function saveInterruptedBannerDiagnostic(
 }
 
 /**
- * Reads the shown banner's diagnostic through `evaluate`; a page that cannot be read gives a
- * diagnostic without a page.
+ * Reads the banner's diagnostic through `evaluate`; null when the page shows none of its words
+ * (or cannot be read).
  */
 export async function readInterruptedBannerDiagnostic(
   evaluate: (expression: string) => Promise<unknown>,
   reason: string,
-): Promise<InterruptedBannerDiagnostic> {
+): Promise<InterruptedBannerDiagnostic | null> {
   const page = (await evaluate(buildInterruptedBannerDiagnosticExpression()).catch(
     () => null,
   )) as InterruptedBannerDiagnosticPage | null;
-  return {
-    reason,
-    capturedAt: new Date().toISOString(),
-    page: page && typeof page === "object" ? page : null,
-  };
+  if (!page || typeof page !== "object") return null;
+  return { reason, capturedAt: new Date().toISOString(), page };
 }

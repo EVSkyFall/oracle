@@ -17,7 +17,11 @@ const BANNER = "connection interrupted. waiting for the complete answer";
  * A ChatGPT tab whose progress read reports the banner as `page.banner` says; the thread itself
  * never changes. Reloads are recorded with their time, and `onLoad` runs on each.
  */
-function bannerTab(page: { banner: string | null }, onLoad: (load: number) => void = () => {}) {
+function bannerTab(
+  // wordsInAnswer: the banner's words show inside the answer's Markdown, where they never count.
+  page: { banner: string | null; wordsInAnswer?: boolean },
+  onLoad: (load: number) => void = () => {},
+) {
   let mark: string | null = null;
   const reloads: number[] = [];
   const Runtime = {
@@ -36,6 +40,8 @@ function bannerTab(page: { banner: string | null }, onLoad: (load: number) => vo
               ? {
                   url: CONVERSATION,
                   text: page.banner,
+                  detected: true,
+                  insideMessageBody: false,
                   bannerHtml: "<span>Connection interrupted</span>",
                   bannerHtmlLength: 35,
                   html: "",
@@ -44,7 +50,23 @@ function bannerTab(page: { banner: string | null }, onLoad: (load: number) => vo
                   withheld: false,
                   stopVisible: true,
                 }
-              : null,
+              : page.wordsInAnswer
+                ? {
+                    url: CONVERSATION,
+                    text: "connection interrupted",
+                    detected: false,
+                    insideMessageBody: true,
+                    bannerHtml: "",
+                    bannerHtmlLength: 0,
+                    html: "",
+                    htmlLength: 0,
+                    ancestors: [
+                      { tag: "p", id: "", className: "", role: "", testId: "", ariaLive: "" },
+                    ],
+                    withheld: true,
+                    stopVisible: true,
+                  }
+                : null,
           },
         };
       }
@@ -90,7 +112,7 @@ describe('the turn resync and the "Connection interrupted" banner', () => {
   });
 
   function start(
-    page: { banner: string | null },
+    page: { banner: string | null; wordsInAnswer?: boolean },
     onLoad?: (load: number) => void,
     extra: { frozenOnly?: boolean } = {},
   ) {
@@ -111,7 +133,7 @@ describe('the turn resync and the "Connection interrupted" banner', () => {
     const startedAt = Date.now();
     void resync.run(waitUntilAborted).catch(() => undefined);
     const since = () => tab.reloads.map((at) => at - startedAt);
-    return { tab, logger, saved, since };
+    return { tab, logger, saved, since, resync };
   }
 
   test("the banner on a generating turn reloads within seconds, with no 8-minute wait", async () => {
@@ -270,6 +292,118 @@ describe('the turn resync and the "Connection interrupted" banner', () => {
     expect(lines(logger).filter((line) => line.includes("no conversation URL"))).toEqual([
       '[browser] ChatGPT shows "Connection interrupted", but no conversation URL is known, so the page is not reloaded.',
     ]);
+  });
+});
+
+describe("Round 8b: the banner's backoff, hidden prompts and evidence", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function start(
+    page: { banner: string | null; wordsInAnswer?: boolean },
+    onLoad?: (load: number) => void,
+  ) {
+    const tab = bannerTab(page, onLoad);
+    const logger = Object.assign(vi.fn(), { verbose: false });
+    const events: string[] = [];
+    const saved: InterruptedBannerDiagnostic[] = [];
+    const resync = createTurnResync({
+      Runtime: tab.Runtime,
+      Page: tab.Page,
+      logger,
+      conversationUrl: () => CONVERSATION,
+      saveInterruptedBannerDiagnostic: async (diagnostic) => {
+        saved.push(diagnostic);
+        events.push("diagnostic");
+        return "artifacts/interrupted-banner-diag-1.html";
+      },
+    });
+    tab.Page.reload = vi.fn(async () => {
+      events.push("reload");
+      return (tab as unknown as { Page: { navigate: () => Promise<unknown> } }).Page.navigate();
+    }) as never;
+    const startedAt = Date.now();
+    void resync.run(waitUntilAborted).catch(() => undefined);
+    const since = () => tab.reloads.map((at) => at - startedAt);
+    return { tab, logger, saved, events, since, resync };
+  }
+
+  test("a banner that comes back after 3 minutes gone, during an 8-minute backoff, reloads at once", async () => {
+    const page = { banner: BANNER as string | null };
+    let backAt = 0;
+    const { since } = start(page, (load) => {
+      // It stays through five reloads (the next one would wait 8 minutes), then goes for 3.
+      if (load !== 5) return;
+      page.banner = null;
+      setTimeout(() => {
+        page.banner = BANNER;
+        backAt = Date.now();
+      }, 3 * MINUTE);
+    });
+    const startedAt = Date.now();
+    await vi.advanceTimersByTimeAsync(14 * MINUTE);
+    expect(since().length).toBeGreaterThanOrEqual(6);
+    expect(backAt).toBeGreaterThan(0);
+    // Two reads after it came back, not the rest of the 8 minutes.
+    expect(since()[5]! - (backAt - startedAt)).toBeLessThan(11_000);
+  });
+
+  test("after a banner reload clears it, a hidden approval prompt still reloads after its 20 s", async () => {
+    const page = { banner: BANNER as string | null };
+    const { logger, since, resync } = start(page, () => {
+      page.banner = null;
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(since()).toHaveLength(1);
+    // The reloaded page shows a CODEXish prompt hidden in a collapsed box; the approval monitor
+    // reports it every 1.5 s.
+    const report = setInterval(
+      () => resync.reportHiddenApproval({ app: "CODEXish", state: "hidden" }),
+      1_500,
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    clearInterval(report);
+    expect(since()).toHaveLength(2);
+    expect(
+      lines(logger).filter((line) =>
+        line.includes("CODEXish's approval prompt is hidden in the page"),
+      ),
+    ).toHaveLength(1);
+    expect(since()[1]!).toBeLessThan(40_000);
+  });
+
+  test("before a stall reload, the banner's words inside the answer are recorded once; they never reload on their own", async () => {
+    const page = { banner: null as string | null, wordsInAnswer: true };
+    const { saved, events, since, logger } = start(page);
+    await vi.advanceTimersByTimeAsync(7 * MINUTE);
+    // No reload and no record before the stall time: the words alone never decide.
+    expect(since()).toEqual([]);
+    expect(saved).toEqual([]);
+    await vi.advanceTimersByTimeAsync(2 * MINUTE);
+    expect(since()).toHaveLength(1);
+    expect(events.slice(0, 2)).toEqual(["diagnostic", "reload"]);
+    expect(saved[0]).toMatchObject({
+      reason: "Before a stall reload (no change for 8m)",
+      page: { detected: false, insideMessageBody: true, withheld: true },
+    });
+    // The next stall reload (16 minutes later) records nothing more.
+    await vi.advanceTimersByTimeAsync(17 * MINUTE);
+    expect(since()).toHaveLength(2);
+    expect(saved).toHaveLength(1);
+    expect(lines(logger).filter((line) => line.includes('shows "Connection interrupted"'))).toEqual(
+      [],
+    );
+  });
+
+  test("a stall reload with no banner words on the page records nothing", async () => {
+    const { saved, since } = start({ banner: null });
+    await vi.advanceTimersByTimeAsync(9 * MINUTE);
+    expect(since()).toHaveLength(1);
+    expect(saved).toEqual([]);
   });
 });
 
