@@ -84,7 +84,7 @@ export class BrowserCancellation {
               ].includes(String(key))
             )
               return value.bind(object);
-            return (...args: unknown[]) => {
+            const wrapper = (...args: unknown[]) => {
               // CDP event subscriptions are synchronous and must remain removable during cleanup.
               if (typeof args[0] === "function") return Reflect.apply(value, object, args);
               if (cleanupContext.getStore()) return Reflect.apply(value, object, args);
@@ -94,6 +94,12 @@ export class BrowserCancellation {
                 ? this.race(Promise.resolve(result))
                 : result;
             };
+            // chrome-remote-interface marks event methods (category "event"); the run client
+            // reads it to tell a wait for an event from a command.
+            const category = (value as { category?: unknown }).category;
+            if (category !== undefined)
+              Object.defineProperty(wrapper, "category", { value: category });
+            return wrapper;
           }
           return value && typeof value === "object" ? wrap(value) : value;
         },

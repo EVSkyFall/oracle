@@ -21,6 +21,14 @@ export class RunTimeExpiredError extends Error {
   }
 }
 
+/** A wait for an event of a tab the run has since left (it was replaced by a new tab). */
+export class TabReplacedError extends Error {
+  constructor(what: string) {
+    super(`${what}: the tab was replaced by a new tab while this waited for it`);
+    this.name = "TabReplacedError";
+  }
+}
+
 const LISTENER_METHODS = new Set(["on", "once", "addListener"]);
 const UNLISTEN_METHODS = new Set(["off", "removeListener"]);
 const PASS_THROUGH = new Set(["emit", "removeAllListeners", "listeners", "listenerCount"]);
@@ -33,7 +41,8 @@ export interface RunClient {
   /**
    * Moves the run to another tab's client: listeners and event subscriptions made through
    * `client` move with it, so the retired client's events (its disconnect included) no longer
-   * reach the run. Returns the retired client, which the caller closes.
+   * reach the run, and a wait for the retired tab's next event ends (TabReplacedError). Returns
+   * the retired client, which the caller closes.
    */
   replace(next: ChromeClient): ChromeClient;
   /**
@@ -44,8 +53,27 @@ export interface RunClient {
   deadline(): number | null;
 }
 
-type Listener = { owner: "client" | string; event: string; fn: (...args: unknown[]) => unknown };
-type Subscription = { domain: string; method: string; args: unknown[]; unsubscribe: unknown };
+type Handler = (...args: unknown[]) => unknown;
+/** A listener on the client's own emitter (`client.on("disconnect", fn)` and the like). */
+type ClientListener = { event: string; fn: Handler; registered: Handler; once: boolean };
+/**
+ * A handler subscribed through a domain: chrome-remote-interface's `Page.on(name, fn)` and
+ * `Page.loadEventFired(fn)` return the unsubscribe function; other clients may have emitter
+ * methods on the domain instead.
+ */
+type Subscription = {
+  domain: string;
+  method: string;
+  args: unknown[];
+  fn: Handler;
+  once: boolean;
+  unsubscribe: unknown;
+};
+/** A promise-form event wait (`Page.loadEventFired()`) on the current tab. */
+type PendingEvent = { reject: (error: Error) => void; what: string };
+
+const isEventMethod = (method: unknown): boolean =>
+  (method as { category?: unknown } | undefined)?.category === "event";
 
 /**
  * Wraps a run's CDP client so the run can move to another tab of the same Chrome (a frozen
@@ -55,8 +83,9 @@ export function createRunClient(initial: ChromeClient): RunClient {
   let currentClient = initial;
   let deadlineAt: number | null = null;
   let unanswered = false;
-  const listeners = new Set<Listener>();
+  const clientListeners = new Set<ClientListener>();
   const subscriptions = new Set<Subscription>();
+  const pendingEvents = new Set<PendingEvent>();
 
   const bounded = <T>(what: string, call: () => T): T | Promise<unknown> => {
     const result = call() as unknown;
@@ -98,60 +127,132 @@ export function createRunClient(initial: ChromeClient): RunClient {
     });
   };
 
-  const domainTarget = (domain: string): Record<string, unknown> | undefined =>
-    (currentClient as unknown as Record<string, Record<string, unknown> | undefined>)[domain];
+  const domainOf = (client: ChromeClient, domain: string): Record<string, unknown> | undefined =>
+    (client as unknown as Record<string, Record<string, unknown> | undefined>)[domain];
+
+  /** Subscribes `subscription` on `client`'s domain; returns what the domain returned. */
+  const subscribeOn = (client: ChromeClient, subscription: Subscription): unknown => {
+    const target = domainOf(client, subscription.domain);
+    const method = target?.[subscription.method];
+    if (typeof method !== "function") {
+      subscription.unsubscribe = undefined;
+      return undefined;
+    }
+    const returned = method.apply(target, subscription.args);
+    subscription.unsubscribe = returned;
+    return returned;
+  };
+
+  /** Ends `subscription` on `client` (its unsubscribe function, or the domain's emitter). */
+  const unsubscribeFrom = (client: ChromeClient, subscription: Subscription) => {
+    try {
+      if (typeof subscription.unsubscribe === "function") {
+        (subscription.unsubscribe as () => unknown)();
+        return;
+      }
+      const target = domainOf(client, subscription.domain);
+      const off = target?.removeListener ?? target?.off;
+      const event = subscription.args[0];
+      const handler = subscription.args[1];
+      if (typeof off === "function" && typeof event === "string" && typeof handler === "function") {
+        off.call(target, event, handler);
+      }
+    } catch {
+      // the retired tab may be gone already
+    }
+  };
 
   const domainProxies = new Map<string, object>();
   const domainProxy = (domain: string): object => {
     const cached = domainProxies.get(domain);
     if (cached) return cached;
+    const removeTracked = (event: unknown, fn: unknown): boolean => {
+      let removed = false;
+      for (const subscription of subscriptions) {
+        const matches =
+          subscription.fn === fn &&
+          (LISTENER_METHODS.has(subscription.method)
+            ? subscription.args[0] === event
+            : subscription.method === event);
+        if (!matches) continue;
+        subscriptions.delete(subscription);
+        unsubscribeFrom(currentClient, subscription);
+        removed = true;
+      }
+      return removed;
+    };
     const proxy = new Proxy(
       {},
       {
         has: (_object, key) => {
-          const target = domainTarget(domain);
+          const target = domainOf(currentClient, domain);
           return Boolean(target) && key in (target as object);
         },
         get: (_object, key) => {
           if (typeof key === "symbol") return undefined;
-          const target = domainTarget(domain);
+          const target = domainOf(currentClient, domain);
           const value = target?.[key];
+          // Subscriptions made here can always be removed here, also where the domain itself
+          // offers only the unsubscribe function (chrome-remote-interface).
+          if (UNLISTEN_METHODS.has(key)) {
+            return (event: unknown, fn: unknown) => {
+              if (removeTracked(event, fn)) return undefined;
+              const live = domainOf(currentClient, domain)?.[key];
+              return typeof live === "function"
+                ? live.call(domainOf(currentClient, domain), event, fn)
+                : undefined;
+            };
+          }
           if (typeof value !== "function") return value;
           return (...args: unknown[]) => {
-            const live = domainTarget(domain);
+            const live = domainOf(currentClient, domain);
             const method = live?.[key];
             if (typeof method !== "function") {
               throw new TypeError(`${domain}.${key} is not available on this tab`);
             }
-            if (LISTENER_METHODS.has(key) && typeof args[1] === "function") {
-              listeners.add({
-                owner: domain,
-                event: String(args[0]),
-                fn: args[1] as Listener["fn"],
-              });
-              return method.apply(live, args);
-            }
-            if (UNLISTEN_METHODS.has(key) && typeof args[1] === "function") {
-              for (const entry of listeners) {
-                if (entry.owner === domain && entry.event === args[0] && entry.fn === args[1]) {
-                  listeners.delete(entry);
-                }
-              }
-              return method.apply(live, args);
-            }
-            // An event subscription (a handler as the only argument) moves with the run.
-            if (typeof args[0] === "function") {
+            const handlerIndex = args.findIndex((arg) => typeof arg === "function");
+            if (handlerIndex >= 0) {
+              // An event subscription moves with the run; a once handler leaves when it fires.
+              const fn = args[handlerIndex] as Handler;
+              const once = key === "once";
               const subscription: Subscription = {
                 domain,
                 method: key,
-                args,
-                unsubscribe: method.apply(live, args),
+                args: [...args],
+                fn,
+                once,
+                unsubscribe: undefined,
               };
+              if (once) {
+                subscription.args[handlerIndex] = (...eventArgs: unknown[]) => {
+                  subscriptions.delete(subscription);
+                  return fn(...eventArgs);
+                };
+              }
               subscriptions.add(subscription);
+              const returned = subscribeOn(currentClient, subscription);
+              if (typeof returned !== "function") return returned;
               return () => {
-                subscriptions.delete(subscription);
-                if (typeof subscription.unsubscribe === "function") subscription.unsubscribe();
+                if (!subscriptions.delete(subscription)) return;
+                unsubscribeFrom(currentClient, subscription);
               };
+            }
+            if (isEventMethod(method)) {
+              // A wait for this tab's next event: it ends if the run moves to another tab first.
+              const what = `${domain}.${key}`;
+              const waited = new Promise((resolve, reject) => {
+                const pending: PendingEvent = { reject, what };
+                pendingEvents.add(pending);
+                Promise.resolve(method.apply(live, args)).then(
+                  (value) => {
+                    if (pendingEvents.delete(pending)) resolve(value);
+                  },
+                  (error: unknown) => {
+                    if (pendingEvents.delete(pending)) reject(error);
+                  },
+                );
+              });
+              return bounded(what, () => waited);
             }
             return bounded(`${domain}.${key}`, () => method.apply(live, args));
           };
@@ -171,20 +272,32 @@ export function createRunClient(initial: ChromeClient): RunClient {
         const raw = currentClient as unknown as Record<string, unknown>;
         const value = raw[key];
         if (LISTENER_METHODS.has(key)) {
-          return (event: string, fn: Listener["fn"]) => {
-            listeners.add({ owner: "client", event, fn });
-            return (raw[key] as (...args: unknown[]) => unknown).call(currentClient, event, fn);
+          return (event: string, fn: Handler) => {
+            const once = key === "once";
+            const listener: ClientListener = { event, fn, registered: fn, once };
+            if (once) {
+              listener.registered = (...eventArgs: unknown[]) => {
+                clientListeners.delete(listener);
+                return fn(...eventArgs);
+              };
+            }
+            clientListeners.add(listener);
+            return (raw[key] as Handler).call(currentClient, event, listener.registered);
           };
         }
         if (UNLISTEN_METHODS.has(key)) {
-          return (event: string, fn: Listener["fn"]) => {
-            for (const entry of listeners) {
-              if (entry.owner === "client" && entry.event === event && entry.fn === fn) {
-                listeners.delete(entry);
+          return (event: string, fn: Handler) => {
+            let registered: Handler = fn;
+            for (const listener of clientListeners) {
+              if (listener.event === event && listener.fn === fn) {
+                clientListeners.delete(listener);
+                registered = listener.registered;
               }
             }
             const off = raw[key] ?? raw.removeListener;
-            return typeof off === "function" ? off.call(currentClient, event, fn) : undefined;
+            return typeof off === "function"
+              ? off.call(currentClient, event, registered)
+              : undefined;
           };
         }
         if (/^[A-Z]/.test(key) && value && typeof value === "object") return domainProxy(key);
@@ -198,34 +311,25 @@ export function createRunClient(initial: ChromeClient): RunClient {
   ) as ChromeClient;
 
   const move = (from: ChromeClient, to: ChromeClient) => {
-    const fromRaw = from as unknown as Record<
-      string,
-      Record<string, unknown> & ((...a: unknown[]) => unknown)
-    >;
-    const toRaw = to as unknown as Record<string, Record<string, unknown>>;
-    for (const entry of listeners) {
-      const source = entry.owner === "client" ? fromRaw : fromRaw[entry.owner];
-      const target = entry.owner === "client" ? toRaw : toRaw[entry.owner];
-      const off =
-        (source as Record<string, unknown> | undefined)?.removeListener ??
-        (source as Record<string, unknown> | undefined)?.off;
-      if (typeof off === "function") off.call(source, entry.event, entry.fn);
-      const on = (target as Record<string, unknown> | undefined)?.on;
-      if (typeof on === "function") on.call(target, entry.event, entry.fn);
+    const fromRaw = from as unknown as Record<string, unknown>;
+    const toRaw = to as unknown as Record<string, unknown>;
+    for (const listener of clientListeners) {
+      const off = fromRaw.removeListener ?? fromRaw.off;
+      try {
+        if (typeof off === "function") off.call(from, listener.event, listener.registered);
+      } catch {
+        // the retired tab may be gone already
+      }
+      const on = toRaw[listener.once ? "once" : "on"] ?? toRaw.on;
+      if (typeof on === "function") on.call(to, listener.event, listener.registered);
     }
     for (const subscription of subscriptions) {
-      if (typeof subscription.unsubscribe === "function") {
-        try {
-          subscription.unsubscribe();
-        } catch {
-          // the retired tab may be gone already
-        }
-      }
-      const method = toRaw[subscription.domain]?.[subscription.method];
-      subscription.unsubscribe =
-        typeof method === "function"
-          ? method.apply(toRaw[subscription.domain], subscription.args)
-          : undefined;
+      unsubscribeFrom(from, subscription);
+      subscribeOn(to, subscription);
+    }
+    for (const pending of pendingEvents) {
+      pendingEvents.delete(pending);
+      pending.reject(new TabReplacedError(pending.what));
     }
   };
 
