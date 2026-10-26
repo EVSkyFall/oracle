@@ -450,6 +450,8 @@ async function executeAssembledBrowserSession({
       conversationId: browserResult.conversationId,
       promptSubmitted: browserResult.promptSubmitted,
       submittedPromptHash: browserResult.submittedPromptHash,
+      presendUserTurnIds: browserResult.presendUserTurnIds,
+      submittedPromptIndex: browserResult.submittedPromptIndex,
       researchPlan: browserResult.researchPlan,
       controllerPid: browserResult.controllerPid ?? process.pid,
       ...(browserResult.appApprovals?.length ? { appApprovals: browserResult.appApprovals } : {}),

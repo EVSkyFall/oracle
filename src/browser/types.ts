@@ -350,6 +350,10 @@ export interface BrowserRunResult {
   conversationId?: string;
   promptSubmitted?: boolean;
   submittedPromptHash?: string | null;
+  /** User turn identities rendered before the latest send; a turn among them is never its turn. */
+  presendUserTurnIds?: string[] | null;
+  /** Which prompt the latest send was: 0 the prompt, n the n-th in-run follow-up. */
+  submittedPromptIndex?: number | null;
   researchPlan?: BrowserResearchPlanMetadata;
   controllerPid?: number;
   /** Tool-permission prompts approved through allowApps during this run. */

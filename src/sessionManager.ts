@@ -129,6 +129,10 @@ export interface BrowserRuntimeMetadata {
   promptSubmitted?: boolean;
   /** Fingerprint of committed user text and stable message ID; null until commitment is confirmed. */
   submittedPromptHash?: string | null;
+  /** User turn identities rendered before the latest send; a turn among them is never its turn. */
+  presendUserTurnIds?: string[] | null;
+  /** Which prompt the latest send was: 0 the prompt, n the n-th in-run follow-up. */
+  submittedPromptIndex?: number | null;
   /** Latest Deep Research plan captured from ChatGPT's out-of-process iframe. */
   researchPlan?: BrowserResearchPlanMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */

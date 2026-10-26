@@ -49,10 +49,13 @@ function isRecoverableMissingTabError(message: string): boolean {
 
 /**
  * How this session's submitted user turn is recognized: its fingerprint (committed text and stable
- * message id), or, when no fingerprint was recorded for a sent prompt, the prompt's text.
+ * message id), or, when no fingerprint was recorded for a sent prompt, a user turn that was not
+ * rendered before the send (by id) and shows the prompt that send submitted.
  * Undefined: a legacy session or an explicit tab, where only the pairing is checked.
  */
-type SessionTurnIdentity = { fingerprint: string } | { promptText: string };
+type SessionTurnIdentity =
+  | { fingerprint: string }
+  | { promptText: string; presendUserTurnIds: ReadonlySet<string> };
 
 /** Whether the latest user turn on the page is the one this session submitted. */
 function latestUserIsSessionTurn(
@@ -61,6 +64,10 @@ function latestUserIsSessionTurn(
 ): boolean {
   if (identity === undefined) return true;
   if ("promptText" in identity) {
+    // A turn rendered before the send is never this session's, however similar its text (round
+    // templates, "continue", a retried prompt); one without an id cannot be told apart.
+    const id = harvested.lastUserMessageId?.trim();
+    if (!id || identity.presendUserTurnIds.has(id)) return false;
     // The same match the run's commit check uses on the latest user turn.
     return [harvested.lastUserTextRaw, harvested.lastUserText, harvested.lastUserContentText].some(
       (text) => typeof text === "string" && promptAppearsInText(identity.promptText, text),
@@ -68,15 +75,15 @@ function latestUserIsSessionTurn(
   }
   const fingerprint = identity.fingerprint;
   return (
-    (typeof harvested.lastUserMessageId === "string" &&
-      harvested.lastUserMessageId.trim().length > 0 &&
-      // ChatGPT can append transient status text outside the user's content after submission.
-      // Keep legacy full-container hashes valid and require an exact match for either form.
-      [harvested.lastUserTextRaw ?? harvested.lastUserText, harvested.lastUserContentText].some(
-        (text) =>
-          typeof text === "string" &&
-          browserPromptFingerprint(text, harvested.lastUserMessageId!) === fingerprint,
-      ))
+    typeof harvested.lastUserMessageId === "string" &&
+    harvested.lastUserMessageId.trim().length > 0 &&
+    // ChatGPT can append transient status text outside the user's content after submission.
+    // Keep legacy full-container hashes valid and require an exact match for either form.
+    [harvested.lastUserTextRaw ?? harvested.lastUserText, harvested.lastUserContentText].some(
+      (text) =>
+        typeof text === "string" &&
+        browserPromptFingerprint(text, harvested.lastUserMessageId!) === fingerprint,
+    )
   );
 }
 
@@ -123,15 +130,24 @@ function describeSessionTurn(state: SessionTurnState): string {
   }
 }
 
-/** The text of the last prompt this session sends: its last in-run follow-up, else its prompt. */
-function sessionLastPromptText(meta: SessionMetadata): string | undefined {
+/**
+ * The text of the prompt the session's latest send submitted, by the index the run recorded with
+ * promptSubmitted: 0 its prompt, n its n-th in-run follow-up (counted as the run counts them).
+ */
+function sessionSubmittedPromptText(
+  meta: SessionMetadata,
+  submittedPromptIndex: unknown,
+): string | undefined {
+  if (typeof submittedPromptIndex !== "number" || !Number.isInteger(submittedPromptIndex)) {
+    return undefined;
+  }
   const options = (meta.options ?? {}) as { prompt?: unknown; browserFollowUps?: unknown };
   const followUps = Array.isArray(options.browserFollowUps)
-    ? options.browserFollowUps.filter(
-        (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
-      )
+    ? options.browserFollowUps
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter(Boolean)
     : [];
-  const prompt = followUps.at(-1) ?? options.prompt;
+  const prompt = submittedPromptIndex === 0 ? options.prompt : followUps[submittedPromptIndex - 1];
   return typeof prompt === "string" && prompt.trim() ? prompt : undefined;
 }
 
@@ -145,13 +161,18 @@ function sessionTurnIdentity(
   const fingerprint = runtime?.submittedPromptHash;
   if (typeof fingerprint === "string") return { fingerprint };
   if (fingerprint === null) {
-    // The prompt was sent but its commit was not proven, so no fingerprint was recorded.
-    const promptText = runtime?.promptSubmitted === true ? sessionLastPromptText(meta) : undefined;
-    if (promptText) {
+    // The prompt was sent but its commit was not proven, so no fingerprint was recorded. Without
+    // the turns rendered before that send, or without knowing which prompt it was, never guess.
+    const presend = runtime?.presendUserTurnIds;
+    const promptText =
+      runtime?.promptSubmitted === true && Array.isArray(presend)
+        ? sessionSubmittedPromptText(meta, runtime.submittedPromptIndex)
+        : undefined;
+    if (promptText && Array.isArray(presend)) {
       console.log(
-        "[reattach] No submitted-turn fingerprint was recorded for this session; its turn is identified by its prompt text.",
+        "[reattach] No submitted-turn fingerprint was recorded for this session; its turn is identified by its prompt text, among the turns not rendered before the send.",
       );
-      return { promptText };
+      return { promptText, presendUserTurnIds: new Set(presend) };
     }
     throw new Error(
       "This browser session has no confirmed submitted user turn; retry after submission or use --browser-tab to inspect a specific tab.",

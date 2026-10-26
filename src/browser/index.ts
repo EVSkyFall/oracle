@@ -938,6 +938,12 @@ async function runBrowserModeInternal(
   let lastUrl: string | undefined;
   let promptSubmitted = false;
   let submittedPromptHash: string | null = null;
+  // Recorded with promptSubmitted: the user turn identities rendered before that send (a turn
+  // among them is never its turn) and which prompt it was (0: the prompt, n: the n-th follow-up).
+  let presendUserTurnIds: string[] | null = null;
+  let submittedPromptIndex: number | null = null;
+  let pendingPresendUserTurnIds: string[] | null = null;
+  let pendingPromptIndex = 0;
   let ownedRecoveryTarget: BrowserRunResult["ownedRecoveryTarget"];
   const targetClaimId = randomUUID();
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -962,6 +968,8 @@ async function runBrowserModeInternal(
     conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
     promptSubmitted,
     submittedPromptHash,
+    presendUserTurnIds,
+    submittedPromptIndex,
     ownedRecoveryTarget,
     controllerPid: process.pid,
     ...approvalRuntime(),
@@ -980,6 +988,8 @@ async function runBrowserModeInternal(
       conversationId,
       promptSubmitted,
       submittedPromptHash,
+      presendUserTurnIds,
+      submittedPromptIndex,
       ownedRecoveryTarget,
       userDataDir,
       controllerPid: process.pid,
@@ -1006,6 +1016,8 @@ async function runBrowserModeInternal(
   const markPromptSubmitted = async (): Promise<void> => {
     promptSubmitted = true;
     submittedPromptHash = null;
+    presendUserTurnIds = pendingPresendUserTurnIds;
+    submittedPromptIndex = pendingPromptIndex;
     await emitRuntimeHint();
     void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
   };
@@ -1304,6 +1316,8 @@ async function runBrowserModeInternal(
                     : undefined,
                 promptSubmitted,
                 submittedPromptHash,
+                presendUserTurnIds,
+                submittedPromptIndex,
                 ownedRecoveryTarget,
                 controllerPid: process.pid,
                 ...approvalRuntime(),
@@ -1899,6 +1913,7 @@ async function runBrowserModeInternal(
           : undefined;
       const previousUserMessageIds = await readUserMessageIds(Runtime, config.inputTimeoutMs);
       providerState.previousUserMessageIds = previousUserMessageIds;
+      pendingPresendUserTurnIds = previousUserMessageIds ? [...previousUserMessageIds] : null;
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,
@@ -1970,6 +1985,7 @@ async function runBrowserModeInternal(
     let deepResearchTargetBaselineCaptured = false;
     await acquireProfileLockIfNeeded();
     try {
+      pendingPromptIndex = 0;
       const submission = await runSubmissionWithRecovery({
         prompt: promptText,
         attachments,
@@ -2108,6 +2124,8 @@ async function runBrowserModeInternal(
         conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
         promptSubmitted,
         submittedPromptHash,
+        presendUserTurnIds,
+        submittedPromptIndex,
         ownedRecoveryTarget,
         controllerPid: process.pid,
         researchPlan,
@@ -2426,6 +2444,7 @@ async function runBrowserModeInternal(
       try {
         await raceWithDisconnect(clearPromptComposer(Runtime, logger));
         await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        pendingPromptIndex = index + 1;
         const submission = await runSubmissionWithRecovery({
           prompt: followUpPrompt,
           attachments: [],
@@ -2567,6 +2586,8 @@ async function runBrowserModeInternal(
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       promptSubmitted,
       submittedPromptHash,
+      presendUserTurnIds,
+      submittedPromptIndex,
       ownedRecoveryTarget,
       controllerPid: process.pid,
       ...(appApprovals.length > 0 ? { appApprovals } : {}),
@@ -2601,6 +2622,8 @@ async function runBrowserModeInternal(
         tabUrl: lastUrl,
         promptSubmitted,
         submittedPromptHash,
+        presendUserTurnIds,
+        submittedPromptIndex,
         ownedRecoveryTarget,
         controllerPid: process.pid,
         ...approvalRuntime(),
@@ -2686,6 +2709,8 @@ async function runBrowserModeInternal(
               : undefined,
           promptSubmitted,
           submittedPromptHash,
+          presendUserTurnIds,
+          submittedPromptIndex,
           ownedRecoveryTarget,
           controllerPid: process.pid,
           ...approvalRuntime(),
@@ -3121,6 +3146,12 @@ async function runRemoteBrowserMode(
   let lastUrl: string | undefined;
   let promptSubmitted = false;
   let submittedPromptHash: string | null = null;
+  // Recorded with promptSubmitted: the user turn identities rendered before that send (a turn
+  // among them is never its turn) and which prompt it was (0: the prompt, n: the n-th follow-up).
+  let presendUserTurnIds: string[] | null = null;
+  let submittedPromptIndex: number | null = null;
+  let pendingPresendUserTurnIds: string[] | null = null;
+  let pendingPromptIndex = 0;
   let ownedRecoveryTarget: BrowserRunResult["ownedRecoveryTarget"];
   const targetClaimId = randomUUID();
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -3151,6 +3182,8 @@ async function runRemoteBrowserMode(
           conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
           promptSubmitted,
           submittedPromptHash,
+          presendUserTurnIds,
+          submittedPromptIndex,
           ownedRecoveryTarget,
           controllerPid: process.pid,
           researchPlan,
@@ -3173,6 +3206,8 @@ async function runRemoteBrowserMode(
   const markPromptSubmitted = async (): Promise<void> => {
     promptSubmitted = true;
     submittedPromptHash = null;
+    presendUserTurnIds = pendingPresendUserTurnIds;
+    submittedPromptIndex = pendingPromptIndex;
     await emitRuntimeHint();
     void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
   };
@@ -3198,6 +3233,8 @@ async function runRemoteBrowserMode(
     conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
     promptSubmitted,
     submittedPromptHash,
+    presendUserTurnIds,
+    submittedPromptIndex,
     ownedRecoveryTarget,
     controllerPid: process.pid,
     ...approvalRuntime(),
@@ -3655,6 +3692,7 @@ async function runRemoteBrowserMode(
           : undefined;
       const previousUserMessageIds = await readUserMessageIds(Runtime, config.inputTimeoutMs);
       providerState.previousUserMessageIds = previousUserMessageIds;
+      pendingPresendUserTurnIds = previousUserMessageIds ? [...previousUserMessageIds] : null;
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,
@@ -3698,6 +3736,7 @@ async function runRemoteBrowserMode(
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
+    pendingPromptIndex = 0;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
       attachments,
@@ -3826,6 +3865,8 @@ async function runRemoteBrowserMode(
         conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
         promptSubmitted,
         submittedPromptHash,
+        presendUserTurnIds,
+        submittedPromptIndex,
         ownedRecoveryTarget,
         controllerPid: process.pid,
         researchPlan,
@@ -4105,6 +4146,7 @@ async function runRemoteBrowserMode(
       logger(`[browser] Sending follow-up ${index + 1}/${followUpPrompts.length}`);
       await clearPromptComposer(Runtime, logger);
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+      pendingPromptIndex = index + 1;
       const submission = await runSubmissionWithRecovery({
         prompt: followUpPrompt,
         attachments: [],
@@ -4232,6 +4274,8 @@ async function runRemoteBrowserMode(
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       promptSubmitted,
       submittedPromptHash,
+      presendUserTurnIds,
+      submittedPromptIndex,
       ownedRecoveryTarget,
       artifacts: savedArtifacts,
       providerNativeCapture: providerCapture.summary,
@@ -4291,6 +4335,8 @@ async function runRemoteBrowserMode(
             : undefined,
         promptSubmitted,
         submittedPromptHash,
+        presendUserTurnIds,
+        submittedPromptIndex,
         ownedRecoveryTarget,
         controllerPid: process.pid,
         ...approvalRuntime(),

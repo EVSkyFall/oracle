@@ -1165,6 +1165,8 @@ function sanitizeResult(
     conversationId: result.conversationId,
     promptSubmitted: result.promptSubmitted,
     submittedPromptHash: result.submittedPromptHash,
+    presendUserTurnIds: result.presendUserTurnIds,
+    submittedPromptIndex: result.submittedPromptIndex,
     warnings: warnings.length > 0 ? warnings : undefined,
     noFocus,
     chromePid: undefined,

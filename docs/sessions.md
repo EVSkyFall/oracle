@@ -169,12 +169,16 @@ fingerprint of each rendered, committed user turn and its stable message ID
 before waiting for its answer, including repeated follow-ups. A mismatch preserves the original output; an unconfirmed
 submission requires waiting or explicit tab inspection. When a prompt was sent
 (`promptSubmitted`) but no fingerprint was recorded because its commit could
-not be proven, `--harvest` and `--live` identify the session's turn by its
-prompt text instead (its last in-run follow-up, else its prompt): the latest
-user turn must show it, matched as the run's commit check matches it, and the
-log says so. Every other rule stays: the completion proof, the turn-tied
-Markdown, never an older turn. Without the prompt text the session is refused
-as before.
+not be proven, `--harvest` and `--live` identify the session's turn by the text
+of the prompt that send submitted instead. With `promptSubmitted` the run
+records the user turn ids rendered before that send (`presendUserTurnIds`) and
+which prompt it was (`submittedPromptIndex`: 0 its prompt, n its n-th in-run
+follow-up). The latest user turn must not be one of those turns, however
+similar its text, and must show that prompt, matched as the run's commit check
+matches it; the log says so. Every other rule stays: the completion proof,
+the turn-tied Markdown, never an older turn. Without that record (a session
+from before it was kept) or without the prompt text, the session is refused as
+before.
 
 Both `--harvest` and `--live` save only an answer that follows the session's
 own submitted user turn; the last assistant message on the page can belong to

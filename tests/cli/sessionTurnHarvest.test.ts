@@ -447,9 +447,42 @@ describe("a reattach saves only this session's own turn", () => {
   });
 
   describe("a sent prompt whose commit was not proven (no fingerprint recorded)", () => {
-    const unproven = { runtime: { submittedPromptHash: null, promptSubmitted: true } };
+    // Recorded with promptSubmitted: the user turns rendered before the send, and which prompt
+    // the send was (0: the prompt, n: the n-th in-run follow-up).
+    const unproven = {
+      runtime: {
+        submittedPromptHash: null,
+        promptSubmitted: true,
+        presendUserTurnIds: ["older-message", "previous-message"],
+        submittedPromptIndex: 0,
+      },
+    };
+    /** The previous round on the page: rendered before the send, its text like this round's. */
+    const previousRound = (text: string) => ({
+      ...finished,
+      lastUserMessageId: "previous-message",
+      lastUserText: text,
+      lastUserTextRaw: text,
+      lastUserSnippet: text,
+      lastAssistantText: PREVIOUS,
+      lastAssistantMarkdown: PREVIOUS,
+      lastAssistantSnippet: PREVIOUS,
+    });
+    async function harvestFails(
+      harvests: unknown[],
+      overrides: Record<string, unknown> = unproven,
+    ) {
+      mockSession(harvests, {}, overrides);
+      const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+      const settled = harvestSessionBrowserOutput("sess-turn", { quietOutput: true }).then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      await advance(4_000);
+      return (await settled) as { value?: unknown; error?: Error };
+    }
 
-    test("--harvest identifies this session's turn by its prompt text and saves the proven answer", async () => {
+    test("--harvest saves the proven answer of a new turn (not rendered before the send) showing the prompt", async () => {
       mockSession([finished], {}, unproven);
       const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
       const result = await harvestSessionBrowserOutput("sess-turn", {
@@ -463,7 +496,7 @@ describe("a reattach saves only this session's own turn", () => {
       );
     });
 
-    test("--live waits for the proven answer of the turn showing the prompt", async () => {
+    test("--live waits for the proven answer of the new turn showing the prompt", async () => {
       mockSession([generatingPartial, preambleNoStop, finished], {}, unproven);
       const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
       const settled = liveTailSessionBrowserOutput("sess-turn").then(
@@ -475,37 +508,55 @@ describe("a reattach saves only this session's own turn", () => {
       expect(savedTexts()).not.toContain(PREAMBLE);
     });
 
-    test("a latest user turn that does not show the prompt is never taken; nothing is saved", async () => {
+    test.each([
+      ["shares its prefix (a round template)", `${PROMPT} (the previous round)`],
+      ["is a retry of the same prompt", PROMPT],
+    ])(
+      "the previous round, rendered before the send, is never taken even when it %s; nothing is saved",
+      async (_label, text) => {
+        const outcome = await harvestFails([previousRound(text)]);
+        expect(String(outcome.error?.message)).toMatch(/not the one this session submitted/);
+        expect(updateSession).not.toHaveBeenCalled();
+        expect(savedTexts()).not.toContain(PREVIOUS);
+      },
+    );
+
+    test("a new turn sharing the previous round's prefix is saved once proven", async () => {
       mockSession(
         [
           {
             ...finished,
-            lastUserText: "An earlier request",
-            lastUserTextRaw: "An earlier request",
-            lastUserSnippet: "An earlier request",
-            lastAssistantText: PREVIOUS,
-            lastAssistantMarkdown: PREVIOUS,
+            lastUserText: `${PROMPT} (this round)`,
+            lastUserTextRaw: `${PROMPT} (this round)`,
           },
         ],
         {},
         unproven,
       );
       const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
-      const settled = harvestSessionBrowserOutput("sess-turn", { quietOutput: true }).then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
-      await advance(4_000);
-      const outcome = (await settled) as { error?: Error };
+      const result = await harvestSessionBrowserOutput("sess-turn", { quietOutput: true });
+      expect(result.lastAssistantMarkdown).toBe(CURRENT);
+    });
+
+    test("a new turn that does not show the prompt is never taken; nothing is saved", async () => {
+      const outcome = await harvestFails([
+        { ...finished, lastUserText: "Something else", lastUserTextRaw: "Something else" },
+      ]);
       expect(String(outcome.error?.message)).toMatch(/not the one this session submitted/);
       expect(updateSession).not.toHaveBeenCalled();
     });
 
-    test("with in-run follow-ups, the turn must show the last follow-up", async () => {
+    test("with in-run follow-ups, the turn must show the prompt the send submitted, not a later one never sent", async () => {
       mockSession(
         [finished],
         {},
-        { ...unproven, options: { prompt: "First question", browserFollowUps: [PROMPT] } },
+        {
+          runtime: { ...unproven.runtime, submittedPromptIndex: 1 },
+          options: {
+            prompt: "First question",
+            browserFollowUps: [PROMPT, "A follow-up never sent"],
+          },
+        },
       );
       const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
       const result = await harvestSessionBrowserOutput("sess-turn", { quietOutput: true });
@@ -513,11 +564,16 @@ describe("a reattach saves only this session's own turn", () => {
     });
 
     test.each([
-      [
-        "the prompt was never sent",
-        { runtime: { submittedPromptHash: null, promptSubmitted: false } },
-      ],
+      ["the prompt was never sent", { runtime: { ...unproven.runtime, promptSubmitted: false } }],
       ["the prompt text is unavailable", { ...unproven, options: { prompt: "" } }],
+      [
+        "no pre-send turns were recorded (a session from before they were)",
+        { runtime: { submittedPromptHash: null, promptSubmitted: true, submittedPromptIndex: 0 } },
+      ],
+      [
+        "which prompt was sent is not recorded",
+        { runtime: { ...unproven.runtime, submittedPromptIndex: undefined } },
+      ],
     ])("as today when %s: no confirmed submitted user turn", async (_label, overrides) => {
       mockSession([finished], {}, overrides);
       const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
